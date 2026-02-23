@@ -10,9 +10,8 @@ Carga sprite sheets del asset pack y las prepara para uso en el juego:
 import os
 import pygame
 
-# Ruta base de assets (relativa al directorio del proyecto)
-_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ASSETS_DIR = os.path.join(_BASE_DIR, "assets")
+# Ruta base de assets (soporta source y frozen/PyInstaller)
+from utils.base_path import ASSETS_DIR
 
 
 def load_image(relative_path: str) -> pygame.Surface:

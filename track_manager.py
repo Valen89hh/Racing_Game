@@ -11,7 +11,7 @@ import time
 
 
 # Directorio donde se guardan las pistas
-TRACKS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracks")
+from utils.base_path import TRACKS_DIR
 
 
 def get_default_control_points():

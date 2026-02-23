@@ -16,7 +16,7 @@ import pygame
 from tile_defs import T_EMPTY, GRID_ROWS, GRID_COLS, get_tile_sprite
 
 # Directory for saved brushes
-_BRUSHES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brushes")
+from utils.base_path import BRUSHES_DIR as _BRUSHES_DIR
 
 
 class Brush:

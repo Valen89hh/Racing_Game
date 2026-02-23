@@ -94,3 +94,10 @@ assets/cache/
 
 server_logs/
 network_dumps/
+
+# ===============================
+# Launcher / Update temp files
+# ===============================
+
+game_update_temp/
+game_backup/

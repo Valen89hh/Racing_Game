@@ -14,7 +14,11 @@ import os
 
 # Asegurar que el directorio del proyecto esté en el path
 # para que los imports funcionen correctamente
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if getattr(sys, "frozen", False):
+    # PyInstaller frozen exe
+    sys.path.insert(0, os.path.dirname(sys.executable))
+else:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from game import Game
 

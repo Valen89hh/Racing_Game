@@ -1,0 +1,8 @@
+{
+    "update_url": "https://api.github.com/repos/OWNER/REPO/releases/latest",
+    "version_url": "",
+    "check_updates_on_launch": true,
+    "auto_download": false,
+    "connection_timeout": 10,
+    "download_timeout": 300
+}

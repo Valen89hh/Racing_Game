@@ -50,7 +50,8 @@ COLL_POLYGON = "polygon"
 COLLISION_TYPES = [COLL_NONE, COLL_FULL, COLL_POLYGON]
 
 # Path to the metadata JSON
-_META_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "levels")
+from utils.base_path import ASSETS_DIR
+_META_DIR = os.path.join(ASSETS_DIR, "levels")
 _META_PATH = os.path.join(_META_DIR, "tileset_meta.json")
 
 
