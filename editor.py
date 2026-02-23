@@ -1,9 +1,9 @@
 """
-editor.py - Editor visual de circuitos basado en tiles.
+editor.py - Professional tile editor with panels, brushes, and property inspector.
 
-Permite crear y modificar circuitos pintando tiles sobre una cuadricula.
-Panel inferior muestra el tileset completo en su layout original,
-con zoom, scroll y arrastre para navegacion.
+Orchestrates TilesetBrowser, ToolsPanel, PropertyInspector, and CollisionEditor.
+Supports single-tile and multi-tile brushes, per-tile metadata editing,
+and custom collision polygons.
 """
 
 import pygame
@@ -14,16 +14,19 @@ from settings import (
     COLOR_GRAY, COLOR_RED,
 )
 from tile_defs import (
-    TILE_SIZE, GRID_COLS, GRID_ROWS, TILE_BASE_PX,
+    TILE_SIZE, GRID_COLS, GRID_ROWS,
     T_EMPTY, T_FINISH, TILE_BASE,
-    CAT_ROAD, CATEGORY_NAMES,
     is_driveable, get_tile_sprite,
-    get_tile_category,
-    make_grass_sprite, make_finish_sprite,
-    get_tileset_sheet, get_tileset_dimensions,
-    get_tile_at_position, get_tile_info,
     GRASS_COLOR, GRASS_DARK,
     empty_terrain,
+)
+from tile_meta import get_manager, CATEGORY_DISPLAY
+from tile_brush import Brush, BrushLibrary
+from editor_panels import (
+    TilesetBrowser, ToolsPanel, PropertyInspector,
+    COL_PANEL_BG, COL_PANEL_BORDER, COL_TILE_SELECTED,
+    COL_TILE_HOVER, COL_DRIVEABLE, COL_WHITE, COL_GRAY,
+    COL_YELLOW, TILE_PREVIEW_SIZE,
 )
 import track_manager
 
@@ -33,9 +36,11 @@ BOTTOM_PANEL_H = 200
 STATUS_BAR_H = 28
 VIEWPORT_HEIGHT = SCREEN_HEIGHT - BOTTOM_PANEL_H - STATUS_BAR_H  # 492
 TOOLS_W = 130
+INSPECTOR_W = 180
+
 BROWSER_X = TOOLS_W
 BROWSER_Y = VIEWPORT_HEIGHT
-BROWSER_W = SCREEN_WIDTH - TOOLS_W
+BROWSER_W = SCREEN_WIDTH - TOOLS_W - INSPECTOR_W
 BROWSER_H = BOTTOM_PANEL_H
 
 # ── Viewport ──
@@ -43,28 +48,18 @@ ZOOM_MIN = 0.1
 ZOOM_MAX = 2.0
 ZOOM_STEP = 0.08
 MAX_UNDO = 30
-TILE_PREVIEW_SIZE = 48
-
-# ── Tileset browser ──
-BROWSER_ZOOM_MIN = 3
-BROWSER_ZOOM_MAX = 48
 
 # ── UI colors ──
-COL_PANEL_BG = (25, 25, 35)
-COL_PANEL_BORDER = (60, 70, 90)
-COL_TILE_SELECTED = (255, 220, 50)
-COL_TILE_HOVER = (150, 200, 255)
 COL_BAR = (20, 20, 20, 200)
 COL_MSG = (100, 255, 150)
 COL_DIALOG_BG = (25, 25, 35, 230)
 COL_DIALOG_BORDER = (80, 120, 200)
 COL_INPUT_BG = (40, 40, 55)
 COL_TOOL_BG = (35, 40, 50)
-COL_DRIVEABLE = (50, 200, 50)
 
 
 class TileEditor:
-    """Editor visual de circuitos basado en tiles."""
+    """Professional tile editor with panel-based UI."""
 
     def __init__(self, screen):
         self.screen = screen
@@ -72,7 +67,7 @@ class TileEditor:
         self.font_big = pygame.font.SysFont("consolas", 22, bold=True)
         self.font_small = pygame.font.SysFont("consolas", 12)
 
-        # Tile data (single grid)
+        # Tile data
         self.terrain = empty_terrain()
 
         # Viewport
@@ -89,24 +84,13 @@ class TileEditor:
         self.painting = False
         self.erasing = False
 
-        # Selection
-        self.selected_tile = T_EMPTY
-        self.brush_size = 1
+        # Brush system (replaces selected_tile + brush_size)
+        self.current_brush = Brush.single(T_EMPTY)
+        self.selected_tile = T_EMPTY  # for Grass/Finish quick-select compat
 
         # Undo/Redo
         self.undo_stack = []
         self.redo_stack = []
-
-        # Tileset browser state
-        self.browser_zoom = BROWSER_ZOOM_MIN
-        self.browser_scroll_x = 0.0
-        self.browser_scroll_y = 0.0
-        self.browser_hover = None  # (src_row, src_col, tile_id) or None
-
-        # Browser panning
-        self.browser_panning = False
-        self.browser_pan_start = (0, 0)
-        self.browser_scroll_start = (0.0, 0.0)
 
         # UI state
         self.show_help = False
@@ -126,15 +110,77 @@ class TileEditor:
         # Result flag
         self.result = None
 
+        # Collision editor (lazy import)
+        self._collision_editor = None
+
         # Build preview sprites
+        from tile_defs import make_grass_sprite
         self._grass_sprite = make_grass_sprite()
-        self._grass_preview = pygame.transform.scale(
-            self._grass_sprite, (TILE_PREVIEW_SIZE, TILE_PREVIEW_SIZE))
-        finish = make_finish_sprite()
-        self._finish_preview = pygame.transform.scale(
-            finish, (TILE_PREVIEW_SIZE, TILE_PREVIEW_SIZE))
+
+        # ── Panels ──
+        self.tools_panel = ToolsPanel(pygame.Rect(
+            0, VIEWPORT_HEIGHT, TOOLS_W, BOTTOM_PANEL_H))
+        self.browser_panel = TilesetBrowser(pygame.Rect(
+            BROWSER_X, BROWSER_Y, BROWSER_W, BROWSER_H))
+        self.inspector_panel = PropertyInspector(pygame.Rect(
+            SCREEN_WIDTH - INSPECTOR_W, VIEWPORT_HEIGHT,
+            INSPECTOR_W, BOTTOM_PANEL_H))
+
+        # Wire callbacks
+        self.browser_panel.on_tile_selected = self._on_tile_selected
+        self.browser_panel.on_brush_selected = self._on_brush_selected
+        self.tools_panel.on_select_grass = lambda: self._set_tile(T_EMPTY)
+        self.tools_panel.on_select_finish = lambda: self._set_tile(T_FINISH)
+        self.tools_panel.on_save_brush = self._save_current_brush
+        self.tools_panel.on_load_brush = self._load_brush
+        self.inspector_panel.on_open_collision_editor = self._open_collision_editor
 
         self._fit_view()
+
+    # ──────────────────────────────────────────
+    # BRUSH / TILE SELECTION CALLBACKS
+    # ──────────────────────────────────────────
+
+    def _on_tile_selected(self, tile_id):
+        self.selected_tile = tile_id
+        self.current_brush = Brush.single(tile_id)
+        self.inspector_panel.set_tile(tile_id)
+
+    def _on_brush_selected(self, brush: Brush):
+        self.current_brush = brush
+        self.selected_tile = -1  # multi-tile brush, no single tile
+        # Inspect first non-empty tile
+        for row in brush.tiles:
+            for tid in row:
+                if tid != T_EMPTY:
+                    self.inspector_panel.set_tile(tid)
+                    return
+
+    def _set_tile(self, tile_id):
+        self.selected_tile = tile_id
+        self.current_brush = Brush.single(tile_id)
+        if tile_id not in (T_EMPTY,):
+            self.inspector_panel.set_tile(tile_id)
+        else:
+            self.inspector_panel.set_tile(None)
+
+    def _save_current_brush(self):
+        if self.current_brush.width <= 1 and self.current_brush.height <= 1:
+            self._show_msg("Select multi-tile brush first")
+            return
+        name = f"Brush {len(self.tools_panel.brush_library.brushes) + 1}"
+        self.current_brush.name = name
+        self.tools_panel.brush_library.save_brush(self.current_brush)
+        self._show_msg(f"Saved: {name}")
+
+    def _load_brush(self, brush: Brush):
+        self.current_brush = brush
+        self.selected_tile = -1
+        self._show_msg(f"Loaded: {brush.name}")
+
+    def _open_collision_editor(self, tile_id):
+        from editor_collision import CollisionEditor
+        self._collision_editor = CollisionEditor(self.screen, tile_id)
 
     # ──────────────────────────────────────────
     # COORDINATE TRANSFORMS
@@ -160,14 +206,6 @@ class TileEditor:
 
     def _is_in_viewport(self, sx, sy):
         return 0 <= sx < SCREEN_WIDTH and 0 <= sy < VIEWPORT_HEIGHT
-
-    def _is_in_browser(self, sx, sy):
-        return (sx >= BROWSER_X and sy >= BROWSER_Y and
-                sy < BROWSER_Y + BROWSER_H)
-
-    def _is_in_tools(self, sx, sy):
-        return (sx < TOOLS_W and sy >= VIEWPORT_HEIGHT and
-                sy < VIEWPORT_HEIGHT + BOTTOM_PANEL_H)
 
     def _is_in_panel(self, sx, sy):
         return sy >= VIEWPORT_HEIGHT and sy < SCREEN_HEIGHT - STATUS_BAR_H
@@ -200,20 +238,24 @@ class TileEditor:
     # ──────────────────────────────────────────
 
     def _paint_at(self, row, col):
-        half = self.brush_size // 2
-        for dr in range(self.brush_size):
-            for dc in range(self.brush_size):
-                r = row + dr - half
-                c = col + dc - half
-                if 0 <= r < GRID_ROWS and 0 <= c < GRID_COLS:
-                    self.terrain[r][c] = self.selected_tile
+        """Paint current brush at grid position."""
+        if self.selected_tile == T_EMPTY:
+            # Eraser mode with brush size
+            w, h = self.current_brush.width, self.current_brush.height
+            for dr in range(h):
+                for dc in range(w):
+                    r, c = row + dr, col + dc
+                    if 0 <= r < GRID_ROWS and 0 <= c < GRID_COLS:
+                        self.terrain[r][c] = T_EMPTY
+        else:
+            self.current_brush.paint_at(self.terrain, row, col)
 
     def _erase_at(self, row, col):
-        half = self.brush_size // 2
-        for dr in range(self.brush_size):
-            for dc in range(self.brush_size):
-                r = row + dr - half
-                c = col + dc - half
+        w = max(1, self.current_brush.width)
+        h = max(1, self.current_brush.height)
+        for dr in range(h):
+            for dc in range(w):
+                r, c = row + dr, col + dc
                 if 0 <= r < GRID_ROWS and 0 <= c < GRID_COLS:
                     self.terrain[r][c] = T_EMPTY
 
@@ -347,6 +389,13 @@ class TileEditor:
     # ──────────────────────────────────────────
 
     def handle_event(self, event):
+        # Collision editor captures all events when active
+        if self._collision_editor is not None:
+            result = self._collision_editor.handle_event(event)
+            if self._collision_editor.done:
+                self._collision_editor = None
+            return True
+
         if self.dialog_mode:
             return self._handle_dialog_event(event)
 
@@ -363,7 +412,6 @@ class TileEditor:
         return True
 
     def _handle_dialog_event(self, event):
-        # Handle text input (pygame 2.x sends TEXTINPUT for typed characters)
         if event.type == pygame.TEXTINPUT:
             if self.dialog_mode == "save":
                 if len(self.dialog_input) < 30:
@@ -436,15 +484,18 @@ class TileEditor:
         # Brush size with Shift+1/2/3
         if shift:
             if event.key == pygame.K_1:
-                self.brush_size = 1
+                self.current_brush = Brush.single(
+                    self.selected_tile if self.selected_tile >= 0 else T_EMPTY)
                 self._show_msg("Brush: 1x1")
                 return True
             if event.key == pygame.K_2:
-                self.brush_size = 2
+                tid = self.selected_tile if self.selected_tile >= 0 else T_EMPTY
+                self.current_brush = Brush([[tid, tid], [tid, tid]])
                 self._show_msg("Brush: 2x2")
                 return True
             if event.key == pygame.K_3:
-                self.brush_size = 3
+                tid = self.selected_tile if self.selected_tile >= 0 else T_EMPTY
+                self.current_brush = Brush([[tid]*3]*3)
                 self._show_msg("Brush: 3x3")
                 return True
 
@@ -453,21 +504,14 @@ class TileEditor:
     def _handle_mousedown(self, event):
         sx, sy = event.pos
 
-        # ── Browser area ──
-        if self._is_in_browser(sx, sy):
-            if event.button == 1:
-                self._handle_browser_click(sx, sy)
-            elif event.button in (2, 3):
-                self.browser_panning = True
-                self.browser_pan_start = (sx, sy)
-                self.browser_scroll_start = (
-                    self.browser_scroll_x, self.browser_scroll_y)
-            return True
-
-        # ── Tools area ──
-        if self._is_in_tools(sx, sy):
-            if event.button == 1:
-                self._handle_tools_click(sx, sy)
+        # ── Panel areas: delegate to panels ──
+        if self._is_in_panel(sx, sy):
+            if self.browser_panel.contains(sx, sy):
+                return self.browser_panel.handle_event(event)
+            if self.tools_panel.contains(sx, sy):
+                return self.tools_panel.handle_event(event)
+            if self.inspector_panel.contains(sx, sy):
+                return self.inspector_panel.handle_event(event)
             return True
 
         # ── Viewport ──
@@ -502,10 +546,12 @@ class TileEditor:
     def _handle_mouseup(self, event):
         if event.button == 2 or (event.button == 1 and self.panning):
             self.panning = False
-        if event.button in (2, 3):
-            self.browser_panning = False
         if event.button == 1:
             self.painting = False
+            # Also notify browser of mouse up for selection
+            self.browser_panel.handle_event(event)
+        if event.button in (2, 3):
+            self.browser_panel.handle_event(event)
         if event.button == 3:
             self.erasing = False
         return True
@@ -513,13 +559,9 @@ class TileEditor:
     def _handle_mousemotion(self, event):
         sx, sy = event.pos
 
-        # Browser panning
-        if self.browser_panning:
-            dx = sx - self.browser_pan_start[0]
-            dy = sy - self.browser_pan_start[1]
-            self.browser_scroll_x = self.browser_scroll_start[0] - dx
-            self.browser_scroll_y = self.browser_scroll_start[1] - dy
-            return True
+        # Browser panning / selection drag
+        if self.browser_panel.panning or self.browser_panel.selecting:
+            return self.browser_panel.handle_event(event)
 
         # Viewport panning
         if self.panning:
@@ -549,9 +591,8 @@ class TileEditor:
         mx, my = pygame.mouse.get_pos()
 
         # Browser zoom
-        if self._is_in_browser(mx, my):
-            self._browser_zoom_at(event.y, mx, my)
-            return True
+        if self.browser_panel.contains(mx, my):
+            return self.browser_panel.handle_event(event)
 
         # Viewport zoom
         if not self._is_in_viewport(mx, my):
@@ -564,57 +605,6 @@ class TileEditor:
         self.cam_x = wx - (mx - SCREEN_WIDTH / 2) / self.zoom
         self.cam_y = wy - (my - VIEWPORT_HEIGHT / 2) / self.zoom
         return True
-
-    def _browser_zoom_at(self, direction, mx, my):
-        """Zoom the tileset browser, keeping tile under cursor stable."""
-        px = mx - BROWSER_X
-        py = my - BROWSER_Y
-        z = self.browser_zoom
-
-        # Tile coords under cursor before zoom
-        tx = (px + self.browser_scroll_x) / z
-        ty = (py + self.browser_scroll_y) / z
-
-        if direction > 0:
-            new_z = min(BROWSER_ZOOM_MAX, z + max(1, z // 3))
-        else:
-            new_z = max(BROWSER_ZOOM_MIN, z - max(1, z // 3))
-
-        self.browser_zoom = new_z
-        # Keep same tile under cursor after zoom
-        self.browser_scroll_x = tx * new_z - px
-        self.browser_scroll_y = ty * new_z - py
-
-    # ──────────────────────────────────────────
-    # PANEL CLICK HANDLING
-    # ──────────────────────────────────────────
-
-    def _handle_tools_click(self, sx, sy):
-        """Handle clicks in the tools section (left of bottom panel)."""
-        px = sx
-        py = sy - VIEWPORT_HEIGHT
-
-        # Grass button: (8, 8) to (56, 56)
-        if 8 <= px < 8 + TILE_PREVIEW_SIZE and 8 <= py < 8 + TILE_PREVIEW_SIZE:
-            self.selected_tile = T_EMPTY
-            return
-
-        # Finish button: (64, 8) to (112, 56)
-        fx = 8 + TILE_PREVIEW_SIZE + 8
-        if fx <= px < fx + TILE_PREVIEW_SIZE and 8 <= py < 8 + TILE_PREVIEW_SIZE:
-            self.selected_tile = T_FINISH
-            return
-
-    def _handle_browser_click(self, sx, sy):
-        """Handle clicks in the tileset browser (select tile)."""
-        px = sx - BROWSER_X
-        py = sy - BROWSER_Y
-        z = self.browser_zoom
-        ts_col = int((px + self.browser_scroll_x) / z)
-        ts_row = int((py + self.browser_scroll_y) / z)
-        tile_id = get_tile_at_position(ts_row, ts_col)
-        if tile_id is not None:
-            self.selected_tile = tile_id
 
     # ──────────────────────────────────────────
     # UPDATE
@@ -645,6 +635,10 @@ class TileEditor:
         elif self.dialog_mode == "load":
             self._draw_load_dialog()
 
+        # Collision editor overlay
+        if self._collision_editor is not None:
+            self._collision_editor.draw(self.screen)
+
     # ──────────────────────────────────────────
     # VIEWPORT
     # ──────────────────────────────────────────
@@ -652,7 +646,6 @@ class TileEditor:
     def _draw_viewport(self):
         viewport_rect = pygame.Rect(0, 0, SCREEN_WIDTH, VIEWPORT_HEIGHT)
         self.screen.set_clip(viewport_rect)
-
         self.screen.fill(GRASS_DARK, viewport_rect)
 
         # Visible tile range
@@ -665,7 +658,7 @@ class TileEditor:
 
         tile_screen_size = max(1, int(TILE_SIZE * self.zoom))
 
-        # Cache scaled sprites for this frame
+        # Cache scaled sprites
         scaled_cache = {}
 
         def get_scaled(sprite, key):
@@ -708,16 +701,17 @@ class TileEditor:
                          pygame.Rect(int(bx0), int(by0),
                                      int(bx1 - bx0), int(by1 - by0)), 2)
 
-        # Hover preview
+        # Hover preview (show brush outline)
         mx, my = pygame.mouse.get_pos()
         if self._is_in_viewport(mx, my) and not self.panning:
             row, col = self.screen_to_tile(mx, my)
             if 0 <= row < GRID_ROWS and 0 <= col < GRID_COLS:
-                half = self.brush_size // 2
-                for dr in range(self.brush_size):
-                    for dc in range(self.brush_size):
-                        r = row + dr - half
-                        c = col + dc - half
+                bw = self.current_brush.width
+                bh = self.current_brush.height
+                for dr in range(bh):
+                    for dc in range(bw):
+                        r = row + dr
+                        c = col + dc
                         if 0 <= r < GRID_ROWS and 0 <= c < GRID_COLS:
                             bsx, bsy = self.world_to_screen(
                                 c * TILE_SIZE, r * TILE_SIZE)
@@ -770,208 +764,25 @@ class TileEditor:
         pygame.draw.line(self.screen, COL_PANEL_BORDER,
                          (0, panel_y), (SCREEN_WIDTH, panel_y), 2)
 
-        # ── Tools section (left) ──
-        self._draw_tools_section(panel_y)
+        # Draw panels
+        self.tools_panel.draw(self.screen,
+                              selected_tile=self.selected_tile,
+                              current_brush=self.current_brush)
 
-        # ── Separator line ──
+        # Separator
         pygame.draw.line(self.screen, COL_PANEL_BORDER,
                          (TOOLS_W, panel_y), (TOOLS_W, panel_y + BOTTOM_PANEL_H), 1)
 
-        # ── Tileset browser (right) ──
-        clip_rect = pygame.Rect(BROWSER_X, BROWSER_Y, BROWSER_W, BROWSER_H)
-        self.screen.set_clip(clip_rect)
-        self._draw_tileset_browser()
-        self.screen.set_clip(None)
+        # Browser
+        self.browser_panel.draw(self.screen)
 
-    def _draw_tools_section(self, panel_y):
-        """Draw tool buttons and selection info in the left section."""
-        pygame.draw.rect(self.screen, COL_TOOL_BG,
-                         (0, panel_y, TOOLS_W, BOTTOM_PANEL_H))
-
-        # ── Row 1: Grass + Finish buttons ──
-        gx, gy = 8, panel_y + 8
-        self.screen.blit(self._grass_preview, (gx, gy))
-        if self.selected_tile == T_EMPTY:
-            pygame.draw.rect(self.screen, COL_TILE_SELECTED,
-                             (gx - 2, gy - 2,
-                              TILE_PREVIEW_SIZE + 4, TILE_PREVIEW_SIZE + 4), 3)
-
-        fx = gx + TILE_PREVIEW_SIZE + 8
-        fy = gy
-        self.screen.blit(self._finish_preview, (fx, fy))
-        if self.selected_tile == T_FINISH:
-            pygame.draw.rect(self.screen, COL_TILE_SELECTED,
-                             (fx - 2, fy - 2,
-                              TILE_PREVIEW_SIZE + 4, TILE_PREVIEW_SIZE + 4), 3)
-
-        # ── Separator ──
-        sep_y = gy + TILE_PREVIEW_SIZE + 8
+        # Separator before inspector
+        insp_x = SCREEN_WIDTH - INSPECTOR_W
         pygame.draw.line(self.screen, COL_PANEL_BORDER,
-                         (4, sep_y), (TOOLS_W - 4, sep_y))
+                         (insp_x, panel_y), (insp_x, panel_y + BOTTOM_PANEL_H), 1)
 
-        # ── Selected tile info ──
-        info_y = sep_y + 6
-        if self.selected_tile == T_EMPTY:
-            info_text = "Grass (eraser)"
-            drive_text = ""
-        elif self.selected_tile == T_FINISH:
-            info_text = "Finish Line"
-            drive_text = "Driveable"
-        else:
-            cat = get_tile_category(self.selected_tile)
-            cat_name = CATEGORY_NAMES.get(cat, "?") if cat else "?"
-            info_text = f"{cat_name} #{self.selected_tile - TILE_BASE}"
-            drive_text = "Driveable" if is_driveable(self.selected_tile) else "Solid"
-
-        self.screen.blit(self.font_small.render(info_text, True, COLOR_WHITE),
-                         (6, info_y))
-
-        if drive_text:
-            drive_color = COL_DRIVEABLE if drive_text == "Driveable" else (200, 80, 80)
-            self.screen.blit(self.font_small.render(drive_text, True, drive_color),
-                             (6, info_y + 15))
-
-        self.screen.blit(self.font_small.render(
-            f"Brush: {self.brush_size}x{self.brush_size}", True, COLOR_GRAY),
-            (6, info_y + 30))
-
-        # ── Hover tile info ──
-        if self.browser_hover:
-            _, _, htid = self.browser_hover
-            hcat = get_tile_category(htid)
-            hname = CATEGORY_NAMES.get(hcat, "?") if hcat else "?"
-            hdrive = "drv" if is_driveable(htid) else "sld"
-            self.screen.blit(self.font_small.render(
-                f"[{hname}|{hdrive}]", True, (120, 140, 160)),
-                (6, info_y + 50))
-
-    def _draw_tileset_browser(self):
-        """Draw the tileset in its original layout, zoomable and scrollable."""
-        sheet = get_tileset_sheet()
-        if sheet is None:
-            self.screen.blit(
-                self.font.render("No tileset", True, (180, 180, 180)),
-                (BROWSER_X + 10, BROWSER_Y + 10))
-            return
-
-        ts_cols, ts_rows = get_tileset_dimensions()
-        z = self.browser_zoom
-
-        # Virtual size at current zoom
-        virt_w = ts_cols * z
-        virt_h = ts_rows * z
-
-        # Clamp scroll
-        max_sx = max(0, virt_w - BROWSER_W)
-        max_sy = max(0, virt_h - BROWSER_H)
-        self.browser_scroll_x = max(0, min(self.browser_scroll_x, max_sx))
-        self.browser_scroll_y = max(0, min(self.browser_scroll_y, max_sy))
-
-        sx = self.browser_scroll_x
-        sy = self.browser_scroll_y
-
-        # Visible tile range
-        col0 = max(0, int(sx / z))
-        row0 = max(0, int(sy / z))
-        col1 = min(ts_cols, col0 + int(BROWSER_W / z) + 2)
-        row1 = min(ts_rows, row0 + int(BROWSER_H / z) + 2)
-
-        if col1 <= col0 or row1 <= row0:
-            return
-
-        # Extract visible portion from sheet and scale
-        sheet_w, sheet_h = sheet.get_size()
-        src_x = col0 * TILE_BASE_PX
-        src_y = row0 * TILE_BASE_PX
-        src_w = min((col1 - col0) * TILE_BASE_PX, sheet_w - src_x)
-        src_h = min((row1 - row0) * TILE_BASE_PX, sheet_h - src_y)
-
-        if src_w <= 0 or src_h <= 0:
-            return
-
-        sub = sheet.subsurface(pygame.Rect(src_x, src_y, src_w, src_h))
-        dst_w = int(src_w * z / TILE_BASE_PX)
-        dst_h = int(src_h * z / TILE_BASE_PX)
-
-        if dst_w <= 0 or dst_h <= 0:
-            return
-
-        scaled = pygame.transform.scale(sub, (dst_w, dst_h))
-
-        blit_x = BROWSER_X + int(col0 * z - sx)
-        blit_y = BROWSER_Y + int(row0 * z - sy)
-
-        self.screen.blit(scaled, (blit_x, blit_y))
-
-        # Grid lines at higher zoom
-        if z >= 12:
-            self._draw_browser_grid(col0, row0, col1, row1, z, sx, sy)
-
-        # Selection highlight
-        self._draw_browser_selection(z, sx, sy)
-
-        # Hover highlight
-        self._draw_browser_hover(z, sx, sy)
-
-    def _draw_browser_grid(self, col0, row0, col1, row1, z, sx, sy):
-        """Draw grid lines between tiles in the browser at high zoom."""
-        alpha = min(60, int(z * 3))
-        grid_surf = pygame.Surface((BROWSER_W, BROWSER_H), pygame.SRCALPHA)
-        color = (255, 255, 255, alpha)
-
-        for col in range(col0, col1 + 1):
-            x = int(col * z - sx)
-            if 0 <= x < BROWSER_W:
-                pygame.draw.line(grid_surf, color, (x, 0), (x, BROWSER_H))
-
-        for row in range(row0, row1 + 1):
-            y = int(row * z - sy)
-            if 0 <= y < BROWSER_H:
-                pygame.draw.line(grid_surf, color, (0, y), (BROWSER_W, y))
-
-        self.screen.blit(grid_surf, (BROWSER_X, BROWSER_Y))
-
-    def _draw_browser_selection(self, z, sx, sy):
-        """Highlight the currently selected tile in the browser."""
-        if self.selected_tile in (T_EMPTY, T_FINISH):
-            return
-        info = get_tile_info(self.selected_tile)
-        if info is None:
-            return
-        sel_x = BROWSER_X + int(info['src_col'] * z - sx)
-        sel_y = BROWSER_Y + int(info['src_row'] * z - sy)
-        tile_sz = max(1, int(z))
-        if (sel_x + tile_sz >= BROWSER_X and sel_x < BROWSER_X + BROWSER_W and
-                sel_y + tile_sz >= BROWSER_Y and sel_y < BROWSER_Y + BROWSER_H):
-            thickness = max(1, int(z / 8))
-            pygame.draw.rect(self.screen, COL_TILE_SELECTED,
-                             (sel_x, sel_y, tile_sz, tile_sz), thickness)
-
-    def _draw_browser_hover(self, z, sx, sy):
-        """Highlight the tile under the cursor in the browser."""
-        mx, my = pygame.mouse.get_pos()
-        px = mx - BROWSER_X
-        py = my - BROWSER_Y
-
-        self.browser_hover = None
-
-        if not (0 <= px < BROWSER_W and 0 <= py < BROWSER_H):
-            return
-        if mx < BROWSER_X:
-            return
-
-        ts_col = int((px + sx) / z)
-        ts_row = int((py + sy) / z)
-
-        tile_id = get_tile_at_position(ts_row, ts_col)
-        if tile_id is not None:
-            self.browser_hover = (ts_row, ts_col, tile_id)
-            hx = BROWSER_X + int(ts_col * z - sx)
-            hy = BROWSER_Y + int(ts_row * z - sy)
-            tile_sz = max(1, int(z))
-            thickness = max(1, int(z / 12))
-            pygame.draw.rect(self.screen, COL_TILE_HOVER,
-                             (hx, hy, tile_sz, tile_sz), thickness)
+        # Inspector
+        self.inspector_panel.draw(self.screen)
 
     # ──────────────────────────────────────────
     # STATUS BAR
@@ -990,7 +801,19 @@ class TileEditor:
             row, col = self.screen_to_tile(mx, my)
             parts.append(f"Tile:({col},{row})")
 
-        parts.append(f"Brush:{self.brush_size}x{self.brush_size}")
+        bw = self.current_brush.width
+        bh = self.current_brush.height
+        parts.append(f"Brush:{bw}x{bh}")
+
+        # Show friction of tile under cursor
+        if self._is_in_viewport(mx, my):
+            row, col = self.screen_to_tile(mx, my)
+            if 0 <= row < GRID_ROWS and 0 <= col < GRID_COLS:
+                tid = self.terrain[row][col]
+                if tid != T_EMPTY:
+                    mgr = get_manager()
+                    fric = mgr.get_friction(tid)
+                    parts.append(f"Friction:{fric:.1f}")
 
         if self.current_name:
             parts.append(f"Track:{self.current_name}")
@@ -1006,18 +829,21 @@ class TileEditor:
         lines = [
             "=== TILE EDITOR ===",
             "",
-            "Left-click        Paint tile",
+            "Left-click         Paint brush",
             "Left-drag          Paint continuously",
-            "Right-click        Erase tile",
+            "Right-click        Erase",
             "",
             "Middle-drag        Pan viewport",
             "Space+drag         Pan viewport",
             "Scroll             Zoom in/out",
             "",
+            "Tileset: click     Select 1 tile",
+            "Tileset: drag      Select rectangle",
             "Tileset: scroll    Zoom tileset",
             "Tileset: R-drag    Pan tileset",
-            "Shift+1/2/3        Brush size",
+            "Tabs               Filter by category",
             "",
+            "Shift+1/2/3        Brush size",
             "Ctrl+Z / Ctrl+Y   Undo / Redo",
             "Ctrl+S             Save track",
             "Ctrl+O             Load track",
@@ -1026,11 +852,14 @@ class TileEditor:
             "T                  Test track",
             "H                  Toggle help",
             "ESC                Back to menu",
+            "",
+            "Property Inspector (right panel):",
+            "  Click fields to cycle values",
         ]
 
         line_h = 19
         pad = 10
-        max_w = 320
+        max_w = 340
         panel_h = len(lines) * line_h + pad * 2
 
         panel = pygame.Surface((max_w, panel_h), pygame.SRCALPHA)

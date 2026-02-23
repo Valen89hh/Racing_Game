@@ -185,3 +185,19 @@ TRACK_TILE_SCALE = 2           # 64x64 → 128x128 por tile
 TILE_SIZE = 64
 GRID_COLS = 56                 # WORLD_WIDTH // TILE_SIZE
 GRID_ROWS = 37                 # WORLD_HEIGHT // TILE_SIZE
+
+# ──────────────────────────────────────────────
+# EDITOR LAYOUT
+# ──────────────────────────────────────────────
+EDITOR_BOTTOM_PANEL_H = 200
+EDITOR_STATUS_BAR_H = 28
+EDITOR_TOOLS_W = 130
+EDITOR_INSPECTOR_W = 180
+
+# ──────────────────────────────────────────────
+# TILE CATEGORIES (used by tile_meta.py)
+# ──────────────────────────────────────────────
+TILE_CAT_TERRAIN = "terrain"       # driveable surfaces
+TILE_CAT_PROPS = "props"           # decorative, blocks movement
+TILE_CAT_OBSTACLES = "obstacles"   # walls, barriers
+TILE_CAT_SPECIAL = "special"       # finish, checkpoints

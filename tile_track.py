@@ -18,6 +18,7 @@ from tile_defs import (
     T_EMPTY, T_FINISH, is_driveable,
     GRASS_COLOR, get_tile_sprite,
 )
+from tile_collision import build_boundary_mask, build_friction_map
 
 
 class TileTrack:
@@ -37,10 +38,15 @@ class TileTrack:
 
     def __init__(self, tile_data: dict):
         self.terrain = tile_data["terrain"]
+        self._tile_overrides = tile_data.get("tile_overrides", None)
 
         # ── Pre-render ──
         self.track_surface = self._render_track()
         self.boundary_mask, self.boundary_surface = self._create_boundary_mask()
+
+        # ── Friction map ──
+        self.friction_map = build_friction_map(
+            self.terrain, overrides=self._tile_overrides)
 
         # ── Finish line ──
         self.finish_line = self._find_finish_line()
@@ -84,24 +90,10 @@ class TileTrack:
 
     def _create_boundary_mask(self):
         """
-        Crea mascara de colision.
-        Tiles driveable = libres. Todo lo demas = colision.
+        Crea mascara de colision usando el nuevo builder con soporte
+        para collision_type none/full/polygon por tile.
         """
-        surface = pygame.Surface((WORLD_WIDTH, WORLD_HEIGHT))
-        surface.set_colorkey((0, 0, 0))
-        surface.fill((255, 0, 0))
-
-        for row in range(GRID_ROWS):
-            for col in range(GRID_COLS):
-                tid = self.terrain[row][col]
-                if is_driveable(tid):
-                    x = col * TILE_SIZE
-                    y = row * TILE_SIZE
-                    pygame.draw.rect(surface, (0, 0, 0),
-                                     (x, y, TILE_SIZE, TILE_SIZE))
-
-        mask = pygame.mask.from_surface(surface)
-        return mask, surface
+        return build_boundary_mask(self.terrain)
 
     # ────────────────────────────────────────────
     # FINISH LINE
@@ -336,6 +328,14 @@ class TileTrack:
         if 0 <= ix < WORLD_WIDTH and 0 <= iy < WORLD_HEIGHT:
             return not self.boundary_mask.get_at((ix, iy))
         return False
+
+    def get_friction_at(self, x: float, y: float) -> float:
+        """Return the friction value at world position (x, y)."""
+        col = int(x // TILE_SIZE)
+        row = int(y // TILE_SIZE)
+        if 0 <= row < GRID_ROWS and 0 <= col < GRID_COLS:
+            return self.friction_map[row][col]
+        return 1.0
 
     def check_car_collision(self, car_mask, car_rect) -> bool:
         offset = (car_rect.x, car_rect.y)

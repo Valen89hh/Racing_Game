@@ -63,27 +63,33 @@ def save_track(filename, name, control_points):
     return filepath
 
 
-def save_tile_track(filename, name, terrain):
-    """Guarda una pista tile-based como archivo JSON.
+def save_tile_track(filename, name, terrain, tile_overrides=None):
+    """Guarda una pista tile-based como archivo JSON (v4 si tiene overrides, v3 otherwise).
 
     Args:
         filename: nombre del archivo (sin extensión, se agrega .json).
         name: nombre visible de la pista.
         terrain: grid 2D de IDs de terreno.
+        tile_overrides: optional dict of "row,col" -> {"friction": float}
     """
     _ensure_tracks_dir()
     if not filename.endswith(".json"):
         filename += ".json"
+
+    version = 4 if tile_overrides else 3
     data = {
         "name": name,
         "author": "Player",
-        "version": 3,
+        "version": version,
         "format": "tiles",
         "tile_size": 64,
         "grid_width": len(terrain[0]) if terrain else 0,
         "grid_height": len(terrain),
         "terrain": terrain,
     }
+    if tile_overrides:
+        data["tile_overrides"] = tile_overrides
+
     filepath = os.path.join(TRACKS_DIR, filename)
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=None)
@@ -107,8 +113,9 @@ def load_track(filename):
 
     # Detectar formato
     if data.get("format") == "tiles" or "terrain" in data:
-        # Formato tiles - no convertir, retornar tal cual
+        # Formato tiles (v3 or v4) - retornar tal cual
         data["format"] = "tiles"
+        # v4 may have tile_overrides, v3 doesn't - both work
     else:
         # Formato clasico
         data["control_points"] = [tuple(p) for p in data["control_points"]]

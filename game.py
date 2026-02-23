@@ -285,8 +285,8 @@ class Game:
             # Efectos de power-ups activos
             car.update_effects(dt)
 
-            # Física
-            self.physics.update(car, dt)
+            # Física (con per-tile friction si el track lo soporta)
+            self.physics.update(car, dt, self.track)
             car.update_sprite()
 
             # Colisiones con bordes

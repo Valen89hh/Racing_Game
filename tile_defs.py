@@ -221,12 +221,17 @@ def _make_grass_sprite():
 # ──────────────────────────────────────────────
 
 def is_driveable(tile_id):
-    """Returns True if tile is driveable (road or finish)."""
-    if tile_id == T_FINISH:
-        return True
+    """Returns True if tile is driveable (road or finish).
+    Delegates to TileMetadataManager when metadata is available."""
     if tile_id == T_EMPTY:
         return False
+    if tile_id == T_FINISH:
+        return True
     _ensure_loaded()
+    from tile_meta import get_manager
+    mgr = get_manager()
+    if mgr._loaded or tile_id not in _road_ids:
+        return mgr.is_driveable(tile_id)
     return tile_id in _road_ids
 
 
@@ -239,8 +244,13 @@ def get_tile_sprite(tile_id):
 
 
 def get_tiles_by_category(category):
-    """Returns list of tile_ids in the given category."""
+    """Returns list of tile_ids in the given category.
+    Also supports new meta categories (terrain, props, obstacles, special)."""
     _ensure_loaded()
+    # Support new meta categories directly
+    from tile_meta import ALL_CATEGORIES, get_manager
+    if category in ALL_CATEGORIES:
+        return get_manager().get_tiles_by_category(category)
     return _categories.get(category, [])
 
 
@@ -257,12 +267,26 @@ def get_tile_count():
 
 
 def get_tile_category(tile_id):
-    """Returns the category of a tile."""
+    """Returns the category of a tile.
+    Delegates to TileMetadataManager when metadata is available."""
     if tile_id == T_EMPTY:
         return None
     if tile_id == T_FINISH:
         return CAT_ROAD
     _ensure_loaded()
+    from tile_meta import get_manager
+    mgr = get_manager()
+    if mgr._loaded:
+        cat = mgr.get_category(tile_id)
+        # Map new categories back to legacy for compatibility
+        from tile_meta import META_TERRAIN, META_PROPS, META_OBSTACLES, META_SPECIAL
+        _reverse_map = {
+            META_TERRAIN: CAT_ROAD,
+            META_PROPS: CAT_NATURE,
+            META_OBSTACLES: CAT_DECOR,
+            META_SPECIAL: CAT_ROAD,
+        }
+        return _reverse_map.get(cat, CAT_DECOR)
     idx = tile_id - TILE_BASE
     if 0 <= idx < len(_tiles):
         return _tiles[idx]['category']

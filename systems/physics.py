@@ -32,11 +32,17 @@ class PhysicsSystem:
     Usa las propiedades effective_* del Car para soportar power-ups.
     """
 
-    def update(self, car: Car, dt: float):
-        """Actualiza la física de un auto para el frame actual."""
+    def update(self, car: Car, dt: float, track=None):
+        """Actualiza la física de un auto para el frame actual.
+
+        Args:
+            car: the car entity
+            dt: delta time
+            track: optional track with get_friction_at(x,y) for per-tile friction
+        """
         self._apply_acceleration(car, dt)
-        self._apply_friction(car, dt)
-        self._apply_turning(car, dt)
+        self._apply_friction(car, dt, track)
+        self._apply_turning(car, dt, track)
         self._apply_movement(car, dt)
 
     def _apply_acceleration(self, car: Car, dt: float):
@@ -80,12 +86,19 @@ class PhysicsSystem:
                 car.speed += accel * car.input_accelerate * dt * 0.5
             car.speed = max(car.speed, -car.reverse_max_speed)
 
-    def _apply_friction(self, car: Car, dt: float):
-        """Aplica fricción cuando no se acelera."""
+    def _apply_friction(self, car: Car, dt: float, track=None):
+        """Aplica fricción cuando no se acelera.
+        Per-tile friction modulates the base friction value."""
         if car.input_accelerate != 0:
             return
 
         friction = car.effective_friction
+
+        # Modulate by tile friction
+        tile_friction = 1.0
+        if track and hasattr(track, 'get_friction_at'):
+            tile_friction = track.get_friction_at(car.x, car.y)
+        friction *= tile_friction
 
         if abs(car.speed) < 5.0:
             car.speed = 0
@@ -100,8 +113,9 @@ class PhysicsSystem:
             if car.speed > 0:
                 car.speed = 0
 
-    def _apply_turning(self, car: Car, dt: float):
-        """Aplica rotación basándose en input, velocidad y multiplicador de giro."""
+    def _apply_turning(self, car: Car, dt: float, track=None):
+        """Aplica rotación basándose en input, velocidad y multiplicador de giro.
+        Slippery surfaces (friction < 0.8) reduce turning proportionally."""
         if car.input_turn == 0:
             return
 
@@ -114,6 +128,12 @@ class PhysicsSystem:
 
         if abs(car.speed) < 1.0 and wall_contact:
             base_turn = car.turn_speed_min
+
+        # Reduce turning on slippery tiles
+        if track and hasattr(track, 'get_friction_at'):
+            tile_friction = track.get_friction_at(car.x, car.y)
+            if tile_friction < 0.8:
+                base_turn *= tile_friction
 
         direction = 1.0 if car.speed >= 0 else -1.0
         car.angle += car.input_turn * base_turn * direction * dt
