@@ -49,8 +49,12 @@ mkdir "dist\release"
 :: Copy launcher.exe
 copy "dist\launcher.exe" "dist\release\launcher.exe" >nul
 
-:: Copy game folder
+:: Copy game folder (PyInstaller output)
 xcopy "dist\game" "dist\release\game\" /e /i /q >nul
+
+:: Copy tracks and brushes next to game.exe (writable, outside _internal)
+if exist "tracks" xcopy "tracks" "dist\release\game\tracks\" /e /i /q >nul
+if exist "brushes" xcopy "brushes" "dist\release\game\brushes\" /e /i /q >nul
 
 :: Copy version.txt and config.json
 copy "version.txt" "dist\release\version.txt" >nul
