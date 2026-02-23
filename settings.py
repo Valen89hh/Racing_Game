@@ -143,6 +143,8 @@ STATE_MENU = "menu"
 STATE_COUNTDOWN = "countdown"
 STATE_RACING = "racing"
 STATE_VICTORY = "victory"
+STATE_EDITOR = "editor"
+STATE_TRACK_SELECT = "track_select"
 
 # ──────────────────────────────────────────────
 # JUGADORES (preparado para multiplayer futuro)
@@ -159,3 +161,27 @@ PLAYER_CONTROLS = {
     0: {"up": "w", "down": "s", "left": "a", "right": "d"},
     1: {"up": "up", "down": "down", "left": "left", "right": "right"},
 }
+
+# ──────────────────────────────────────────────
+# PIXEL ART SPRITES
+# ──────────────────────────────────────────────
+SPRITE_SCALE = 3               # factor de escala para sprites 16x16 → 48x48
+SPRITE_FRAME_SIZE = 16         # tamaño original de cada frame del sprite
+
+# Archivos de sprites de autos (en assets/cars/)
+CAR_SPRITES = {
+    0: "player_blue.png",      # Jugador 1
+    1: "player_red.png",       # Bot / Jugador 2
+    2: "player_green.png",     # Jugador 3
+    3: "player_yellow.png",    # Jugador 4
+}
+
+# Escala del tile de textura de pista
+TRACK_TILE_SCALE = 2           # 64x64 → 128x128 por tile
+
+# ──────────────────────────────────────────────
+# TILES (editor tile-based)
+# ──────────────────────────────────────────────
+TILE_SIZE = 64
+GRID_COLS = 56                 # WORLD_WIDTH // TILE_SIZE
+GRID_ROWS = 37                 # WORLD_HEIGHT // TILE_SIZE

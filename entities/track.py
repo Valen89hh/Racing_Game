@@ -12,6 +12,7 @@ requiere una cámara para visualizarse.
 
 import pygame
 import math
+import random
 
 from settings import (
     WORLD_WIDTH, WORLD_HEIGHT, SCREEN_WIDTH, SCREEN_HEIGHT,
@@ -19,7 +20,10 @@ from settings import (
     COLOR_CURB_RED, COLOR_CURB_WHITE, COLOR_WHITE, COLOR_YELLOW,
     TRACK_HALF_WIDTH, TRACK_BORDER_THICKNESS,
     MINIMAP_SCALE, MINIMAP_MARGIN, COLOR_MINIMAP_BG,
+    TRACK_TILE_SCALE,
 )
+from utils.sprites import load_image, extract_tiles
+from track_manager import get_default_control_points
 
 
 class Track:
@@ -35,46 +39,12 @@ class Track:
     6. Minimapa pre-renderizado.
     """
 
-    def __init__(self):
+    def __init__(self, control_points=None):
         # ── Paso 1: Puntos de control del circuito ──
-        # Diseño inspirado en circuitos reales: rectas largas, curvas cerradas,
-        # S-curves y chicanas. Sentido horario.
-        control_points = [
-            # Start/finish straight (arriba, hacia la derecha)
-            (550, 500),  (850, 500),  (1150, 500),  (1500, 500),
-            (1800, 500),
-
-            # Curva 1 — sweeper derecha bajando al sureste
-            (2050, 530),  (2250, 620),  (2400, 780),  (2480, 980),
-
-            # Recta descendente
-            (2500, 1200),  (2480, 1400),
-
-            # Curva 2 — hairpin derecho
-            (2520, 1560),  (2640, 1680),  (2820, 1720),
-            (2980, 1660),  (3060, 1520),  (3060, 1360),
-
-            # S-curves
-            (3020, 1200),  (3080, 1050),  (3200, 940),
-            (3150, 800),  (3020, 740),  (2880, 820),
-
-            # Recta larga hacia el suroeste
-            (2760, 960),  (2580, 1140),  (2340, 1380),
-            (2080, 1620),  (1820, 1800),
-
-            # Curva 3 — amplia izquierda al oeste
-            (1540, 1900),  (1260, 1920),  (1020, 1840),
-            (840, 1700),
-
-            # Recta al noroeste
-            (740, 1500),  (700, 1300),
-
-            # Curva 4 — derecha subiendo
-            (660, 1100),  (580, 940),  (520, 800),
-
-            # Chicana final antes de la recta de meta
-            (500, 700),  (520, 620),
-        ]
+        if control_points is None:
+            control_points = get_default_control_points()
+        control_points = list(control_points)
+        self.control_points = [tuple(p) for p in control_points]
 
         # ── Paso 2: Suavizar con Chaikin ──
         self.centerline = self._chaikin_smooth(control_points, iterations=3)
@@ -193,6 +163,28 @@ class Track:
             pts = new_pts
         return pts
 
+    @staticmethod
+    def offset_path_static(centerline: list[tuple[float, float]],
+                           offset_dist: float) -> list[tuple[float, float]]:
+        """Versión estática de _offset_path para uso externo (ej. editor)."""
+        result = []
+        n = len(centerline)
+        for i in range(n):
+            p_prev = centerline[(i - 1) % n]
+            p_next = centerline[(i + 1) % n]
+            dx = p_next[0] - p_prev[0]
+            dy = p_next[1] - p_prev[1]
+            length = math.hypot(dx, dy)
+            if length < 0.001:
+                result.append(centerline[i])
+                continue
+            nx = -dy / length
+            ny = dx / length
+            ox = centerline[i][0] + nx * offset_dist
+            oy = centerline[i][1] + ny * offset_dist
+            result.append((ox, oy))
+        return result
+
     def _offset_path(self, centerline: list[tuple[float, float]],
                      offset_dist: float) -> list[tuple[float, float]]:
         """
@@ -238,53 +230,155 @@ class Track:
 
     def _render_track(self) -> pygame.Surface:
         """
-        Pre-renderiza el circuito completo en una superficie del tamaño del mundo.
+        Pre-renderiza el circuito completo con texturas pixel art.
 
-        Usa el método de "tubo de círculos" en lugar de polygon fill para
-        evitar artefactos cuando el circuito se cruza consigo mismo
-        (hairpins, S-curves).  Los círculos cubren la centerline con radio
-        TRACK_HALF_WIDTH, garantizando cobertura uniforme.
+        Usa tiles del asset pack para el césped y colores del pixel art
+        para el asfalto, bordillos y líneas.
         """
         surface = pygame.Surface((WORLD_WIDTH, WORLD_HEIGHT))
 
-        # Fondo de césped con patrón de franjas
-        surface.fill(COLOR_GRASS)
-        stripe_width = 60
-        for x in range(0, WORLD_WIDTH, stripe_width * 2):
-            pygame.draw.rect(surface, COLOR_GRASS_LIGHT,
-                             (x, 0, stripe_width, WORLD_HEIGHT))
+        # ── Colores extraídos del pixel art ──
+        pa_grass = (66, 173, 55)       # verde del Summer_road
+        pa_grass_dark = (55, 148, 46)  # variante más oscura
+        pa_asphalt = (103, 97, 95)     # gris del Summer_road
+        pa_asphalt_dark = (85, 80, 78) # gris más oscuro para línea central
+        pa_curb_orange = (196, 117, 64)  # naranja del Summer_road
+        pa_curb_white = (230, 225, 210)  # blanco cálido
+        pa_yellow = (241, 187, 59)     # amarillo de la línea central
 
-        # Asfalto: dibujar círculos a lo largo de la centerline.
-        # Los puntos están separados ~14px, el radio es 75px, por lo que
-        # los círculos se solapan ampliamente → cobertura sin huecos.
+        # ── Fondo de césped tileado ──
+        self._tile_grass(surface, pa_grass, pa_grass_dark)
+
+        # ── Asfalto: círculos a lo largo de la centerline ──
         hw = TRACK_HALF_WIDTH
         for p in self.centerline:
-            pygame.draw.circle(surface, COLOR_ASPHALT,
+            pygame.draw.circle(surface, pa_asphalt,
                                (int(p[0]), int(p[1])), hw)
 
-        # Línea central punteada
+        # ── Línea central punteada (amarillo pixel art) ──
         for i in range(0, self.num_points, 4):
             if i % 8 < 4:
                 p1 = self.centerline[i]
                 p2 = self.centerline[(i + 1) % self.num_points]
-                pygame.draw.line(surface, COLOR_ASPHALT_DARK,
+                pygame.draw.line(surface, pa_yellow,
                                  (int(p1[0]), int(p1[1])),
                                  (int(p2[0]), int(p2[1])), 2)
 
-        # Bordillos exteriores e interiores (siguen siendo polilíneas)
-        self._draw_curbs(surface, self.outer_boundary)
-        self._draw_curbs(surface, self.inner_boundary)
+        # ── Bordillos (naranja/blanco del pixel art) ──
+        self._draw_curbs_pa(surface, self.outer_boundary,
+                            pa_curb_orange, pa_curb_white)
+        self._draw_curbs_pa(surface, self.inner_boundary,
+                            pa_curb_orange, pa_curb_white)
 
-        # Bordes blancos
-        self._draw_polyline(surface, self.outer_boundary, COLOR_WHITE,
+        # ── Bordes blancos ──
+        self._draw_polyline(surface, self.outer_boundary, pa_curb_white,
                             TRACK_BORDER_THICKNESS)
-        self._draw_polyline(surface, self.inner_boundary, COLOR_WHITE,
+        self._draw_polyline(surface, self.inner_boundary, pa_curb_white,
                             TRACK_BORDER_THICKNESS)
 
-        # Línea de meta (damero)
+        # ── Línea de meta (damero) ──
         self._draw_finish_line(surface)
 
+        # ── Decoraciones de césped (sprites del asset pack) ──
+        self._scatter_grass_details(surface)
+
+        # ── Props a lo largo de los bordes ──
+        self._place_trackside_props(surface)
+
         return surface
+
+    def _tile_grass(self, surface, color_main, color_dark):
+        """Rellena el fondo con un patrón de césped pixel art."""
+        tile_size = 16 * TRACK_TILE_SCALE  # 32px por tile
+
+        # Crear tiles de césped con variación
+        grass_tile_a = pygame.Surface((tile_size, tile_size))
+        grass_tile_a.fill(color_main)
+        grass_tile_b = pygame.Surface((tile_size, tile_size))
+        grass_tile_b.fill(color_dark)
+
+        # Patrón de checkerboard sutil
+        for ty in range(0, WORLD_HEIGHT, tile_size):
+            for tx in range(0, WORLD_WIDTH, tile_size):
+                if ((tx // tile_size) + (ty // tile_size)) % 2 == 0:
+                    surface.blit(grass_tile_a, (tx, ty))
+                else:
+                    surface.blit(grass_tile_b, (tx, ty))
+
+    def _draw_curbs_pa(self, surface, boundary, color_a, color_b):
+        """Dibuja bordillos alternando naranja/blanco (pixel art)."""
+        n = len(boundary)
+        for i in range(0, n, 2):
+            p1 = boundary[i]
+            p2 = boundary[(i + 1) % n]
+            color = color_a if (i // 2) % 2 == 0 else color_b
+            pygame.draw.line(surface, color,
+                             (int(p1[0]), int(p1[1])),
+                             (int(p2[0]), int(p2[1])), 5)
+
+    def _scatter_grass_details(self, surface):
+        """Coloca sprites de detalle de césped en áreas fuera de la pista."""
+        try:
+            detail_tiles = extract_tiles("levels/summer_details.png",
+                                         tile_size=16, scale=TRACK_TILE_SCALE)
+        except (FileNotFoundError, pygame.error):
+            return
+
+        if not detail_tiles:
+            return
+
+        # Generar posiciones pseudo-aleatorias para detalles de césped
+        rng = random.Random(42)  # seed fija para reproducibilidad
+        hw = TRACK_HALF_WIDTH + 40  # margen fuera de la pista
+
+        for _ in range(300):
+            x = rng.randint(50, WORLD_WIDTH - 50)
+            y = rng.randint(50, WORLD_HEIGHT - 50)
+
+            # Verificar que esté fuera de la pista
+            on_track = False
+            for p in self.centerline[::8]:
+                dx = x - p[0]
+                dy = y - p[1]
+                if dx * dx + dy * dy < hw * hw:
+                    on_track = True
+                    break
+
+            if not on_track:
+                tile = rng.choice(detail_tiles)
+                surface.blit(tile, (x, y))
+
+    def _place_trackside_props(self, surface):
+        """Coloca props decorativos a lo largo de los bordes de la pista."""
+        try:
+            prop_tiles = extract_tiles("props/misc_props.png",
+                                       tile_size=16, scale=TRACK_TILE_SCALE)
+        except (FileNotFoundError, pygame.error):
+            return
+
+        if not prop_tiles:
+            return
+
+        rng = random.Random(123)
+        # Colocar props cada ~200 puntos a lo largo del borde exterior
+        step = max(1, self.num_points // 30)
+        for i in range(0, self.num_points, step):
+            bp = self.outer_boundary[i]
+
+            # Desplazar un poco más afuera de la pista
+            cp = self.centerline[i]
+            dx = bp[0] - cp[0]
+            dy = bp[1] - cp[1]
+            dist = math.hypot(dx, dy)
+            if dist < 1:
+                continue
+            nx, ny = dx / dist, dy / dist
+            px = int(bp[0] + nx * 25)
+            py = int(bp[1] + ny * 25)
+
+            if 0 <= px < WORLD_WIDTH - 32 and 0 <= py < WORLD_HEIGHT - 32:
+                prop = rng.choice(prop_tiles)
+                surface.blit(prop, (px - 16, py - 16))
 
     def _draw_curbs(self, surface: pygame.Surface,
                     boundary: list[tuple[float, float]]):
@@ -474,9 +568,9 @@ class Track:
         src_x = int(camera.cx) - half_diag
         src_y = int(camera.cy) - half_diag
 
-        # Crear chunk y rellenar con césped (áreas fuera del mundo)
+        # Crear chunk y rellenar con césped (color pixel art)
         chunk = pygame.Surface((chunk_size, chunk_size))
-        chunk.fill(COLOR_GRASS)
+        chunk.fill((66, 173, 55))
 
         # Copiar la porción válida del track_surface al chunk
         blit_x = max(0, -src_x)

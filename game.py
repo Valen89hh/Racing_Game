@@ -22,6 +22,7 @@ from settings import (
     COLOR_BLACK, COLOR_WHITE, COLOR_YELLOW, COLOR_GREEN,
     COLOR_RED, COLOR_GRAY, COLOR_DARK_GRAY, COLOR_ORANGE, COLOR_BLUE,
     STATE_MENU, STATE_COUNTDOWN, STATE_RACING, STATE_VICTORY,
+    STATE_EDITOR, STATE_TRACK_SELECT,
     PLAYER_COLORS, TOTAL_LAPS, HUD_FONT_SIZE, HUD_TITLE_FONT_SIZE,
     HUD_SUBTITLE_FONT_SIZE, HUD_MARGIN, MINIMAP_MARGIN, MINIMAP_CAR_DOT,
     BOT_ACCELERATION, BOT_MAX_SPEED, BOT_TURN_SPEED,
@@ -40,6 +41,9 @@ from systems.ai import AISystem
 from systems.camera import Camera
 from utils.timer import RaceTimer
 from utils.helpers import draw_text_centered
+from editor import TileEditor
+from tile_track import TileTrack
+import track_manager
 
 
 class Game:
@@ -88,6 +92,15 @@ class Game:
         self.winner = None
         self.final_times = {}
 
+        # Editor y selección de pista
+        self.editor = None
+        self.track_list = []
+        self.track_selected = 0
+        self.return_to_editor = False  # para volver al editor tras test race
+
+        # Exportar circuito por defecto si no existe
+        track_manager.export_default_track()
+
     # ──────────────────────────────────────────────
     # GAME LOOP
     # ──────────────────────────────────────────────
@@ -115,29 +128,69 @@ class Game:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
+                continue
 
-            elif event.type == pygame.KEYDOWN:
+            # Editor captura sus propios eventos
+            if self.state == STATE_EDITOR and self.editor:
+                self.editor.handle_event(event)
+                if self.editor.result == "menu":
+                    self.state = STATE_MENU
+                    self.editor = None
+                elif self.editor.result == "test":
+                    tile_data = self.editor._build_tile_data()
+                    self.return_to_editor = True
+                    self._start_race(tile_data=tile_data)
+                    self.editor.result = None
+                continue
+
+            if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     if self.state in (STATE_RACING, STATE_COUNTDOWN):
+                        if self.return_to_editor:
+                            self._open_editor_with_points()
+                        else:
+                            self.state = STATE_MENU
+                    elif self.state == STATE_TRACK_SELECT:
                         self.state = STATE_MENU
                     else:
                         self.running = False
 
+                elif event.key == pygame.K_e:
+                    if self.state == STATE_MENU:
+                        self._open_editor()
+                    elif self.state == STATE_TRACK_SELECT:
+                        self._edit_selected_track()
+
                 elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER,
                                    pygame.K_SPACE):
                     if self.state == STATE_MENU:
-                        self._start_race()
+                        self._open_track_select()
+                    elif self.state == STATE_TRACK_SELECT:
+                        self._start_selected_track()
                     elif self.state == STATE_VICTORY:
-                        self.state = STATE_MENU
+                        if self.return_to_editor:
+                            self._open_editor_with_points()
+                        else:
+                            self.state = STATE_MENU
+
+                elif self.state == STATE_TRACK_SELECT:
+                    if event.key == pygame.K_UP:
+                        self.track_selected = max(0, self.track_selected - 1)
+                    elif event.key == pygame.K_DOWN:
+                        self.track_selected = min(
+                            len(self.track_list) - 1, self.track_selected + 1)
 
     # ──────────────────────────────────────────────
     # INICIALIZACIÓN DE CARRERA
     # ──────────────────────────────────────────────
 
-    def _start_race(self):
+    def _start_race(self, control_points=None, tile_data=None):
         """Inicializa una nueva carrera."""
         # Circuito
-        self.track = Track()
+        if tile_data:
+            self.track = TileTrack(tile_data)
+        else:
+            self.track = Track(control_points=control_points)
 
         # Autos
         self.cars = []
@@ -190,6 +243,8 @@ class Game:
             self._update_countdown(dt)
         elif self.state == STATE_RACING:
             self._update_racing(dt)
+        elif self.state == STATE_EDITOR and self.editor:
+            self.editor.update(dt)
 
     def _update_countdown(self, dt: float):
         """Actualiza la cuenta regresiva."""
@@ -383,6 +438,10 @@ class Game:
         elif self.state == STATE_VICTORY:
             self._render_race()
             self._render_victory()
+        elif self.state == STATE_EDITOR and self.editor:
+            self.editor.render()
+        elif self.state == STATE_TRACK_SELECT:
+            self._render_track_select()
 
         pygame.display.flip()
 
@@ -405,6 +464,7 @@ class Game:
             "A / D   -  Turn Left / Right",
             "SPACE   -  Handbrake",
             "L-SHIFT -  Use Power-Up",
+            "E       -  Track Editor",
             "ESC     -  Back to Menu",
         ]
         for i, text in enumerate(instructions):
@@ -650,6 +710,110 @@ class Game:
 
         draw_text_centered(self.screen, "Press ENTER to return to menu",
                            self.font, COLOR_GRAY, SCREEN_HEIGHT - 80)
+
+    # ──────────────────────────────────────────────
+    # EDITOR & TRACK SELECT
+    # ──────────────────────────────────────────────
+
+    def _open_editor(self):
+        """Abre el editor de pistas."""
+        self.editor = TileEditor(self.screen)
+        self.state = STATE_EDITOR
+        self.return_to_editor = False
+
+    def _open_editor_with_points(self):
+        """Vuelve al editor conservando los tiles de la carrera de prueba."""
+        if self.editor is None:
+            self.editor = TileEditor(self.screen)
+        self.state = STATE_EDITOR
+        self.return_to_editor = False
+        self.editor.result = None
+
+    def _open_track_select(self):
+        """Abre la pantalla de selección de pista."""
+        self.track_list = track_manager.list_tracks()
+        self.track_selected = 0
+        self.state = STATE_TRACK_SELECT
+        self.return_to_editor = False
+
+    def _start_selected_track(self):
+        """Inicia carrera con la pista seleccionada."""
+        if not self.track_list:
+            return
+        entry = self.track_list[self.track_selected]
+        try:
+            data = track_manager.load_track(entry["filename"])
+            if data.get("format") == "tiles":
+                self._start_race(tile_data=data)
+            else:
+                self._start_race(control_points=data["control_points"])
+        except (OSError, KeyError):
+            pass
+
+    def _edit_selected_track(self):
+        """Abre la pista seleccionada en el editor para editarla."""
+        if not self.track_list:
+            return
+        entry = self.track_list[self.track_selected]
+        if entry.get("type") != "tiles":
+            return
+        self.editor = TileEditor(self.screen)
+        if self.editor.load_from_file(entry["filename"]):
+            self.state = STATE_EDITOR
+            self.return_to_editor = False
+        else:
+            self.editor = None
+
+    def _render_track_select(self):
+        """Renderiza la pantalla de selección de pista."""
+        # Gradient background
+        for y in range(SCREEN_HEIGHT):
+            ratio = y / SCREEN_HEIGHT
+            r = int(10 + 20 * ratio)
+            g = int(10 + 15 * ratio)
+            b = int(30 + 40 * ratio)
+            pygame.draw.line(self.screen, (r, g, b), (0, y), (SCREEN_WIDTH, y))
+
+        draw_text_centered(self.screen, "SELECT TRACK",
+                           self.font_title, COLOR_YELLOW, 80)
+
+        if not self.track_list:
+            draw_text_centered(self.screen, "No tracks found",
+                               self.font_subtitle, COLOR_GRAY, 200)
+            draw_text_centered(self.screen, "Press E in menu to create one",
+                               self.font, COLOR_GRAY, 250)
+        else:
+            start_y = 180
+            visible = 12
+            start_idx = max(0, self.track_selected - visible + 1)
+            end_idx = min(len(self.track_list), start_idx + visible)
+
+            for i_draw, i in enumerate(range(start_idx, end_idx)):
+                entry = self.track_list[i]
+                yy = start_y + i_draw * 38
+                name = entry["name"]
+                fname = entry["filename"]
+                track_type = entry.get("type", "classic")
+
+                if i == self.track_selected:
+                    sel_rect = pygame.Rect(
+                        SCREEN_WIDTH // 2 - 250, yy - 2, 500, 34)
+                    pygame.draw.rect(self.screen, (40, 50, 90), sel_rect,
+                                     border_radius=4)
+                    pygame.draw.rect(self.screen, COLOR_YELLOW, sel_rect, 1,
+                                     border_radius=4)
+                    color = COLOR_YELLOW
+                else:
+                    color = COLOR_WHITE
+
+                type_tag = f" [{track_type}]" if track_type == "tiles" else ""
+                draw_text_centered(self.screen, name + type_tag,
+                                   self.font_subtitle, color, yy)
+                draw_text_centered(self.screen, f"({fname})",
+                                   self.font_small, COLOR_GRAY, yy + 22)
+
+        draw_text_centered(self.screen, "UP/DOWN select | ENTER race | E edit | ESC back",
+                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
 
     # ──────────────────────────────────────────────
     # HELPERS

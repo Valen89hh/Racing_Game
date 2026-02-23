@@ -23,8 +23,10 @@ from settings import (
     OIL_FRICTION_MULT, OIL_TURN_MULT,
     MISSILE_SLOW_FACTOR,
     POWERUP_COLORS, COLOR_WHITE,
+    CAR_SPRITES, SPRITE_SCALE, SPRITE_FRAME_SIZE,
 )
 from utils.helpers import create_car_surface, angle_to_vector
+from utils.sprites import load_car_frames
 
 
 class Car:
@@ -90,12 +92,12 @@ class Car:
         self.is_shielded = False           # si el escudo está activo
         self.active_effects = {}           # {effect_name: seconds_remaining}
 
-        # Sprite
+        # Sprite (pixel art, frame 0 = apuntando arriba)
         self.width = CAR_WIDTH
         self.height = CAR_HEIGHT
-        self.original_surface = create_car_surface(
-            self.width, self.height, self.color
-        )
+        sprite_file = CAR_SPRITES.get(player_id, "player_blue.png")
+        frames = load_car_frames(sprite_file, SPRITE_FRAME_SIZE, SPRITE_SCALE)
+        self.original_surface = frames[0]
         self.surface = self.original_surface
         self.rect = self.surface.get_rect(center=(self.x, self.y))
         self.mask = pygame.mask.from_surface(self.surface)
@@ -215,7 +217,7 @@ class Car:
         self.input_use_powerup = False
 
     def draw(self, surface: pygame.Surface, camera):
-        """Dibuja el auto en pantalla usando la cámara rotativa."""
+        """Dibuja el auto en pantalla usando el sprite pixel art rotado."""
         sx, sy = camera.world_to_screen(self.x, self.y)
 
         # Rotar sprite según ángulo relativo a la cámara
