@@ -20,18 +20,23 @@ _BRUSHES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brushes
 
 
 class Brush:
-    """Rectangular grid of tile IDs."""
+    """Rectangular grid of tile IDs with per-cell rotations."""
 
-    def __init__(self, tiles: list[list[int]], name: str = ""):
+    def __init__(self, tiles: list[list[int]], name: str = "",
+                 rotations: list[list[int]] | None = None):
         self.tiles = tiles
         self.height = len(tiles)
         self.width = len(tiles[0]) if tiles else 0
         self.name = name
+        if rotations is not None:
+            self.rotations = rotations
+        else:
+            self.rotations = [[0] * self.width for _ in range(self.height)]
 
     @staticmethod
-    def single(tile_id: int) -> Brush:
+    def single(tile_id: int, rotation: int = 0) -> Brush:
         """Create a 1x1 brush from a single tile."""
-        return Brush([[tile_id]], name="")
+        return Brush([[tile_id]], name="", rotations=[[rotation]])
 
     @staticmethod
     def from_selection(terrain: list[list[int]],
@@ -73,9 +78,15 @@ class Brush:
             tiles.append(row)
         return Brush(tiles)
 
-    def paint_at(self, terrain: list[list[int]], row: int, col: int):
+    def paint_at(self, terrain: list[list[int]], row: int, col: int,
+                 rotations_grid: list[list[int]] | None = None,
+                 rotation_offset: int = 0):
         """Stamp this brush onto terrain at (row, col).
         T_EMPTY cells in the brush are treated as transparent (not painted).
+
+        Args:
+            rotations_grid: the editor's rotation grid to write into.
+            rotation_offset: additional rotation (0-3) applied to each cell.
         """
         for dr in range(self.height):
             for dc in range(self.width):
@@ -86,8 +97,12 @@ class Brush:
                 c = col + dc
                 if 0 <= r < GRID_ROWS and 0 <= c < GRID_COLS:
                     terrain[r][c] = tid
+                    if rotations_grid is not None:
+                        rot = (self.rotations[dr][dc] + rotation_offset) % 4
+                        rotations_grid[r][c] = rot
 
-    def get_preview_surface(self, cell_size: int = 32) -> pygame.Surface:
+    def get_preview_surface(self, cell_size: int = 32,
+                            rotation_offset: int = 0) -> pygame.Surface:
         """Render a small preview of this brush."""
         w = self.width * cell_size
         h = self.height * cell_size
@@ -98,7 +113,8 @@ class Brush:
                 tid = self.tiles[dr][dc]
                 if tid == T_EMPTY:
                     continue
-                sprite = get_tile_sprite(tid)
+                rot = (self.rotations[dr][dc] + rotation_offset) % 4
+                sprite = get_tile_sprite(tid, rot)
                 if sprite is not None:
                     scaled = pygame.transform.scale(sprite, (cell_size, cell_size))
                     surf.blit(scaled, (dc * cell_size, dr * cell_size))
@@ -109,18 +125,23 @@ class Brush:
         return surf
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "name": self.name,
             "width": self.width,
             "height": self.height,
             "tiles": self.tiles,
         }
+        # Only include rotations if any non-zero
+        if any(r != 0 for row in self.rotations for r in row):
+            d["rotations"] = self.rotations
+        return d
 
     @staticmethod
     def from_dict(d: dict) -> Brush:
         return Brush(
             tiles=d["tiles"],
             name=d.get("name", ""),
+            rotations=d.get("rotations"),
         )
 
 

@@ -63,20 +63,25 @@ def save_track(filename, name, control_points):
     return filepath
 
 
-def save_tile_track(filename, name, terrain, tile_overrides=None):
-    """Guarda una pista tile-based como archivo JSON (v4 si tiene overrides, v3 otherwise).
+def save_tile_track(filename, name, terrain, tile_overrides=None,
+                    rotations=None):
+    """Guarda una pista tile-based como archivo JSON.
 
     Args:
         filename: nombre del archivo (sin extensión, se agrega .json).
         name: nombre visible de la pista.
         terrain: grid 2D de IDs de terreno.
         tile_overrides: optional dict of "row,col" -> {"friction": float}
+        rotations: optional 2D grid of rotation values (0-3).
     """
     _ensure_tracks_dir()
     if not filename.endswith(".json"):
         filename += ".json"
 
-    version = 4 if tile_overrides else 3
+    has_overrides = bool(tile_overrides)
+    has_rotations = rotations and any(
+        r != 0 for row in rotations for r in row)
+    version = 4 if (has_overrides or has_rotations) else 3
     data = {
         "name": name,
         "author": "Player",
@@ -89,6 +94,8 @@ def save_tile_track(filename, name, terrain, tile_overrides=None):
     }
     if tile_overrides:
         data["tile_overrides"] = tile_overrides
+    if has_rotations:
+        data["rotations"] = rotations
 
     filepath = os.path.join(TRACKS_DIR, filename)
     with open(filepath, "w", encoding="utf-8") as f:

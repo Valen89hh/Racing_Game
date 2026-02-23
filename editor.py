@@ -18,7 +18,7 @@ from tile_defs import (
     T_EMPTY, T_FINISH, TILE_BASE,
     is_driveable, get_tile_sprite,
     GRASS_COLOR, GRASS_DARK,
-    empty_terrain,
+    empty_terrain, empty_rotations,
 )
 from tile_meta import get_manager, CATEGORY_DISPLAY
 from tile_brush import Brush, BrushLibrary
@@ -69,6 +69,8 @@ class TileEditor:
 
         # Tile data
         self.terrain = empty_terrain()
+        self.rotations = empty_rotations()
+        self.current_rotation = 0  # 0-3: 0/90/180/270 degrees
 
         # Viewport
         self.cam_x = (GRID_COLS * TILE_SIZE) / 2
@@ -215,7 +217,8 @@ class TileEditor:
     # ──────────────────────────────────────────
 
     def _push_undo(self):
-        snap = [row[:] for row in self.terrain]
+        snap = ([row[:] for row in self.terrain],
+                [row[:] for row in self.rotations])
         self.undo_stack.append(snap)
         if len(self.undo_stack) > MAX_UNDO:
             self.undo_stack.pop(0)
@@ -224,14 +227,16 @@ class TileEditor:
     def _undo(self):
         if not self.undo_stack:
             return
-        self.redo_stack.append([row[:] for row in self.terrain])
-        self.terrain = self.undo_stack.pop()
+        self.redo_stack.append(([row[:] for row in self.terrain],
+                                [row[:] for row in self.rotations]))
+        self.terrain, self.rotations = self.undo_stack.pop()
 
     def _redo(self):
         if not self.redo_stack:
             return
-        self.undo_stack.append([row[:] for row in self.terrain])
-        self.terrain = self.redo_stack.pop()
+        self.undo_stack.append(([row[:] for row in self.terrain],
+                                [row[:] for row in self.rotations]))
+        self.terrain, self.rotations = self.redo_stack.pop()
 
     # ──────────────────────────────────────────
     # PAINTING
@@ -247,8 +252,12 @@ class TileEditor:
                     r, c = row + dr, col + dc
                     if 0 <= r < GRID_ROWS and 0 <= c < GRID_COLS:
                         self.terrain[r][c] = T_EMPTY
+                        self.rotations[r][c] = 0
         else:
-            self.current_brush.paint_at(self.terrain, row, col)
+            self.current_brush.paint_at(
+                self.terrain, row, col,
+                rotations_grid=self.rotations,
+                rotation_offset=self.current_rotation)
 
     def _erase_at(self, row, col):
         w = max(1, self.current_brush.width)
@@ -258,6 +267,7 @@ class TileEditor:
                 r, c = row + dr, col + dc
                 if 0 <= r < GRID_ROWS and 0 <= c < GRID_COLS:
                     self.terrain[r][c] = T_EMPTY
+                    self.rotations[r][c] = 0
 
     # ──────────────────────────────────────────
     # FIT VIEW / STATUS
@@ -292,7 +302,7 @@ class TileEditor:
         return has_finish and count >= 10
 
     def _build_tile_data(self):
-        return {
+        data = {
             "name": self.current_name or "Untitled",
             "format": "tiles",
             "version": 3,
@@ -301,6 +311,12 @@ class TileEditor:
             "grid_height": GRID_ROWS,
             "terrain": [row[:] for row in self.terrain],
         }
+        has_rotations = any(
+            r != 0 for row in self.rotations for r in row)
+        if has_rotations:
+            data["rotations"] = [row[:] for row in self.rotations]
+            data["version"] = 4
+        return data
 
     # ──────────────────────────────────────────
     # DIALOGS
@@ -326,7 +342,9 @@ class TileEditor:
             return
         filename = name.lower().replace(" ", "_")
         try:
-            track_manager.save_tile_track(filename, name, self.terrain)
+            track_manager.save_tile_track(
+                filename, name, self.terrain,
+                rotations=self.rotations)
             self.current_filename = filename
             self.current_name = name
             self._close_dialog()
@@ -345,6 +363,9 @@ class TileEditor:
                 return
             self._push_undo()
             self.terrain = data["terrain"]
+            self.rotations = data.get("rotations", None)
+            if self.rotations is None:
+                self.rotations = empty_rotations()
             self.current_filename = entry["filename"].replace(".json", "")
             self.current_name = data.get("name", self.current_filename)
             self._close_dialog()
@@ -362,6 +383,9 @@ class TileEditor:
                 return False
             self._push_undo()
             self.terrain = data["terrain"]
+            self.rotations = data.get("rotations", None)
+            if self.rotations is None:
+                self.rotations = empty_rotations()
             self.current_filename = filename.replace(".json", "")
             self.current_name = data.get("name", self.current_filename)
             self._fit_view()
@@ -377,7 +401,8 @@ class TileEditor:
                 track_manager.save_tile_track(
                     self.current_filename,
                     self.current_name or self.current_filename,
-                    self.terrain)
+                    self.terrain,
+                    rotations=self.rotations)
                 self._show_msg(f"Saved: {self.current_filename}.json")
             except OSError as e:
                 self._show_msg(f"Error: {e}")
@@ -462,9 +487,19 @@ class TileEditor:
         if ctrl and event.key == pygame.K_n:
             self._push_undo()
             self.terrain = empty_terrain()
+            self.rotations = empty_rotations()
+            self.current_rotation = 0
             self.current_filename = None
             self.current_name = None
             self._show_msg("New track")
+            return True
+
+        if event.key == pygame.K_r and not ctrl:
+            if shift:
+                self.current_rotation = (self.current_rotation - 1) % 4
+            else:
+                self.current_rotation = (self.current_rotation + 1) % 4
+            self._show_msg(f"Rotation: {self.current_rotation * 90}\u00b0")
             return True
 
         if event.key == pygame.K_h:
@@ -684,9 +719,11 @@ class TileEditor:
                 if tid == T_EMPTY:
                     self.screen.blit(scaled_grass, (isx, isy))
                 else:
-                    sprite = get_tile_sprite(tid)
+                    rot = self.rotations[row][col]
+                    sprite = get_tile_sprite(tid, rot)
                     if sprite is not None:
-                        self.screen.blit(get_scaled(sprite, tid), (isx, isy))
+                        self.screen.blit(
+                            get_scaled(sprite, (tid, rot)), (isx, isy))
                     else:
                         self.screen.blit(scaled_grass, (isx, isy))
 
@@ -701,7 +738,7 @@ class TileEditor:
                          pygame.Rect(int(bx0), int(by0),
                                      int(bx1 - bx0), int(by1 - by0)), 2)
 
-        # Hover preview (show brush outline)
+        # Hover preview (show brush outline with rotated sprite preview)
         mx, my = pygame.mouse.get_pos()
         if self._is_in_viewport(mx, my) and not self.panning:
             row, col = self.screen_to_tile(mx, my)
@@ -715,13 +752,27 @@ class TileEditor:
                         if 0 <= r < GRID_ROWS and 0 <= c < GRID_COLS:
                             bsx, bsy = self.world_to_screen(
                                 c * TILE_SIZE, r * TILE_SIZE)
-                            hover = pygame.Surface(
-                                (tile_screen_size, tile_screen_size),
-                                pygame.SRCALPHA)
-                            hover.fill((255, 255, 100, 50))
-                            self.screen.blit(hover, (int(bsx), int(bsy)))
+                            ibsx, ibsy = int(bsx), int(bsy)
+                            # Show rotated tile preview
+                            tid = self.current_brush.tiles[dr][dc]
+                            if tid != T_EMPTY and self.selected_tile != T_EMPTY:
+                                brot = (self.current_brush.rotations[dr][dc]
+                                        + self.current_rotation) % 4
+                                preview_spr = get_tile_sprite(tid, brot)
+                                if preview_spr is not None:
+                                    ps = get_scaled(
+                                        preview_spr, (tid, brot, "preview"))
+                                    ps.set_alpha(120)
+                                    self.screen.blit(ps, (ibsx, ibsy))
+                                    ps.set_alpha(255)
+                            else:
+                                hover = pygame.Surface(
+                                    (tile_screen_size, tile_screen_size),
+                                    pygame.SRCALPHA)
+                                hover.fill((255, 255, 100, 50))
+                                self.screen.blit(hover, (ibsx, ibsy))
                             pygame.draw.rect(self.screen, (255, 255, 100),
-                                             (int(bsx), int(bsy),
+                                             (ibsx, ibsy,
                                               tile_screen_size,
                                               tile_screen_size), 1)
 
@@ -767,7 +818,8 @@ class TileEditor:
         # Draw panels
         self.tools_panel.draw(self.screen,
                               selected_tile=self.selected_tile,
-                              current_brush=self.current_brush)
+                              current_brush=self.current_brush,
+                              current_rotation=self.current_rotation)
 
         # Separator
         pygame.draw.line(self.screen, COL_PANEL_BORDER,
@@ -804,6 +856,7 @@ class TileEditor:
         bw = self.current_brush.width
         bh = self.current_brush.height
         parts.append(f"Brush:{bw}x{bh}")
+        parts.append(f"Rot:{self.current_rotation * 90}\u00b0")
 
         # Show friction of tile under cursor
         if self._is_in_viewport(mx, my):
@@ -843,6 +896,7 @@ class TileEditor:
             "Tileset: R-drag    Pan tileset",
             "Tabs               Filter by category",
             "",
+            "R / Shift+R        Rotate tile CW/CCW",
             "Shift+1/2/3        Brush size",
             "Ctrl+Z / Ctrl+Y   Undo / Redo",
             "Ctrl+S             Save track",

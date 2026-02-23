@@ -39,6 +39,9 @@ class TileTrack:
     def __init__(self, tile_data: dict):
         self.terrain = tile_data["terrain"]
         self._tile_overrides = tile_data.get("tile_overrides", None)
+        self.rotations = tile_data.get("rotations", None)
+        if self.rotations is None:
+            self.rotations = [[0] * GRID_COLS for _ in range(GRID_ROWS)]
 
         # ── Pre-render ──
         self.track_surface = self._render_track()
@@ -82,7 +85,8 @@ class TileTrack:
                 tid = self.terrain[row][col]
                 if tid == T_EMPTY:
                     continue
-                sprite = get_tile_sprite(tid)
+                rot = self.rotations[row][col]
+                sprite = get_tile_sprite(tid, rot)
                 if sprite is not None:
                     surface.blit(sprite, (col * TILE_SIZE, row * TILE_SIZE))
 
@@ -93,7 +97,7 @@ class TileTrack:
         Crea mascara de colision usando el nuevo builder con soporte
         para collision_type none/full/polygon por tile.
         """
-        return build_boundary_mask(self.terrain)
+        return build_boundary_mask(self.terrain, rotations=self.rotations)
 
     # ────────────────────────────────────────────
     # FINISH LINE

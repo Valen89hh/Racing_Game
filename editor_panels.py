@@ -508,7 +508,8 @@ class ToolsPanel(Panel):
 
     def draw(self, surface: pygame.Surface,
              selected_tile: int = T_EMPTY,
-             current_brush: Brush = None):
+             current_brush: Brush = None,
+             current_rotation: int = 0):
         pygame.draw.rect(surface, COL_TOOL_BG, self.rect)
         rx, ry = self.rect.x, self.rect.y
 
@@ -544,6 +545,12 @@ class ToolsPanel(Panel):
             brush_text = "Brush: 1x1"
         surface.blit(self.font.render(brush_text, True, COL_GRAY),
                      (rx + 6, info_y))
+
+        # Rotation info
+        rot_text = f"Rot: {current_rotation * 90}\u00b0"
+        rot_color = COL_YELLOW if current_rotation != 0 else COL_GRAY
+        surface.blit(self.font.render(rot_text, True, rot_color),
+                     (rx + 70, info_y))
 
         if selected_tile == T_EMPTY:
             surface.blit(self.font.render("Grass (eraser)", True, COL_WHITE),

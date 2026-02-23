@@ -52,6 +52,7 @@ GRASS_DARK = (55, 148, 46)
 _loaded = False
 _tiles = []        # list of tile info dicts
 _sprites = {}      # tile_id -> Surface(64x64)
+_rotated_sprites = {}  # (tile_id, rotation) -> Surface(64x64)
 _categories = {}   # category -> [tile_id, ...]
 _road_ids = set()  # driveable tile IDs
 _tileset_sheet = None   # original tileset Surface (preserved for browser)
@@ -235,12 +236,27 @@ def is_driveable(tile_id):
     return tile_id in _road_ids
 
 
-def get_tile_sprite(tile_id):
-    """Returns 64x64 Surface for the tile, or None for T_EMPTY."""
+def get_tile_sprite(tile_id, rotation=0):
+    """Returns 64x64 Surface for the tile, or None for T_EMPTY.
+
+    Args:
+        tile_id: the tile identifier.
+        rotation: 0-3 representing 0/90/180/270 degrees clockwise.
+    """
     if tile_id == T_EMPTY:
         return None
     _ensure_loaded()
-    return _sprites.get(tile_id)
+    if rotation == 0:
+        return _sprites.get(tile_id)
+    key = (tile_id, rotation)
+    if key not in _rotated_sprites:
+        base = _sprites.get(tile_id)
+        if base is None:
+            return None
+        # pygame rotates counter-clockwise, so negate for clockwise
+        angle = rotation * -90
+        _rotated_sprites[key] = pygame.transform.rotate(base, angle)
+    return _rotated_sprites[key]
 
 
 def get_tiles_by_category(category):
@@ -307,6 +323,11 @@ def make_finish_sprite():
 def empty_terrain():
     """Creates an empty terrain grid (all grass)."""
     return [[T_EMPTY] * GRID_COLS for _ in range(GRID_ROWS)]
+
+
+def empty_rotations():
+    """Creates an empty rotations grid (all 0)."""
+    return [[0] * GRID_COLS for _ in range(GRID_ROWS)]
 
 
 def get_tileset_sheet():

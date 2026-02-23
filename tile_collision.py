@@ -55,8 +55,32 @@ class CollisionShape:
         return CollisionShape([(v[0], v[1]) for v in data])
 
 
+def rotate_polygon(polygon, rotation):
+    """Rotate normalised polygon vertices (0-1 space) by rotation*90 degrees clockwise.
+
+    Args:
+        polygon: list of [x, y] pairs in 0..1 space.
+        rotation: 0-3 (0=0deg, 1=90deg CW, 2=180deg, 3=270deg CW).
+    Returns:
+        New list of [x, y] pairs.
+    """
+    if rotation == 0 or not polygon:
+        return polygon
+    result = []
+    for v in polygon:
+        x, y = v[0], v[1]
+        if rotation == 1:    # 90 CW
+            result.append([1.0 - y, x])
+        elif rotation == 2:  # 180
+            result.append([1.0 - x, 1.0 - y])
+        elif rotation == 3:  # 270 CW
+            result.append([y, 1.0 - x])
+    return result
+
+
 def build_boundary_mask(terrain: list[list[int]],
-                        meta_manager=None) -> tuple[pygame.mask.Mask, pygame.Surface]:
+                        meta_manager=None,
+                        rotations=None) -> tuple[pygame.mask.Mask, pygame.Surface]:
     """Build the world-sized collision mask and debug surface.
 
     - collision_type "none"    -> tile is free (painted black / removed from mask)
@@ -101,9 +125,13 @@ def build_boundary_mask(terrain: list[list[int]],
                 pygame.draw.rect(surface, (0, 0, 0),
                                  (x, y, TILE_SIZE, TILE_SIZE))
                 if meta.collision_polygon and len(meta.collision_polygon) >= 3:
+                    poly = meta.collision_polygon
+                    rot = rotations[row][col] if rotations else 0
+                    if rot:
+                        poly = rotate_polygon(poly, rot)
                     points = [
                         (x + int(v[0] * TILE_SIZE), y + int(v[1] * TILE_SIZE))
-                        for v in meta.collision_polygon
+                        for v in poly
                     ]
                     pygame.draw.polygon(surface, (255, 0, 0), points)
 
