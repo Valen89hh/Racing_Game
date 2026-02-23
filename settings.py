@@ -113,6 +113,25 @@ OIL_EFFECT_DURATION = 1.5      # segundos de efecto al pisar
 OIL_FRICTION_MULT = 3.0        # multiplicador de fricción (derrape)
 OIL_TURN_MULT = 0.3            # multiplicador de giro (pierde control)
 
+# ──────────────────────────────────────────────
+# PARTÍCULAS DE POLVO
+# ──────────────────────────────────────────────
+DUST_MAX_PARTICLES = 120
+DUST_SPEED_THRESHOLD = 80.0    # velocidad mínima para emitir
+DUST_EMIT_RATE = 3.0           # partículas base por frame a max speed
+DUST_LIFETIME_MIN = 0.3
+DUST_LIFETIME_MAX = 0.8
+DUST_RADIUS_MIN = 2.0
+DUST_RADIUS_MAX = 5.0
+DUST_MAX_ALPHA = 120
+DUST_COLORS = [
+    (160, 130, 100),  # brown
+    (140, 120, 90),   # tan
+    (130, 130, 120),  # gray
+    (150, 140, 110),  # sandy
+    (120, 110, 100),  # cool brown
+]
+
 # Colores de cada power-up
 POWERUP_COLORS = {
     POWERUP_BOOST:   (0, 220, 80),

@@ -69,6 +69,10 @@ class UpdateManager:
             report(0.80, "Installing update...")
             self._swap()
 
+            # Step 5b: Preserve user data from backup
+            report(0.85, "Restoring user tracks...")
+            self._restore_user_data()
+
             # Step 6: Write version (90% - 95%)
             report(0.90, "Updating version info...")
             write_local_version(new_version)
@@ -163,6 +167,19 @@ class UpdateManager:
     def _swap(self):
         """Move extracted temp to game/."""
         os.rename(TEMP_DIR, GAME_DIR)
+
+    def _restore_user_data(self):
+        """Copy user-created tracks from backup into the new installation."""
+        backup_tracks = os.path.join(BACKUP_DIR, "tracks")
+        new_tracks = os.path.join(GAME_DIR, "tracks")
+        if not os.path.exists(backup_tracks):
+            return
+        os.makedirs(new_tracks, exist_ok=True)
+        for fname in os.listdir(backup_tracks):
+            src = os.path.join(backup_tracks, fname)
+            dst = os.path.join(new_tracks, fname)
+            if os.path.isfile(src) and not os.path.exists(dst):
+                shutil.copy2(src, dst)
 
     def _cleanup_backup(self):
         """Remove backup directory after successful update."""

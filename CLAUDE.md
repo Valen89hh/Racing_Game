@@ -2,8 +2,9 @@
 
 ## Project Overview
 
-**2D top-down arcade racing game** built with **Pygame** (Python 3.12+). Features a tile-based track editor, AI opponents, power-ups, and a rotating camera system. The game supports two track formats: classic (control points + Chaikin smoothing) and tile-based (painted grid).
+**2D top-down arcade racing game** built with **Pygame** (Python 3.12+). Features a tile-based track editor, AI opponents, power-ups, dust particles, and a rotating camera system. The game supports two track formats: classic (control points + Chaikin smoothing) and tile-based (painted grid).
 
+**Current version:** 1.0.1
 **Entry point:** `python main.py`
 
 ## Directory Structure
@@ -11,17 +12,19 @@
 ```
 racing_game/
 ├── main.py              (29 lines)  - Entry point
-├── game.py              (834 lines) - Game loop, state machine, orchestration
-├── settings.py          (187 lines) - All configuration constants
+├── game.py              (~850 lines) - Game loop, state machine, orchestration
+├── settings.py          (~220 lines) - All configuration constants
 ├── track_manager.py     (163 lines) - Track file I/O (JSON save/load)
 ├── tile_track.py        (400 lines) - Tile-based track (TileTrack class)
 ├── tile_defs.py         (312 lines) - Tile definitions, classification, sprites
 ├── editor.py           (1123 lines) - Tile editor (TileEditor class)
+├── version.txt                      - Current version number (e.g. "1.0.1")
 │
 ├── entities/
 │   ├── car.py           (264 lines) - Car entity (physics, sprites, effects)
 │   ├── track.py         (596 lines) - Classic track (Chaikin curves, rendering)
-│   └── powerup.py       (237 lines) - PowerUpItem, Missile, OilSlick
+│   ├── powerup.py       (237 lines) - PowerUpItem, Missile, OilSlick
+│   └── particles.py     (~130 lines) - DustParticleSystem (pool-based dust FX)
 │
 ├── systems/
 │   ├── input_handler.py  (81 lines) - Keyboard → car inputs
@@ -45,9 +48,22 @@ racing_game/
 │   │   ├── misc_props.png, road_markings.png
 │   └── sounds/
 │
+├── launcher/            - Auto-updater launcher (separate PyInstaller build)
+│   ├── main.py          (186 lines) - Launcher orchestrator + Pygame UI
+│   ├── updater.py       (~205 lines) - Download, extract, install with rollback
+│   ├── version_checker.py(132 lines) - GitHub Releases version detection
+│   ├── config.py        (79 lines)  - Path resolution, config.json loading
+│   └── ui.py            (216 lines) - Pygame launcher GUI (600x400)
+│
 ├── tracks/              - Saved track files (JSON)
 │   ├── default_circuit.json  - Classic format (control points)
 │   └── *.json                - User-created tracks
+│
+├── build_game.bat       - Build game exe (PyInstaller onedir)
+├── build_launcher.bat   - Build launcher exe
+├── build_all.bat        - Build both
+├── game.spec            - PyInstaller spec for game
+├── launcher.spec        - PyInstaller spec for launcher
 │
 └── venv/                - Python virtual environment
 ```
@@ -70,6 +86,7 @@ States defined in `settings.py`: `STATE_MENU`, `STATE_COUNTDOWN`, `STATE_RACING`
 - `Car` → processed by `PhysicsSystem`, `InputHandler`, `AISystem`
 - `Track`/`TileTrack` → consumed by `CollisionSystem`, `Camera`, `AISystem`
 - `PowerUpItem`/`Missile`/`OilSlick` → processed in `Game._update_racing()`
+- `DustParticleSystem` → emits + updates + draws in `Game._update_racing()` / `_render_race()`
 
 ### Two Track Formats
 
@@ -102,6 +119,7 @@ METHODS:    draw(surface, camera), check_car_collision(mask, rect),
 - **Bot:** max_speed=480, acceleration=290
 - **Laps:** 3 per race
 - **Power-ups:** Boost (3s), Shield (12s), Missile (700px/s), Oil (8s on ground)
+- **Dust particles:** pool=120, threshold=80px/s, lifetime=0.3-0.8s, alpha fade+shrink
 
 ## Tile System (tile_defs.py)
 
@@ -236,6 +254,48 @@ Tracks stored in `tracks/` directory. `list_tracks()` returns both formats with 
    - Screen coords: (0,0) to (1280, 720) after camera transform
 4. **Event handling:** Pygame 2.x uses `TEXTINPUT` for character input (not `KEYDOWN.unicode`)
 5. **Track interface compatibility:** Any new track type must provide the same attributes/methods as Track
+6. **Particle pool:** `DustParticleSystem` pre-allocates 120 `Particle` objects (with `__slots__`) to avoid per-frame allocations. Circular index reuses dead particles.
+
+## Render Order (_render_race)
+
+```
+1. Track surface
+2. Oil slicks
+3. Power-up pickups
+4. Dust particles      ← particles.py
+5. Cars
+6. Missiles
+```
+
+## Build & Distribution
+
+- **Build game:** `build_game.bat` → `dist/game/` (PyInstaller onedir)
+- **Build launcher:** `build_launcher.bat` → `dist/launcher.exe`
+- **Build all:** `build_all.bat`
+- **Release:** Compress `dist/game/` as ZIP, upload to GitHub Release with tag `vX.Y.Z`
+- **PyInstaller specs:** `game.spec` (hiddenimports must include all modules), `launcher.spec`
+- **Adding new modules:** Remember to add to `hiddenimports` in `game.spec`
+
+## Auto-Update System (launcher/)
+
+The launcher checks GitHub Releases for new versions and handles download/install:
+
+1. Compare local `version.txt` vs GitHub release tag
+2. Download `.zip` asset (streaming with progress)
+3. Verify zip integrity
+4. Extract to `game_update_temp/`
+5. Backup `game/` → `game_backup/`
+6. Swap: `game_update_temp/` → `game/`
+7. **Restore user data:** Copy user tracks from backup to new install (preserves custom maps)
+8. Write new version, cleanup backup
+
+On failure: automatic rollback from `game_backup/`.
+
+**Key paths (relative to dist/):**
+- `game/` — Game installation
+- `game/tracks/` — User tracks (preserved across updates)
+- `version.txt` — Current version
+- `config.json` — Update URL, timeouts
 
 ## Running the Game
 

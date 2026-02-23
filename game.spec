@@ -31,6 +31,7 @@ a = Analysis(
         'entities.car',
         'entities.track',
         'entities.powerup',
+        'entities.particles',
         'systems',
         'systems.input_handler',
         'systems.physics',

@@ -34,6 +34,7 @@ from settings import (
 from entities.car import Car
 from entities.track import Track
 from entities.powerup import PowerUpItem, Missile, OilSlick
+from entities.particles import DustParticleSystem
 from systems.physics import PhysicsSystem
 from systems.collision import CollisionSystem
 from systems.input_handler import InputHandler
@@ -87,6 +88,7 @@ class Game:
         self.missiles = []         # misiles activos
         self.oil_slicks = []       # manchas de aceite activas
         self._use_cooldown = 0.0   # cooldown para evitar doble uso
+        self.dust_particles = None # sistema de partículas de polvo
 
         # Resultado
         self.winner = None
@@ -222,6 +224,9 @@ class Game:
         self.missiles = []
         self.oil_slicks = []
         self._use_cooldown = 0.0
+
+        # Partículas de polvo
+        self.dust_particles = DustParticleSystem()
 
         # Timer
         self.race_timer.reset()
@@ -376,6 +381,13 @@ class Game:
                         car.apply_effect("oil_slow", OIL_EFFECT_DURATION)
         self.oil_slicks = [o for o in self.oil_slicks if o.alive]
 
+        # ── Partículas de polvo ──
+        if self.dust_particles:
+            for car in self.cars:
+                if not car.finished:
+                    self.dust_particles.emit_from_car(car)
+            self.dust_particles.update(dt)
+
         # ── Cámara ──
         self.camera.update(self.player_car.x, self.player_car.y,
                            self.player_car.angle, self.player_car.speed, dt)
@@ -511,6 +523,10 @@ class Game:
         for item in self.powerup_items:
             if item.active and cam.is_visible(item.x, item.y, 30):
                 item.draw(self.screen, cam, self.total_time)
+
+        # Partículas de polvo (debajo de los autos)
+        if self.dust_particles:
+            self.dust_particles.draw(self.screen, cam)
 
         # Autos
         for car in self.cars:
