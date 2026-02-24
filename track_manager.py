@@ -64,7 +64,8 @@ def save_track(filename, name, control_points):
 
 
 def save_tile_track(filename, name, terrain, tile_overrides=None,
-                    rotations=None):
+                    rotations=None, checkpoint_zones=None,
+                    circuit_direction=None):
     """Guarda una pista tile-based como archivo JSON.
 
     Args:
@@ -96,6 +97,10 @@ def save_tile_track(filename, name, terrain, tile_overrides=None,
         data["tile_overrides"] = tile_overrides
     if has_rotations:
         data["rotations"] = rotations
+    if checkpoint_zones:
+        data["checkpoint_zones"] = checkpoint_zones
+    if circuit_direction:
+        data["circuit_direction"] = circuit_direction
 
     filepath = os.path.join(TRACKS_DIR, filename)
     with open(filepath, "w", encoding="utf-8") as f:

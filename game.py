@@ -23,7 +23,8 @@ from settings import (
     COLOR_RED, COLOR_GRAY, COLOR_DARK_GRAY, COLOR_ORANGE, COLOR_BLUE,
     STATE_MENU, STATE_COUNTDOWN, STATE_RACING, STATE_VICTORY,
     STATE_EDITOR, STATE_TRACK_SELECT,
-    PLAYER_COLORS, TOTAL_LAPS, HUD_FONT_SIZE, HUD_TITLE_FONT_SIZE,
+    PLAYER_COLORS, TOTAL_LAPS, DEBUG_CHECKPOINTS,
+    HUD_FONT_SIZE, HUD_TITLE_FONT_SIZE,
     HUD_SUBTITLE_FONT_SIZE, HUD_MARGIN, MINIMAP_MARGIN, MINIMAP_CAR_DOT,
     BOT_ACCELERATION, BOT_MAX_SPEED, BOT_TURN_SPEED,
     POWERUP_BOOST, POWERUP_SHIELD, POWERUP_MISSILE, POWERUP_OIL,
@@ -44,6 +45,7 @@ from utils.timer import RaceTimer
 from utils.helpers import draw_text_centered
 from editor import TileEditor
 from tile_track import TileTrack
+from race_progress import RaceProgressTracker
 import track_manager
 
 
@@ -93,6 +95,7 @@ class Game:
         # Resultado
         self.winner = None
         self.final_times = {}
+        self.race_progress = None
 
         # Editor y selección de pista
         self.editor = None
@@ -213,6 +216,15 @@ class Game:
         self.ai_system = AISystem(self.track)
         self.ai_system.register_bot(bot_car)
 
+        # Race progress tracker
+        fl = self.track.finish_line
+        fl_center = ((fl[0][0] + fl[1][0]) / 2, (fl[0][1] + fl[1][1]) / 2)
+        self.race_progress = RaceProgressTracker(
+            self.track.checkpoints, fl_center
+        )
+        for car in self.cars:
+            self.race_progress.register_car(car.player_id)
+
         # Cámara: snap instantáneo al jugador (con ángulo inicial)
         self.camera.snap_to(self.player_car.x, self.player_car.y,
                             self.player_car.angle)
@@ -310,8 +322,9 @@ class Game:
                 self.physics.clear_wall_contact(car)
 
             # Checkpoints y vueltas
+            old_laps = car.laps
             self.collision_system.update_checkpoints(car)
-            if self.collision_system.check_lap_completion(car, old_x, old_y):
+            if car.laps > old_laps:
                 if car == self.player_car:
                     self.race_timer.complete_lap()
                 if car.laps >= TOTAL_LAPS:
@@ -320,6 +333,9 @@ class Game:
                     self.final_times[car.name] = car.finish_time
                     if self.winner is None:
                         self.winner = car
+
+            # Actualizar progreso de carrera
+            self.race_progress.update(car)
 
             # Usar power-up
             if car.input_use_powerup and car.held_powerup is not None:
@@ -539,6 +555,64 @@ class Game:
             if cam.is_visible(missile.x, missile.y, 20):
                 missile.draw(self.screen, cam)
 
+        # Debug: dibujar checkpoint zones y next_checkpoint_index
+        if DEBUG_CHECKPOINTS and hasattr(self.track, 'checkpoint_zones'):
+            self._render_debug_checkpoints(cam)
+
+    def _render_debug_checkpoints(self, cam):
+        """Dibuja zonas de checkpoint y next_cp sobre autos (debug)."""
+        zones = self.track.checkpoint_zones
+
+        # Dibujar cada zona como rectángulo semi-transparente
+        for i, zone in enumerate(zones):
+            # Transformar las 4 esquinas del rect a coordenadas de pantalla
+            corners_world = [
+                (zone.left, zone.top),
+                (zone.right, zone.top),
+                (zone.right, zone.bottom),
+                (zone.left, zone.bottom),
+            ]
+            corners_screen = [cam.world_to_screen(wx, wy) for wx, wy in corners_world]
+
+            # Determinar color según estado del jugador
+            player_next = self.player_car.next_checkpoint_index
+            if i < player_next or (self.player_car.laps > 0 and i < player_next):
+                color = (0, 200, 0, 60)  # verde = ya pasado
+            elif i == player_next:
+                color = (255, 50, 50, 80)  # rojo = siguiente
+            else:
+                color = (150, 150, 150, 40)  # gris = pendiente
+
+            # Dibujar polígono semi-transparente
+            int_corners = [(int(cx), int(cy)) for cx, cy in corners_screen]
+            # Calcular bounding box del polígono en pantalla
+            min_x = min(c[0] for c in int_corners)
+            min_y = min(c[1] for c in int_corners)
+            max_x = max(c[0] for c in int_corners)
+            max_y = max(c[1] for c in int_corners)
+            w = max_x - min_x
+            h = max_y - min_y
+            if w > 0 and h > 0 and max_x > 0 and max_y > 0:
+                overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+                shifted = [(cx - min_x, cy - min_y) for cx, cy in int_corners]
+                pygame.draw.polygon(overlay, color, shifted)
+                pygame.draw.polygon(overlay, (255, 255, 255, 120), shifted, 2)
+                self.screen.blit(overlay, (min_x, min_y))
+
+                # Número del checkpoint
+                label = self.font_small.render(str(i), True, COLOR_WHITE)
+                center_sx = sum(c[0] for c in int_corners) // 4
+                center_sy = sum(c[1] for c in int_corners) // 4
+                self.screen.blit(label, (center_sx - 4, center_sy - 8))
+
+        # Dibujar next_checkpoint_index sobre cada auto
+        for car in self.cars:
+            sx, sy = cam.world_to_screen(car.x, car.y)
+            label = self.font_small.render(
+                f"cp{car.next_checkpoint_index}", True, COLOR_WHITE
+            )
+            self.screen.blit(label, (int(sx) - 12, int(sy) - 35))
+
     def _render_countdown(self):
         """Renderiza la cuenta regresiva superpuesta."""
         overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
@@ -703,20 +777,28 @@ class Game:
                            COLOR_WHITE, y_pos)
         y_pos += 50
 
-        sorted_cars = sorted(
-            self.cars, key=lambda c: c.finish_time if c.finished else 9999
-        )
-        for i, car in enumerate(sorted_cars):
-            if car.finished:
-                time_str = RaceTimer.format_time(car.finish_time)
-                text = f"{i + 1}. {car.name} - {time_str}"
-            else:
+        if self.race_progress:
+            rankings = self.race_progress.get_all_rankings()
+            car_by_id = {c.player_id: c for c in self.cars}
+            for pos, pid, _score in rankings:
+                car = car_by_id.get(pid)
+                if car is None:
+                    continue
+                if car.finished:
+                    time_str = RaceTimer.format_time(car.finish_time)
+                    text = f"{pos}. {car.name} - {time_str}"
+                else:
+                    text = f"{pos}. {car.name} - DNF"
+                color = COLOR_YELLOW if car == self.winner else COLOR_WHITE
+                draw_text_centered(self.screen, text, self.font_subtitle,
+                                   color, y_pos)
+                y_pos += 40
+        else:
+            for i, car in enumerate(self.cars):
                 text = f"{i + 1}. {car.name} - DNF"
-
-            color = COLOR_YELLOW if car == self.winner else COLOR_WHITE
-            draw_text_centered(self.screen, text, self.font_subtitle,
-                               color, y_pos)
-            y_pos += 40
+                draw_text_centered(self.screen, text, self.font_subtitle,
+                                   COLOR_WHITE, y_pos)
+                y_pos += 40
 
         if self.race_timer.best_lap is not None:
             y_pos += 20
@@ -837,14 +919,6 @@ class Game:
 
     def _get_player_position(self) -> int:
         """Calcula la posición actual del jugador en la carrera."""
-        player = self.player_car
-        position = 1
-        for car in self.cars:
-            if car == player:
-                continue
-            if car.laps > player.laps:
-                position += 1
-            elif car.laps == player.laps:
-                if car.last_checkpoint > player.last_checkpoint:
-                    position += 1
-        return position
+        if self.race_progress:
+            return self.race_progress.get_position(self.player_car.player_id)
+        return 1

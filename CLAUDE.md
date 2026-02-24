@@ -14,10 +14,10 @@ racing_game/
 ├── main.py              (29 lines)  - Entry point
 ├── game.py              (~850 lines) - Game loop, state machine, orchestration
 ├── settings.py          (~220 lines) - All configuration constants
-├── track_manager.py     (163 lines) - Track file I/O (JSON save/load)
-├── tile_track.py        (400 lines) - Tile-based track (TileTrack class)
+├── track_manager.py     (~170 lines) - Track file I/O (JSON save/load)
+├── tile_track.py        (~350 lines) - Tile-based track (TileTrack class)
 ├── tile_defs.py         (312 lines) - Tile definitions, classification, sprites
-├── editor.py           (1123 lines) - Tile editor (TileEditor class)
+├── editor.py           (~1200 lines) - Tile editor (TileEditor class)
 ├── version.txt                      - Current version number (e.g. "1.0.1")
 │
 ├── entities/
@@ -179,12 +179,27 @@ empty_terrain() → [[T_EMPTY]*56 for _ in range(37)]
 - **Ctrl+S** — Save, **Ctrl+O** — Load, **Ctrl+N** — New
 - **Ctrl+Z/Y** — Undo/Redo (max 30 snapshots)
 - **T** — Test race (needs finish tiles + 10+ driveable)
+- **C** — Checkpoint mode (drag=place zone, R-click=delete)
+- **D** — Direction mode (drag=set arrow, R-click=delete)
 - **H** — Help overlay, **F** — Fit view, **ESC** — Menu
 
 ### Features
 - `load_from_file(filename)` — Load existing tile track for editing
 - Save dialog uses `pygame.TEXTINPUT` events (not KEYDOWN.unicode)
 - Track select screen: press **E** to edit a tile-based track
+
+### Checkpoint System (manual only)
+- Checkpoints are placed manually in the editor via **C** mode (no auto-generation)
+- Displayed 0-indexed: checkpoint **0** should be placed at/near the finish line
+- At runtime, TileTrack rotates the list so C0 becomes the **last** checkpoint in sequence
+- This ensures the lap counter increments when the car crosses C0 (the finish area)
+- If no checkpoints are placed, `checkpoint_zones = []` and lap counting relies only on finish line
+
+### Circuit Direction (editor D mode)
+- Click-drag draws a green arrow indicating the forward direction of the circuit
+- Saved as `circuit_direction: [x1, y1, x2, y2]` in the track JSON (world coords)
+- TileTrack uses this to orient car start positions instead of auto-computing from DFS path
+- If not set, falls back to the original auto-compute (last DFS tile → finish tile)
 
 ## Track File Formats (track_manager.py)
 
@@ -198,7 +213,7 @@ empty_terrain() → [[T_EMPTY]*56 for _ in range(37)]
 }
 ```
 
-### Tile Format (version 3)
+### Tile Format (version 3/4)
 ```json
 {
   "name": "My Track",
@@ -208,11 +223,19 @@ empty_terrain() → [[T_EMPTY]*56 for _ in range(37)]
   "tile_size": 64,
   "grid_width": 56,
   "grid_height": 37,
-  "terrain": [[0,0,0,...], [0,1,1,...], ...]
+  "terrain": [[0,0,0,...], [0,1,1,...], ...],
+  "rotations": [[0,0,1,...], ...],
+  "checkpoint_zones": [[x, y, w, h], ...],
+  "circuit_direction": [x1, y1, x2, y2]
 }
 ```
+- `rotations` (v4): per-tile rotation 0-3 (0/90/180/270 deg). Bumps version to 4.
+- `checkpoint_zones`: manual checkpoint rectangles from editor (0-indexed, C0 = finish area).
+- `circuit_direction`: optional arrow [start_x, start_y, end_x, end_y] in world coords.
 
 Tracks stored in `tracks/` directory. `list_tracks()` returns both formats with `type` field.
+
+`save_tile_track(filename, name, terrain, tile_overrides=None, rotations=None, checkpoint_zones=None, circuit_direction=None)`
 
 ## Camera System (systems/camera.py)
 
@@ -241,7 +264,7 @@ Tracks stored in `tracks/` directory. `list_tracks()` returns both formats with 
 - **Car vs wall:** 16 rays around car, compute normal, iterative push-out
 - **Car vs car:** Mask overlap, push apart
 - **Car vs finish line:** Segment intersection (lap detection)
-- **Car vs checkpoints:** Distance check (80px radius)
+- **Car vs checkpoints:** Zone rect collision (manual zones from editor, sequential order)
 - **Car vs power-ups/missiles/oil:** Distance checks
 
 ## Important Patterns

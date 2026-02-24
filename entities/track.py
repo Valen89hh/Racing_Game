@@ -62,9 +62,15 @@ class Track:
         self.waypoints = [self.centerline[i] for i in range(0, self.num_points, step)]
 
         # ── Checkpoints (6, distribuidos equitativamente) ──
+        # Offset por 1 step: cp0 está a 1/6 del track, cp5 está en la meta.
+        # Así la vuelta se completa al pasar la zona de meta (cp5), no antes.
         cp_step = self.num_points // 6
-        self.checkpoints = [self.centerline[i * cp_step] for i in range(6)]
+        cp_indices = [((i + 1) * cp_step) % self.num_points for i in range(6)]
+        self.checkpoints = [self.centerline[idx] for idx in cp_indices]
         self.num_checkpoints = len(self.checkpoints)
+
+        # ── Checkpoint zones (rectángulos perpendiculares al track) ──
+        self.checkpoint_zones = self._compute_checkpoint_zones(cp_indices)
 
         # ── Línea de meta ──
         # Perpendicular a la centerline en el punto 0
@@ -223,6 +229,61 @@ class Track:
             result.append((ox, oy))
 
         return result
+
+    # ────────────────────────────────────────────────────
+    # CHECKPOINT ZONES
+    # ────────────────────────────────────────────────────
+
+    def _compute_checkpoint_zones(self, cp_indices: list) -> list:
+        """
+        Genera rectángulos de checkpoint perpendiculares al track.
+
+        Cada zona es un pygame.Rect axis-aligned que cubre el ancho completo
+        de la pista en ese punto, con un grosor de 40px a lo largo del track.
+        """
+        zones = []
+        hw = TRACK_HALF_WIDTH
+        thickness = 20  # ±20px a lo largo del track
+
+        for idx in cp_indices:
+            cx, cy = self.centerline[idx]
+
+            # Tangente local
+            prev_idx = (idx - 2) % self.num_points
+            next_idx = (idx + 2) % self.num_points
+            tx = self.centerline[next_idx][0] - self.centerline[prev_idx][0]
+            ty = self.centerline[next_idx][1] - self.centerline[prev_idx][1]
+            tlen = math.hypot(tx, ty)
+            if tlen < 0.001:
+                tx, ty = 1.0, 0.0
+            else:
+                tx, ty = tx / tlen, ty / tlen
+
+            # Perpendicular al track (dirección que cruza el ancho)
+            px, py = -ty, tx
+
+            # 4 esquinas del rectángulo rotado
+            half_w = hw + 10  # ancho de la pista + margen
+            corners = [
+                (cx + px * half_w + tx * thickness,
+                 cy + py * half_w + ty * thickness),
+                (cx + px * half_w - tx * thickness,
+                 cy + py * half_w - ty * thickness),
+                (cx - px * half_w + tx * thickness,
+                 cy - py * half_w + ty * thickness),
+                (cx - px * half_w - tx * thickness,
+                 cy - py * half_w - ty * thickness),
+            ]
+
+            # Bounding box axis-aligned
+            xs = [c[0] for c in corners]
+            ys = [c[1] for c in corners]
+            rect = pygame.Rect(int(min(xs)), int(min(ys)),
+                               int(max(xs) - min(xs)),
+                               int(max(ys) - min(ys)))
+            zones.append(rect)
+
+        return zones
 
     # ────────────────────────────────────────────────────
     # RENDERIZADO
@@ -506,8 +567,8 @@ class Track:
         d3 = cross(x1, y1, x2, y2, x3, y3)
         d4 = cross(x1, y1, x2, y2, x4, y4)
 
-        if ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and \
-           ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)):
+        # Non-strict: allow crossing when a point is exactly on the line
+        if d1 * d2 <= 0 and d1 != d2 and d3 * d4 <= 0 and d3 != d4:
             return True
         return False
 

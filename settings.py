@@ -71,6 +71,13 @@ BOT_WAYPOINT_REACH_DIST = 70
 BOT_ACCELERATION = 290.0
 BOT_MAX_SPEED = 480.0
 BOT_TURN_SPEED = 195.0
+BOT_STUCK_CHECK_INTERVAL = 0.5
+BOT_STUCK_DIST_THRESHOLD = 10.0
+BOT_STUCK_TIME_THRESHOLD = 1.5
+BOT_RECOVERY_DURATION = 1.0
+BOT_LOOK_AHEAD = 5
+BOT_STEER_DEADZONE = 1.5
+BOT_STEER_RANGE = 60.0
 
 # ──────────────────────────────────────────────
 # CIRCUITO
@@ -78,6 +85,7 @@ BOT_TURN_SPEED = 195.0
 TRACK_HALF_WIDTH = 75          # mitad del ancho de la pista (pista total = 150px)
 TRACK_BORDER_THICKNESS = 3
 TOTAL_LAPS = 3
+DEBUG_CHECKPOINTS = True    # Dibujar zonas de checkpoint y next_cp sobre autos
 
 # ──────────────────────────────────────────────
 # POWER-UPS

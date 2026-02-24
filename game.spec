@@ -18,6 +18,7 @@ a = Analysis(
     hiddenimports=[
         'game',
         'settings',
+        'race_progress',
         'track_manager',
         'tile_defs',
         'tile_meta',

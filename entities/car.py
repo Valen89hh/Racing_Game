@@ -81,8 +81,7 @@ class Car:
         self.laps = 0
         self.finished = False
         self.finish_time = 0.0
-        self.last_checkpoint = -1
-        self.crossed_finish = False
+        self.next_checkpoint_index = 0
 
         # Colisión con pared (usado por physics.py)
         self._wall_normal = None

@@ -115,6 +115,18 @@ class TileEditor:
         # Collision editor (lazy import)
         self._collision_editor = None
 
+        # Checkpoint mode
+        self.checkpoint_mode = False
+        self.checkpoint_zones = []      # list of [x, y, w, h] in world coords
+        self.cp_drag_start = None       # (wx, wy) start of drag
+        self.cp_drag_current = None     # (wx, wy) current drag position
+
+        # Direction mode
+        self.direction_mode = False
+        self.circuit_direction = None   # [x1, y1, x2, y2] world coords, or None
+        self.dir_drag_start = None      # (wx, wy) start of drag
+        self.dir_drag_current = None    # (wx, wy) current position
+
         # Build preview sprites
         from tile_defs import make_grass_sprite
         self._grass_sprite = make_grass_sprite()
@@ -218,7 +230,9 @@ class TileEditor:
 
     def _push_undo(self):
         snap = ([row[:] for row in self.terrain],
-                [row[:] for row in self.rotations])
+                [row[:] for row in self.rotations],
+                [z[:] for z in self.checkpoint_zones],
+                list(self.circuit_direction) if self.circuit_direction else None)
         self.undo_stack.append(snap)
         if len(self.undo_stack) > MAX_UNDO:
             self.undo_stack.pop(0)
@@ -228,15 +242,27 @@ class TileEditor:
         if not self.undo_stack:
             return
         self.redo_stack.append(([row[:] for row in self.terrain],
-                                [row[:] for row in self.rotations]))
-        self.terrain, self.rotations = self.undo_stack.pop()
+                                [row[:] for row in self.rotations],
+                                [z[:] for z in self.checkpoint_zones],
+                                list(self.circuit_direction) if self.circuit_direction else None))
+        snap = self.undo_stack.pop()
+        self.terrain = snap[0]
+        self.rotations = snap[1]
+        self.checkpoint_zones = snap[2] if len(snap) > 2 else []
+        self.circuit_direction = snap[3] if len(snap) > 3 else None
 
     def _redo(self):
         if not self.redo_stack:
             return
         self.undo_stack.append(([row[:] for row in self.terrain],
-                                [row[:] for row in self.rotations]))
-        self.terrain, self.rotations = self.redo_stack.pop()
+                                [row[:] for row in self.rotations],
+                                [z[:] for z in self.checkpoint_zones],
+                                list(self.circuit_direction) if self.circuit_direction else None))
+        snap = self.redo_stack.pop()
+        self.terrain = snap[0]
+        self.rotations = snap[1]
+        self.checkpoint_zones = snap[2] if len(snap) > 2 else []
+        self.circuit_direction = snap[3] if len(snap) > 3 else None
 
     # ──────────────────────────────────────────
     # PAINTING
@@ -316,6 +342,10 @@ class TileEditor:
         if has_rotations:
             data["rotations"] = [row[:] for row in self.rotations]
             data["version"] = 4
+        if self.checkpoint_zones:
+            data["checkpoint_zones"] = [z[:] for z in self.checkpoint_zones]
+        if self.circuit_direction:
+            data["circuit_direction"] = list(self.circuit_direction)
         return data
 
     # ──────────────────────────────────────────
@@ -344,7 +374,9 @@ class TileEditor:
         try:
             track_manager.save_tile_track(
                 filename, name, self.terrain,
-                rotations=self.rotations)
+                rotations=self.rotations,
+                checkpoint_zones=self.checkpoint_zones or None,
+                circuit_direction=self.circuit_direction)
             self.current_filename = filename
             self.current_name = name
             self._close_dialog()
@@ -366,6 +398,9 @@ class TileEditor:
             self.rotations = data.get("rotations", None)
             if self.rotations is None:
                 self.rotations = empty_rotations()
+            self.checkpoint_zones = [
+                z[:] for z in data.get("checkpoint_zones", [])]
+            self.circuit_direction = data.get("circuit_direction", None)
             self.current_filename = entry["filename"].replace(".json", "")
             self.current_name = data.get("name", self.current_filename)
             self._close_dialog()
@@ -386,6 +421,9 @@ class TileEditor:
             self.rotations = data.get("rotations", None)
             if self.rotations is None:
                 self.rotations = empty_rotations()
+            self.checkpoint_zones = [
+                z[:] for z in data.get("checkpoint_zones", [])]
+            self.circuit_direction = data.get("circuit_direction", None)
             self.current_filename = filename.replace(".json", "")
             self.current_name = data.get("name", self.current_filename)
             self._fit_view()
@@ -402,7 +440,9 @@ class TileEditor:
                     self.current_filename,
                     self.current_name or self.current_filename,
                     self.terrain,
-                    rotations=self.rotations)
+                    rotations=self.rotations,
+                    checkpoint_zones=self.checkpoint_zones or None,
+                    circuit_direction=self.circuit_direction)
                 self._show_msg(f"Saved: {self.current_filename}.json")
             except OSError as e:
                 self._show_msg(f"Error: {e}")
@@ -469,6 +509,18 @@ class TileEditor:
         shift = mods & pygame.KMOD_SHIFT
 
         if event.key == pygame.K_ESCAPE:
+            if self.direction_mode:
+                self.direction_mode = False
+                self.dir_drag_start = None
+                self.dir_drag_current = None
+                self._show_msg("Direction mode OFF")
+                return True
+            if self.checkpoint_mode:
+                self.checkpoint_mode = False
+                self.cp_drag_start = None
+                self.cp_drag_current = None
+                self._show_msg("Checkpoint mode OFF")
+                return True
             self.result = "menu"
             return True
 
@@ -489,6 +541,8 @@ class TileEditor:
             self.terrain = empty_terrain()
             self.rotations = empty_rotations()
             self.current_rotation = 0
+            self.checkpoint_zones = []
+            self.circuit_direction = None
             self.current_filename = None
             self.current_name = None
             self._show_msg("New track")
@@ -514,6 +568,28 @@ class TileEditor:
                 self.result = "test"
             else:
                 self._show_msg("Need finish + circuit (10+ driveable)")
+            return True
+
+        if event.key == pygame.K_c and not ctrl:
+            self.checkpoint_mode = not self.checkpoint_mode
+            self.cp_drag_start = None
+            self.cp_drag_current = None
+            if self.checkpoint_mode:
+                self.direction_mode = False
+                self._show_msg("Checkpoint mode ON  (drag=place, R-click=delete)")
+            else:
+                self._show_msg("Checkpoint mode OFF")
+            return True
+
+        if event.key == pygame.K_d and not ctrl:
+            self.direction_mode = not self.direction_mode
+            self.dir_drag_start = None
+            self.dir_drag_current = None
+            if self.direction_mode:
+                self.checkpoint_mode = False
+                self._show_msg("Direction mode ON  (drag=set arrow, R-click=delete)")
+            else:
+                self._show_msg("Direction mode OFF")
             return True
 
         # Brush size with Shift+1/2/3
@@ -560,6 +636,44 @@ class TileEditor:
             self.pan_cam_start = (self.cam_x, self.cam_y)
             return True
 
+        # ── Direction mode ──
+        if self.direction_mode:
+            if event.button == 1:
+                wx, wy = self.screen_to_world(sx, sy)
+                self.dir_drag_start = (wx, wy)
+                self.dir_drag_current = (wx, wy)
+                return True
+            if event.button == 3:
+                if self.circuit_direction:
+                    self._push_undo()
+                    self.circuit_direction = None
+                    self._show_msg("Direction arrow deleted")
+                return True
+            return True
+
+        # ── Checkpoint mode ──
+        if self.checkpoint_mode:
+            if event.button == 1:
+                wx, wy = self.screen_to_world(sx, sy)
+                # Snap to grid
+                wx = int(wx // TILE_SIZE) * TILE_SIZE
+                wy = int(wy // TILE_SIZE) * TILE_SIZE
+                self.cp_drag_start = (wx, wy)
+                self.cp_drag_current = (wx, wy)
+                return True
+            if event.button == 3:
+                wx, wy = self.screen_to_world(sx, sy)
+                # Find and delete zone under cursor
+                for i, z in enumerate(self.checkpoint_zones):
+                    r = pygame.Rect(z[0], z[1], z[2], z[3])
+                    if r.collidepoint(wx, wy):
+                        self._push_undo()
+                        self.checkpoint_zones.pop(i)
+                        self._show_msg(f"Deleted checkpoint {i}")
+                        break
+                return True
+            return True
+
         if event.button == 1:
             row, col = self.screen_to_tile(sx, sy)
             if 0 <= row < GRID_ROWS and 0 <= col < GRID_COLS:
@@ -581,6 +695,49 @@ class TileEditor:
     def _handle_mouseup(self, event):
         if event.button == 2 or (event.button == 1 and self.panning):
             self.panning = False
+
+        # Direction drag finalize
+        if self.direction_mode and event.button == 1 and self.dir_drag_start:
+            sx, sy = event.pos
+            wx, wy = self.screen_to_world(sx, sy)
+            x1, y1 = self.dir_drag_start
+            dist = ((wx - x1) ** 2 + (wy - y1) ** 2) ** 0.5
+            if dist >= TILE_SIZE:
+                self._push_undo()
+                self.circuit_direction = [x1, y1, wx, wy]
+                self._show_msg("Direction arrow set")
+            else:
+                self._show_msg("Drag longer (min 1 tile)")
+            self.dir_drag_start = None
+            self.dir_drag_current = None
+            return True
+
+        # Checkpoint drag finalize
+        if self.checkpoint_mode and event.button == 1 and self.cp_drag_start:
+            sx, sy = event.pos
+            wx, wy = self.screen_to_world(sx, sy)
+            # Snap end to grid
+            wx = int(wx // TILE_SIZE) * TILE_SIZE + TILE_SIZE
+            wy = int(wy // TILE_SIZE) * TILE_SIZE + TILE_SIZE
+            x0, y0 = self.cp_drag_start
+            # Normalize (ensure positive w/h)
+            x1 = min(x0, wx)
+            y1 = min(y0, wy)
+            x2 = max(x0, wx)
+            y2 = max(y0, wy)
+            # Minimum 1 tile size
+            if x2 - x1 < TILE_SIZE:
+                x2 = x1 + TILE_SIZE
+            if y2 - y1 < TILE_SIZE:
+                y2 = y1 + TILE_SIZE
+            self._push_undo()
+            self.checkpoint_zones.append([int(x1), int(y1),
+                                          int(x2 - x1), int(y2 - y1)])
+            self.cp_drag_start = None
+            self.cp_drag_current = None
+            self._show_msg(f"Checkpoint {len(self.checkpoint_zones) - 1} placed")
+            return True
+
         if event.button == 1:
             self.painting = False
             # Also notify browser of mouse up for selection
@@ -593,6 +750,20 @@ class TileEditor:
 
     def _handle_mousemotion(self, event):
         sx, sy = event.pos
+
+        # Direction drag update
+        if self.direction_mode and self.dir_drag_start is not None:
+            wx, wy = self.screen_to_world(sx, sy)
+            self.dir_drag_current = (wx, wy)
+            return True
+
+        # Checkpoint drag update
+        if self.checkpoint_mode and self.cp_drag_start is not None:
+            wx, wy = self.screen_to_world(sx, sy)
+            wx = int(wx // TILE_SIZE) * TILE_SIZE + TILE_SIZE
+            wy = int(wy // TILE_SIZE) * TILE_SIZE + TILE_SIZE
+            self.cp_drag_current = (wx, wy)
+            return True
 
         # Browser panning / selection drag
         if self.browser_panel.panning or self.browser_panel.selecting:
@@ -738,6 +909,12 @@ class TileEditor:
                          pygame.Rect(int(bx0), int(by0),
                                      int(bx1 - bx0), int(by1 - by0)), 2)
 
+        # Checkpoint zones overlay
+        self._draw_checkpoint_zones()
+
+        # Circuit direction arrow
+        self._draw_circuit_direction()
+
         # Hover preview (show brush outline with rotated sprite preview)
         mx, my = pygame.mouse.get_pos()
         if self._is_in_viewport(mx, my) and not self.panning:
@@ -801,6 +978,96 @@ class TileEditor:
                                  (0, isy), (SCREEN_WIDTH, isy))
 
         self.screen.blit(grid_surf, (0, 0))
+
+    def _draw_checkpoint_zones(self):
+        """Draw checkpoint zone rectangles and drag preview in the viewport."""
+        # Existing zones
+        for i, z in enumerate(self.checkpoint_zones):
+            x, y, w, h = z
+            sx0, sy0 = self.world_to_screen(x, y)
+            sx1, sy1 = self.world_to_screen(x + w, y + h)
+            sw = int(sx1 - sx0)
+            sh = int(sy1 - sy0)
+            if sw < 2 or sh < 2:
+                continue
+            # Semi-transparent violet fill
+            fill_surf = pygame.Surface((sw, sh), pygame.SRCALPHA)
+            fill_surf.fill((180, 60, 220, 50))
+            self.screen.blit(fill_surf, (int(sx0), int(sy0)))
+            # Border
+            pygame.draw.rect(self.screen, (180, 60, 220),
+                             (int(sx0), int(sy0), sw, sh), 2)
+            # Number label with background
+            label = self.font_small.render(str(i), True, COLOR_WHITE)
+            lw, lh = label.get_size()
+            lcx = int(sx0 + sw / 2 - lw / 2)
+            lcy = int(sy0 + sh / 2 - lh / 2)
+            bg = pygame.Surface((lw + 6, lh + 4), pygame.SRCALPHA)
+            bg.fill((0, 0, 0, 160))
+            self.screen.blit(bg, (lcx - 3, lcy - 2))
+            self.screen.blit(label, (lcx, lcy))
+
+        # Drag preview
+        if self.cp_drag_start and self.cp_drag_current:
+            x0, y0 = self.cp_drag_start
+            x1, y1 = self.cp_drag_current
+            sx0, sy0 = self.world_to_screen(min(x0, x1), min(y0, y1))
+            sx1, sy1 = self.world_to_screen(max(x0, x1), max(y0, y1))
+            sw = max(2, int(sx1 - sx0))
+            sh = max(2, int(sy1 - sy0))
+            preview = pygame.Surface((sw, sh), pygame.SRCALPHA)
+            preview.fill((220, 180, 50, 40))
+            self.screen.blit(preview, (int(sx0), int(sy0)))
+            pygame.draw.rect(self.screen, (220, 180, 50),
+                             (int(sx0), int(sy0), sw, sh), 2)
+
+    def _draw_circuit_direction(self):
+        """Draw the circuit direction arrow (saved or drag preview)."""
+        import math
+
+        def _draw_arrow(x1, y1, x2, y2, color, thickness=3):
+            """Draw an arrow from (x1,y1) to (x2,y2) in screen coords."""
+            pygame.draw.line(self.screen, color,
+                             (int(x1), int(y1)), (int(x2), int(y2)), thickness)
+            # Arrowhead
+            dx = x2 - x1
+            dy = y2 - y1
+            length = math.hypot(dx, dy)
+            if length < 1:
+                return
+            ux, uy = dx / length, dy / length
+            # Perpendicular
+            px, py = -uy, ux
+            head_len = min(20, length * 0.3)
+            head_w = head_len * 0.5
+            tip_x, tip_y = x2, y2
+            base_x = x2 - ux * head_len
+            base_y = y2 - uy * head_len
+            points = [
+                (int(tip_x), int(tip_y)),
+                (int(base_x + px * head_w), int(base_y + py * head_w)),
+                (int(base_x - px * head_w), int(base_y - py * head_w)),
+            ]
+            pygame.draw.polygon(self.screen, color, points)
+
+        # Saved direction arrow (green)
+        if self.circuit_direction:
+            wx1, wy1, wx2, wy2 = self.circuit_direction
+            sx1, sy1 = self.world_to_screen(wx1, wy1)
+            sx2, sy2 = self.world_to_screen(wx2, wy2)
+            _draw_arrow(sx1, sy1, sx2, sy2, (50, 220, 80), 3)
+            # "START" label at base
+            label = self.font_small.render("START", True, (50, 220, 80))
+            self.screen.blit(label, (int(sx1) - label.get_width() // 2,
+                                     int(sy1) - 16))
+
+        # Drag preview arrow (yellow)
+        if self.dir_drag_start and self.dir_drag_current:
+            wx1, wy1 = self.dir_drag_start
+            wx2, wy2 = self.dir_drag_current
+            sx1, sy1 = self.world_to_screen(wx1, wy1)
+            sx2, sy2 = self.world_to_screen(wx2, wy2)
+            _draw_arrow(sx1, sy1, sx2, sy2, (220, 200, 50), 2)
 
     # ──────────────────────────────────────────
     # BOTTOM PANEL
@@ -868,6 +1135,16 @@ class TileEditor:
                     fric = mgr.get_friction(tid)
                     parts.append(f"Friction:{fric:.1f}")
 
+        if self.direction_mode:
+            parts.append("DIRECTION MODE")
+        elif self.circuit_direction:
+            parts.append("Dir:set")
+
+        if self.checkpoint_mode:
+            parts.append(f"CHECKPOINT MODE ({len(self.checkpoint_zones)} zones)")
+        elif self.checkpoint_zones:
+            parts.append(f"CPs:{len(self.checkpoint_zones)}")
+
         if self.current_name:
             parts.append(f"Track:{self.current_name}")
 
@@ -904,6 +1181,10 @@ class TileEditor:
             "Ctrl+N             New track",
             "F                  Fit view",
             "T                  Test track",
+            "C                  Checkpoint mode",
+            "  drag=place, R-click=delete",
+            "D                  Direction mode",
+            "  drag=set arrow, R-click=delete",
             "H                  Toggle help",
             "ESC                Back to menu",
             "",

@@ -58,9 +58,27 @@ class TileTrack:
         raw_path = self._trace_circuit()
         self.waypoints = self._sample_waypoints(raw_path, target=60)
 
-        # ── Checkpoints ──
-        self.checkpoints = self._distribute_points(self.waypoints, 6)
-        self.num_checkpoints = len(self.checkpoints)
+        # ── Checkpoints (zonas manuales del editor) ──
+        manual_cp = tile_data.get("checkpoint_zones")
+        if manual_cp and len(manual_cp) > 0:
+            zones = [
+                pygame.Rect(z[0], z[1], z[2], z[3]) for z in manual_cp
+            ]
+            # Rotar: checkpoint 0 (meta) pasa al final, asi el lap se
+            # incrementa al cruzar la zona de meta (la ultima en la secuencia).
+            if len(zones) > 1:
+                self.checkpoint_zones = zones[1:] + zones[:1]
+            else:
+                self.checkpoint_zones = zones
+        else:
+            self.checkpoint_zones = []
+        self.num_checkpoints = len(self.checkpoint_zones)
+        self.checkpoints = [
+            (z.centerx, z.centery) for z in self.checkpoint_zones
+        ]
+
+        # ── Circuit direction (manual, from editor) ──
+        self._circuit_direction = tile_data.get("circuit_direction", None)
 
         # ── Start positions ──
         self.start_positions = self._compute_start_positions(raw_path)
@@ -258,37 +276,79 @@ class TileTrack:
                 (WORLD_WIDTH // 2 + 30, WORLD_HEIGHT // 2, 0),
             ]
 
-        idx1 = max(0, len(raw_path) - 3)
-        idx2 = max(0, len(raw_path) - 8)
+        n = len(raw_path)
 
-        r1, c1 = raw_path[idx1]
-        r2, c2 = raw_path[idx2]
-
-        x1 = c1 * TILE_SIZE + TILE_SIZE // 2
-        y1 = r1 * TILE_SIZE + TILE_SIZE // 2
-        x2 = c2 * TILE_SIZE + TILE_SIZE // 2
-        y2 = r2 * TILE_SIZE + TILE_SIZE // 2
-
-        if len(raw_path) >= 5:
-            idx_back = max(0, idx1 - 3)
-            idx_fwd = min(len(raw_path) - 1, idx1 + 3)
-            rb, cb = raw_path[idx_back]
-            rf, cf = raw_path[idx_fwd]
-            dx = (cf - cb) * TILE_SIZE
-            dy = (rf - rb) * TILE_SIZE
-            angle = math.degrees(math.atan2(dx, -dy)) % 360
+        # Dirección de avance: manual (editor) o auto-compute desde DFS path
+        manual_dir = self._circuit_direction
+        if manual_dir and len(manual_dir) == 4:
+            x1, y1, x2, y2 = manual_dir
+            fwd_dx = x2 - x1
+            fwd_dy = y2 - y1
+            fwd_len = math.hypot(fwd_dx, fwd_dy)
+            if fwd_len > 0:
+                fwd_x = fwd_dx / fwd_len
+                fwd_y = fwd_dy / fwd_len
+            else:
+                fwd_x, fwd_y = 0.0, -1.0
         else:
-            angle = 0
+            # Auto-compute original desde raw_path
+            # (raw_path[0] es el finish tile, raw_path[-1] es justo antes de cerrar)
+            lr, lc = raw_path[-1]
+            fr, fc = raw_path[0]
+            fwd_dx = (fc - lc) * TILE_SIZE
+            fwd_dy = (fr - lr) * TILE_SIZE
+            fwd_len = math.hypot(fwd_dx, fwd_dy)
+            if fwd_len > 0:
+                fwd_x = fwd_dx / fwd_len
+                fwd_y = fwd_dy / fwd_len
+            else:
+                fwd_x, fwd_y = 0.0, -1.0
 
-        angle_rad = math.radians(angle)
-        perp_x = math.cos(angle_rad)
-        perp_y = -math.sin(angle_rad)
+        angle = math.degrees(math.atan2(fwd_x, -fwd_y)) % 360
+
+        # Perpendicular (derecha del vector forward)
+        perp_x = -fwd_y
+        perp_y = fwd_x
         lateral = 22
+
+        # Centro de la finish line
+        fl = self.finish_line
+        fcx = (fl[0][0] + fl[1][0]) / 2
+        fcy = (fl[0][1] + fl[1][1]) / 2
+
+        # Colocar autos DETRÁS de la meta (opuesto a forward)
+        # Auto 1: 1.5 tiles detrás, Auto 2: 3.5 tiles detrás
+        x1 = fcx - fwd_x * TILE_SIZE * 1.5
+        y1 = fcy - fwd_y * TILE_SIZE * 1.5
+        x2 = fcx - fwd_x * TILE_SIZE * 3.5
+        y2 = fcy - fwd_y * TILE_SIZE * 3.5
+
+        # Verificar que las posiciones estén en pista; si no, usar tiles del path
+        if not self._is_world_pos_driveable(x1, y1):
+            idx1 = max(0, n - 3)
+            r1, c1 = raw_path[idx1]
+            x1 = c1 * TILE_SIZE + TILE_SIZE // 2
+            y1 = r1 * TILE_SIZE + TILE_SIZE // 2
+
+        if not self._is_world_pos_driveable(x2, y2):
+            idx2 = max(n * 3 // 4, n - 7)
+            idx2 = min(idx2, n - 1)
+            r2, c2 = raw_path[idx2]
+            x2 = c2 * TILE_SIZE + TILE_SIZE // 2
+            y2 = r2 * TILE_SIZE + TILE_SIZE // 2
 
         return [
             (x1 + perp_x * lateral, y1 + perp_y * lateral, angle),
             (x2 - perp_x * lateral, y2 - perp_y * lateral, angle),
         ]
+
+    def _is_world_pos_driveable(self, wx, wy):
+        """Verifica si una posición en coordenadas del mundo está en pista."""
+        col = int(wx // TILE_SIZE)
+        row = int(wy // TILE_SIZE)
+        if 0 <= row < GRID_ROWS and 0 <= col < GRID_COLS:
+            return is_driveable(self.terrain[row][col])
+        return False
 
     # ────────────────────────────────────────────
     # MINIMAP
@@ -364,8 +424,8 @@ class TileTrack:
         d3 = cross(x1, y1, x2, y2, x3, y3)
         d4 = cross(x1, y1, x2, y2, x4, y4)
 
-        if ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and \
-           ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)):
+        # Non-strict: allow crossing when a point is exactly on the line
+        if d1 * d2 <= 0 and d1 != d2 and d3 * d4 <= 0 and d3 != d4:
             return True
         return False
 

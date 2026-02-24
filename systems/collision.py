@@ -13,7 +13,7 @@ from entities.track import Track
 from entities.powerup import PowerUpItem, Missile, OilSlick
 from utils.helpers import distance
 from settings import (
-    TOTAL_LAPS, WORLD_WIDTH, WORLD_HEIGHT,
+    WORLD_WIDTH, WORLD_HEIGHT,
     MISSILE_SLOW_DURATION, OIL_EFFECT_DURATION,
 )
 
@@ -31,7 +31,6 @@ class CollisionSystem:
 
     def __init__(self, track: Track):
         self.track = track
-        self.checkpoint_radius = 80.0
 
     # ── AUTO vs PISTA ──
 
@@ -88,30 +87,23 @@ class CollisionSystem:
 
     # ── VUELTAS Y CHECKPOINTS ──
 
-    def check_lap_completion(self, car: Car, old_x: float, old_y: float) -> bool:
-        """Verifica si el auto completó una vuelta válida."""
-        crossed = self.track.check_finish_line_cross(old_x, old_y, car.x, car.y)
-
-        if crossed and not car.crossed_finish:
-            car.crossed_finish = True
-            if car.last_checkpoint >= self.track.num_checkpoints - 1:
-                car.laps += 1
-                car.last_checkpoint = -1
-                return True
-        elif not crossed:
-            car.crossed_finish = False
-
-        return False
-
     def update_checkpoints(self, car: Car):
-        """Actualiza el progreso de checkpoints del auto."""
-        next_cp = car.last_checkpoint + 1
-        if next_cp >= self.track.num_checkpoints:
-            return
+        """
+        Actualiza checkpoints y vueltas usando zonas rectangulares.
 
-        cp = self.track.checkpoints[next_cp]
-        if distance((car.x, car.y), cp) < self.checkpoint_radius:
-            car.last_checkpoint = next_cp
+        Cada frame verifica si el auto está dentro de la zona del siguiente
+        checkpoint. Si pasa todos los checkpoints, incrementa la vuelta.
+        """
+        zones = self.track.checkpoint_zones
+        n = len(zones)
+        if n == 0 or car.next_checkpoint_index >= n:
+            return
+        zone = zones[car.next_checkpoint_index]
+        if zone.collidepoint(int(car.x), int(car.y)):
+            car.next_checkpoint_index += 1
+            if car.next_checkpoint_index >= n:
+                car.laps += 1
+                car.next_checkpoint_index = 0
 
     # ── AUTO vs AUTO ──
 
