@@ -11,10 +11,15 @@ Ahora incluye:
 - Minimapa.
 """
 
+import os
 import sys
 import random
 import math
 import pygame
+
+import json
+import subprocess
+import tempfile
 
 from settings import (
     SCREEN_WIDTH, SCREEN_HEIGHT, FPS, TITLE,
@@ -22,7 +27,8 @@ from settings import (
     COLOR_BLACK, COLOR_WHITE, COLOR_YELLOW, COLOR_GREEN,
     COLOR_RED, COLOR_GRAY, COLOR_DARK_GRAY, COLOR_ORANGE, COLOR_BLUE,
     STATE_MENU, STATE_COUNTDOWN, STATE_RACING, STATE_VICTORY,
-    STATE_EDITOR, STATE_TRACK_SELECT,
+    STATE_EDITOR, STATE_TRACK_SELECT, STATE_TRAINING,
+    COLOR_PROGRESS_BAR, COLOR_PROGRESS_BG,
     PLAYER_COLORS, TOTAL_LAPS, DEBUG_CHECKPOINTS,
     HUD_FONT_SIZE, HUD_TITLE_FONT_SIZE,
     HUD_SUBTITLE_FONT_SIZE, HUD_MARGIN, MINIMAP_MARGIN, MINIMAP_CAR_DOT,
@@ -39,7 +45,7 @@ from entities.particles import DustParticleSystem
 from systems.physics import PhysicsSystem
 from systems.collision import CollisionSystem
 from systems.input_handler import InputHandler
-from systems.ai import AISystem
+from systems.ai import AISystem, RLSystem
 from systems.camera import Camera
 from utils.timer import RaceTimer
 from utils.helpers import draw_text_centered
@@ -82,6 +88,7 @@ class Game:
         self.collision_system = None
         self.input_handler = InputHandler()
         self.ai_system = None
+        self.rl_system = None
         self.camera = Camera()
         self.race_timer = RaceTimer()
 
@@ -102,6 +109,15 @@ class Game:
         self.track_list = []
         self.track_selected = 0
         self.return_to_editor = False  # para volver al editor tras test race
+
+        # Training state
+        self._train_process = None
+        self._train_progress_file = None
+        self._train_progress = {}
+        self._train_track_name = ""
+        self._train_track_file = ""
+        self._train_timesteps = 200000
+        self._train_status = "idle"  # idle | training | done | error
 
         # Exportar circuito por defecto si no existe
         track_manager.export_default_track()
@@ -157,6 +173,9 @@ class Game:
                             self.state = STATE_MENU
                     elif self.state == STATE_TRACK_SELECT:
                         self.state = STATE_MENU
+                    elif self.state == STATE_TRAINING:
+                        self._cancel_training()
+                        self.state = STATE_TRACK_SELECT
                     else:
                         self.running = False
 
@@ -177,6 +196,11 @@ class Game:
                             self._open_editor_with_points()
                         else:
                             self.state = STATE_MENU
+                    elif self.state == STATE_TRAINING:
+                        if self._train_status == "idle":
+                            self._launch_training()
+                        elif self._train_status in ("done", "error"):
+                            self.state = STATE_TRACK_SELECT
 
                 elif self.state == STATE_TRACK_SELECT:
                     if event.key == pygame.K_UP:
@@ -184,6 +208,17 @@ class Game:
                     elif event.key == pygame.K_DOWN:
                         self.track_selected = min(
                             len(self.track_list) - 1, self.track_selected + 1)
+                    elif event.key == pygame.K_t:
+                        if self.track_list:
+                            entry = self.track_list[self.track_selected]
+                            if entry.get("type") == "tiles":
+                                self._start_training_screen()
+
+                elif self.state == STATE_TRAINING:
+                    if event.key == pygame.K_UP and self._train_status == "idle":
+                        self._train_timesteps = min(self._train_timesteps + 50000, 1000000)
+                    elif event.key == pygame.K_DOWN and self._train_status == "idle":
+                        self._train_timesteps = max(self._train_timesteps - 50000, 50000)
 
     # ──────────────────────────────────────────────
     # INICIALIZACIÓN DE CARRERA
@@ -213,6 +248,17 @@ class Game:
 
         # Sistemas
         self.collision_system = CollisionSystem(self.track)
+
+        # Intentar cargar modelo RL para esta pista
+        self.rl_system = None
+        if hasattr(self, 'track_list') and self.track_list and self.track_selected < len(self.track_list):
+            track_name = os.path.splitext(self.track_list[self.track_selected]["filename"])[0]
+            model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", f"{track_name}_model.zip")
+            if os.path.exists(model_path):
+                rl = RLSystem(self.track, model_path)
+                if rl.is_loaded:
+                    self.rl_system = rl
+
         self.ai_system = AISystem(self.track)
         self.ai_system.register_bot(bot_car)
 
@@ -262,6 +308,8 @@ class Game:
             self._update_racing(dt)
         elif self.state == STATE_EDITOR and self.editor:
             self.editor.update(dt)
+        elif self.state == STATE_TRAINING:
+            self._update_training(dt)
 
     def _update_countdown(self, dt: float):
         """Actualiza la cuenta regresiva."""
@@ -297,7 +345,10 @@ class Game:
             if car.player_id == 0:
                 self.input_handler.update(car, keys)
             else:
-                self.ai_system.update(car, dt, self.cars)
+                if self.rl_system is not None:
+                    self.rl_system.update(car, dt, self.cars)
+                else:
+                    self.ai_system.update(car, dt, self.cars)
 
             # Efectos de power-ups activos
             car.update_effects(dt)
@@ -470,6 +521,8 @@ class Game:
             self.editor.render()
         elif self.state == STATE_TRACK_SELECT:
             self._render_track_select()
+        elif self.state == STATE_TRAINING:
+            self._render_training()
 
         pygame.display.flip()
 
@@ -862,6 +915,217 @@ class Game:
         else:
             self.editor = None
 
+    # ──────────────────────────────────────────────
+    # TRAINING
+    # ──────────────────────────────────────────────
+
+    def _start_training_screen(self):
+        """Abre la pantalla de entrenamiento RL para la pista seleccionada."""
+        entry = self.track_list[self.track_selected]
+        self._train_track_name = entry["name"]
+        self._train_track_file = entry["filename"]
+        self._train_status = "idle"
+        self._train_progress = {}
+        self._train_timesteps = 200000
+        self.state = STATE_TRAINING
+
+    def _launch_training(self):
+        """Lanza el subproceso de entrenamiento RL."""
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        track_path = os.path.join(project_root, "tracks", self._train_track_file)
+
+        self._train_progress_file = os.path.join(
+            tempfile.gettempdir(), f"rl_progress_{os.getpid()}.json"
+        )
+        # Limpiar archivo de progreso previo
+        if os.path.exists(self._train_progress_file):
+            os.remove(self._train_progress_file)
+
+        self._train_process = subprocess.Popen(
+            [sys.executable, "-m", "training.train_ai",
+             track_path,
+             "--timesteps", str(self._train_timesteps),
+             "--json-progress", self._train_progress_file],
+            cwd=project_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self._train_status = "training"
+        self._train_progress = {}
+
+    def _update_training(self, dt):
+        """Lee el progreso del subproceso de entrenamiento."""
+        if self._train_status != "training":
+            return
+
+        # Leer progreso del JSON
+        if self._train_progress_file and os.path.exists(self._train_progress_file):
+            try:
+                with open(self._train_progress_file, "r") as f:
+                    self._train_progress = json.load(f)
+                status = self._train_progress.get("status", "training")
+                if status in ("done", "error"):
+                    self._train_status = status
+            except (json.JSONDecodeError, IOError):
+                pass  # archivo en escritura parcial, reintentar next frame
+
+        # Verificar si el proceso murió inesperadamente
+        if self._train_process and self._train_process.poll() is not None:
+            if self._train_status == "training":
+                self._train_status = "error"
+                # Intentar leer stderr para un mensaje útil
+                err_msg = ""
+                try:
+                    _, stderr = self._train_process.communicate(timeout=2)
+                    if stderr:
+                        lines = stderr.decode(errors="replace").strip().splitlines()
+                        err_msg = lines[-1] if lines else ""
+                except Exception:
+                    pass
+                self._train_progress["message"] = (
+                    err_msg or "Training process exited unexpectedly"
+                )
+
+    def _cancel_training(self):
+        """Cancela el entrenamiento en curso y limpia recursos."""
+        if self._train_process and self._train_process.poll() is None:
+            self._train_process.terminate()
+            try:
+                self._train_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._train_process.kill()
+        self._train_process = None
+        self._train_status = "idle"
+        if self._train_progress_file and os.path.exists(self._train_progress_file):
+            try:
+                os.remove(self._train_progress_file)
+            except OSError:
+                pass
+
+    def _render_training(self):
+        """Renderiza la pantalla de entrenamiento RL."""
+        # Gradient background (same as menu/track_select)
+        for y in range(SCREEN_HEIGHT):
+            ratio = y / SCREEN_HEIGHT
+            r = int(10 + 20 * ratio)
+            g = int(10 + 15 * ratio)
+            b = int(30 + 40 * ratio)
+            pygame.draw.line(self.screen, (r, g, b), (0, y), (SCREEN_WIDTH, y))
+
+        # Title
+        draw_text_centered(self.screen, "TRAIN AI MODEL",
+                           self.font_title, COLOR_YELLOW, 80)
+
+        # Track name
+        draw_text_centered(self.screen, f"Track: {self._train_track_name}",
+                           self.font_subtitle, COLOR_WHITE, 160)
+
+        # Timesteps selector
+        ts_text = f"{self._train_timesteps:,}"
+        if self._train_status == "idle":
+            draw_text_centered(
+                self.screen,
+                f"Timesteps:  < {ts_text} >",
+                self.font_subtitle, COLOR_WHITE, 230,
+            )
+            draw_text_centered(
+                self.screen, "UP/DOWN to adjust",
+                self.font_small, COLOR_GRAY, 265,
+            )
+        else:
+            draw_text_centered(
+                self.screen, f"Timesteps: {ts_text}",
+                self.font_subtitle, COLOR_GRAY, 230,
+            )
+
+        # Progress bar area
+        bar_x = SCREEN_WIDTH // 2 - 250
+        bar_y = 320
+        bar_w = 500
+        bar_h = 30
+
+        progress = self._train_progress
+        done = progress.get("timesteps_done", 0)
+        total = progress.get("timesteps_total", self._train_timesteps)
+        fraction = min(done / total, 1.0) if total > 0 else 0.0
+
+        if self._train_status in ("training", "done", "error"):
+            # Background
+            pygame.draw.rect(self.screen, COLOR_PROGRESS_BG,
+                             (bar_x, bar_y, bar_w, bar_h), border_radius=4)
+            # Fill
+            fill_w = int(bar_w * fraction)
+            if fill_w > 0:
+                fill_color = COLOR_PROGRESS_BAR if self._train_status != "error" else COLOR_RED
+                pygame.draw.rect(self.screen, fill_color,
+                                 (bar_x, bar_y, fill_w, bar_h), border_radius=4)
+            # Border
+            pygame.draw.rect(self.screen, COLOR_WHITE,
+                             (bar_x, bar_y, bar_w, bar_h), 2, border_radius=4)
+            # Percentage
+            pct_text = f"{int(fraction * 100)}%"
+            draw_text_centered(self.screen, pct_text, self.font,
+                               COLOR_WHITE, bar_y + 4)
+
+            # Stats below bar
+            stats_y = bar_y + 45
+            draw_text_centered(
+                self.screen,
+                f"{done:,} / {total:,} timesteps",
+                self.font, COLOR_WHITE, stats_y,
+            )
+
+            elapsed = progress.get("elapsed_seconds", 0)
+            mins = int(elapsed) // 60
+            secs = int(elapsed) % 60
+            stats_parts = [f"Elapsed: {mins}:{secs:02d}"]
+            if "mean_reward" in progress:
+                stats_parts.append(f"Mean reward: {progress['mean_reward']:.1f}")
+            if "episodes_done" in progress:
+                stats_parts.append(f"Episodes: {progress['episodes_done']}")
+            draw_text_centered(
+                self.screen,
+                "  |  ".join(stats_parts),
+                self.font, COLOR_GRAY, stats_y + 30,
+            )
+
+        # Status line
+        status_y = 450
+        if self._train_status == "idle":
+            draw_text_centered(self.screen, "Ready to train",
+                               self.font_subtitle, COLOR_WHITE, status_y)
+        elif self._train_status == "training":
+            dots = "." * ((pygame.time.get_ticks() // 500) % 4)
+            draw_text_centered(self.screen, f"Training{dots}",
+                               self.font_subtitle, COLOR_YELLOW, status_y)
+        elif self._train_status == "done":
+            draw_text_centered(self.screen, "Training Complete!",
+                               self.font_subtitle, COLOR_GREEN, status_y)
+            model_path = progress.get("model_path", "")
+            if model_path:
+                draw_text_centered(self.screen, f"Model saved: {os.path.basename(model_path)}",
+                                   self.font, COLOR_GRAY, status_y + 35)
+        elif self._train_status == "error":
+            draw_text_centered(self.screen, "Training Error",
+                               self.font_subtitle, COLOR_RED, status_y)
+            msg = progress.get("message", "Unknown error")
+            draw_text_centered(self.screen, msg,
+                               self.font_small, COLOR_RED, status_y + 35)
+
+        # Footer
+        sep_y = SCREEN_HEIGHT - 80
+        pygame.draw.line(self.screen, COLOR_GRAY,
+                         (100, sep_y), (SCREEN_WIDTH - 100, sep_y))
+
+        if self._train_status == "idle":
+            footer = "ENTER: Start Training  |  ESC: Back"
+        elif self._train_status == "training":
+            footer = "ESC: Cancel Training"
+        else:
+            footer = "ENTER: Back to Track Select  |  ESC: Back"
+        draw_text_centered(self.screen, footer,
+                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 55)
+
     def _render_track_select(self):
         """Renderiza la pantalla de selección de pista."""
         # Gradient background
@@ -910,7 +1174,7 @@ class Game:
                 draw_text_centered(self.screen, f"({fname})",
                                    self.font_small, COLOR_GRAY, yy + 22)
 
-        draw_text_centered(self.screen, "UP/DOWN select | ENTER race | E edit | ESC back",
+        draw_text_centered(self.screen, "UP/DOWN select | ENTER race | E edit | T train AI | ESC back",
                            self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
 
     # ──────────────────────────────────────────────

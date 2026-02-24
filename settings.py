@@ -48,6 +48,8 @@ COLOR_ORANGE = (255, 140, 0)
 COLOR_HUD_BG = (20, 20, 20, 180)
 COLOR_FINISH_LINE = (255, 255, 255)
 COLOR_MINIMAP_BG = (30, 30, 30, 200)
+COLOR_PROGRESS_BAR = (0, 180, 80)
+COLOR_PROGRESS_BG = (40, 40, 50)
 
 # ──────────────────────────────────────────────
 # FÍSICA DEL AUTO
@@ -172,6 +174,7 @@ STATE_RACING = "racing"
 STATE_VICTORY = "victory"
 STATE_EDITOR = "editor"
 STATE_TRACK_SELECT = "track_select"
+STATE_TRAINING = "training"
 
 # ──────────────────────────────────────────────
 # JUGADORES (preparado para multiplayer futuro)

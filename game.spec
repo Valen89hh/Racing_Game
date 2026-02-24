@@ -14,6 +14,7 @@ a = Analysis(
         ('assets', 'assets'),
         ('tracks', 'tracks'),
         ('brushes', 'brushes'),
+        ('models', 'models'),
     ],
     hiddenimports=[
         'game',
@@ -44,6 +45,9 @@ a = Analysis(
         'utils.sprites',
         'utils.helpers',
         'utils.timer',
+        'training',
+        'training.racing_env',
+        'training.train_ai',
     ],
     hookspath=[],
     hooksconfig={},

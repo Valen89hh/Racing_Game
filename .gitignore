@@ -101,3 +101,11 @@ network_dumps/
 
 game_update_temp/
 game_backup/
+
+# ===============================
+# RL Training
+# ===============================
+
+training/logs/
+models/checkpoints/
+models/*.zip

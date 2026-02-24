@@ -258,3 +258,132 @@ class AISystem:
             return random.random() < 0.005
 
         return False
+
+
+class RLSystem:
+    """
+    Sistema de IA basado en Reinforcement Learning (PPO).
+
+    Carga un modelo entrenado con stable-baselines3 y lo usa para controlar
+    un bot en tiempo real. Si el modelo no se puede cargar, is_loaded = False
+    y el juego debe usar AISystem como fallback.
+    """
+
+    NUM_RAYS = 7
+    RAY_MAX_DIST = 300.0
+    RAY_STEP = 4
+    RAY_ANGLES = [-60, -40, -20, 0, 20, 40, 60]
+
+    def __init__(self, track, model_path: str):
+        self.track = track
+        self.model = None
+        self._model_path = model_path
+
+        try:
+            from stable_baselines3 import PPO
+            self.model = PPO.load(model_path)
+            print(f"[RLSystem] Loaded model: {model_path}")
+        except (ImportError, FileNotFoundError, Exception) as e:
+            print(f"[RLSystem] Failed to load model: {e}")
+            self.model = None
+
+    @property
+    def is_loaded(self) -> bool:
+        return self.model is not None
+
+    def update(self, car: Car, dt: float, other_cars: list[Car] = None):
+        """
+        Controla el bot usando el modelo RL.
+        Misma firma que AISystem.update() para ser intercambiable.
+        """
+        if self.model is None:
+            return
+
+        car.reset_inputs()
+        obs = self._build_observation(car)
+
+        try:
+            import numpy as np
+            action, _ = self.model.predict(obs, deterministic=True)
+            action = int(action)
+        except Exception:
+            return
+
+        # Map action to car inputs (same mapping as RacingEnv)
+        if action == 0:  # Forward
+            car.input_accelerate = 1.0
+        elif action == 1:  # Left + forward
+            car.input_accelerate = 1.0
+            car.input_turn = -1.0
+        elif action == 2:  # Right + forward
+            car.input_accelerate = 1.0
+            car.input_turn = 1.0
+        elif action == 3:  # Brake
+            car.input_brake = True
+
+    def _build_observation(self, car: Car):
+        """Build 9-float observation vector (identical to RacingEnv)."""
+        import numpy as np
+        from settings import CAR_MAX_SPEED
+
+        rays = self._cast_rays(car)
+        speed_norm = min(abs(car.speed) / CAR_MAX_SPEED, 1.0)
+        angle_norm = self._angle_to_next_checkpoint(car)
+
+        obs = np.zeros(9, dtype=np.float32)
+        obs[0:7] = rays
+        obs[7] = speed_norm
+        obs[8] = angle_norm
+        return obs
+
+    def _cast_rays(self, car: Car):
+        """Cast 7 rays from car position, return normalized distances."""
+        import numpy as np
+        from settings import WORLD_WIDTH, WORLD_HEIGHT
+
+        rays = np.zeros(self.NUM_RAYS, dtype=np.float32)
+        mask = self.track.boundary_mask
+
+        for i, angle_offset in enumerate(self.RAY_ANGLES):
+            ray_angle = car.angle + angle_offset
+            rad = math.radians(ray_angle)
+            dx = math.sin(rad)
+            dy = -math.cos(rad)
+
+            hit_dist = self.RAY_MAX_DIST
+            step = 0
+            while step < self.RAY_MAX_DIST:
+                step += self.RAY_STEP
+                sx = int(car.x + dx * step)
+                sy = int(car.y + dy * step)
+
+                if not (0 <= sx < WORLD_WIDTH and 0 <= sy < WORLD_HEIGHT):
+                    hit_dist = step
+                    break
+
+                if mask.get_at((sx, sy)):
+                    hit_dist = step
+                    break
+
+            rays[i] = hit_dist / self.RAY_MAX_DIST
+
+        return rays
+
+    def _angle_to_next_checkpoint(self, car: Car):
+        """Return normalized angle to next checkpoint (0.5 = straight ahead)."""
+        zones = self.track.checkpoint_zones
+        if not zones:
+            if not self.track.waypoints:
+                return 0.5
+            wp = self.track.waypoints[0]
+            target = (wp[0], wp[1])
+        else:
+            idx = car.next_checkpoint_index % len(zones)
+            zone = zones[idx]
+            target = (zone.centerx, zone.centery)
+
+        target_angle = angle_between_points(
+            (car.x, car.y), target
+        )
+        diff = normalize_angle(target_angle - car.angle)
+        return (diff + 180.0) / 360.0
