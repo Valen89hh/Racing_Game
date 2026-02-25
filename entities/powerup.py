@@ -15,14 +15,25 @@ import pygame
 from settings import (
     POWERUP_SIZE, POWERUP_RESPAWN_TIME, POWERUP_BOB_SPEED,
     POWERUP_BOOST, POWERUP_SHIELD, POWERUP_MISSILE, POWERUP_OIL,
+    POWERUP_MINE, POWERUP_EMP, POWERUP_MAGNET, POWERUP_SLOWMO,
+    POWERUP_BOUNCE, POWERUP_AUTOPILOT, POWERUP_TELEPORT,
+    POWERUP_SMART_MISSILE,
     POWERUP_COLORS, POWERUP_MYSTERY_COLOR,
     MISSILE_SPEED, MISSILE_LIFETIME, MISSILE_SIZE,
+    SMART_MISSILE_SPEED, SMART_MISSILE_LIFETIME,
+    SMART_MISSILE_TURN_SPEED, SMART_MISSILE_SIZE,
     OIL_SLICK_RADIUS, OIL_SLICK_LIFETIME,
+    MINE_RADIUS, MINE_LIFETIME,
     WORLD_WIDTH, WORLD_HEIGHT,
 )
 
 # Todos los tipos disponibles para spawn aleatorio
-ALL_POWERUP_TYPES = [POWERUP_BOOST, POWERUP_SHIELD, POWERUP_MISSILE, POWERUP_OIL]
+ALL_POWERUP_TYPES = [
+    POWERUP_BOOST, POWERUP_SHIELD, POWERUP_MISSILE, POWERUP_OIL,
+    POWERUP_MINE, POWERUP_EMP, POWERUP_MAGNET, POWERUP_SLOWMO,
+    POWERUP_BOUNCE, POWERUP_AUTOPILOT, POWERUP_TELEPORT,
+    POWERUP_SMART_MISSILE,
+]
 
 
 class PowerUpItem:
@@ -215,3 +226,131 @@ class OilSlick:
         pygame.draw.ellipse(oil_surface, (80, 70, 50, 60),
                             (r // 2, r // 3, r, r // 2))
         surface.blit(oil_surface, (sx - r - 2, sy - r))
+
+
+class Mine:
+    """
+    Mina explosiva dejada en la pista.
+
+    Al pasar por encima, causa spin (rotación forzada) y reducción de
+    velocidad. Se destruye tras ser activada o al agotar su lifetime.
+    """
+
+    def __init__(self, x: float, y: float, owner_id: int):
+        self.x = x
+        self.y = y
+        self.owner_id = owner_id
+        self.radius = MINE_RADIUS
+        self.lifetime = MINE_LIFETIME
+        self.alive = True
+
+    def update(self, dt: float):
+        """Reduce el lifetime."""
+        if not self.alive:
+            return
+        self.lifetime -= dt
+        if self.lifetime <= 0:
+            self.alive = False
+
+    def draw(self, surface: pygame.Surface, camera):
+        """Dibuja la mina como un círculo oscuro con picos."""
+        if not self.alive:
+            return
+
+        sx, sy = camera.world_to_screen(self.x, self.y)
+        ix, iy = int(sx), int(sy)
+        r = self.radius
+
+        # Círculo base
+        pygame.draw.circle(surface, (60, 20, 20), (ix, iy), r)
+        pygame.draw.circle(surface, (160, 40, 40), (ix, iy), r, 2)
+
+        # Picos (triángulos alrededor)
+        for i in range(6):
+            a = math.radians(i * 60)
+            px = ix + int(math.cos(a) * (r + 5))
+            py = iy + int(math.sin(a) * (r + 5))
+            pygame.draw.circle(surface, (180, 50, 50), (px, py), 3)
+
+        # Punto rojo central (indicador)
+        pygame.draw.circle(surface, (255, 60, 60), (ix, iy), 4)
+
+
+class SmartMissile:
+    """
+    Misil inteligente que persigue al auto en primera posición.
+
+    Gira hacia su objetivo cada frame. Se destruye al impactar,
+    chocar con un muro, o agotar su lifetime.
+    """
+
+    def __init__(self, x: float, y: float, angle: float,
+                 owner_id: int, target):
+        self.x = x
+        self.y = y
+        self.angle = angle
+        self.owner_id = owner_id
+        self.target = target           # Car object al que persigue
+        self.speed = SMART_MISSILE_SPEED
+        self.lifetime = SMART_MISSILE_LIFETIME
+        self.alive = True
+        self.radius = SMART_MISSILE_SIZE
+
+    def update(self, dt: float):
+        """Actualiza posición con homing hacia el target."""
+        if not self.alive:
+            return
+
+        # Girar hacia el objetivo
+        if self.target and not self.target.finished:
+            dx = self.target.x - self.x
+            dy = self.target.y - self.y
+            target_angle = math.degrees(math.atan2(dx, -dy)) % 360
+            current = self.angle % 360
+            diff = (target_angle - current + 180) % 360 - 180
+            max_turn = SMART_MISSILE_TURN_SPEED * dt
+            if abs(diff) < max_turn:
+                self.angle = target_angle
+            else:
+                self.angle += max_turn if diff > 0 else -max_turn
+
+        # Mover adelante
+        rad = math.radians(self.angle)
+        self.x += math.sin(rad) * self.speed * dt
+        self.y += -math.cos(rad) * self.speed * dt
+
+        self.lifetime -= dt
+        if self.lifetime <= 0:
+            self.alive = False
+
+        # Fuera del mundo
+        if (self.x < -50 or self.x > WORLD_WIDTH + 50 or
+                self.y < -50 or self.y > WORLD_HEIGHT + 50):
+            self.alive = False
+
+    def draw(self, surface: pygame.Surface, camera):
+        """Dibuja el misil inteligente como triángulo naranja."""
+        if not self.alive:
+            return
+
+        sx, sy = camera.world_to_screen(self.x, self.y)
+        screen_ang = camera.screen_angle(self.angle)
+        r = self.radius
+        rad = math.radians(screen_ang)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+
+        # Punta, esquina izquierda, esquina derecha
+        pts = [
+            (sx + sin_a * r * 2,       sy - cos_a * r * 2),
+            (sx - cos_a * r - sin_a * r, sy - sin_a * r + cos_a * r),
+            (sx + cos_a * r - sin_a * r, sy + sin_a * r + cos_a * r),
+        ]
+        int_pts = [(int(p[0]), int(p[1])) for p in pts]
+        pygame.draw.polygon(surface, (255, 100, 30), int_pts)
+        pygame.draw.polygon(surface, (255, 200, 50), int_pts, 2)
+
+        # Estela
+        tail_x = sx - sin_a * r * 3
+        tail_y = sy + cos_a * r * 3
+        pygame.draw.line(surface, (255, 140, 30),
+                         (int(sx), int(sy)), (int(tail_x), int(tail_y)), 2)

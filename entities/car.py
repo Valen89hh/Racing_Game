@@ -22,7 +22,8 @@ from settings import (
     BOOST_SPEED_MULT, BOOST_ACCEL_MULT,
     OIL_FRICTION_MULT, OIL_TURN_MULT,
     MISSILE_SLOW_FACTOR,
-    POWERUP_COLORS, COLOR_WHITE,
+    MINE_SLOW_FACTOR, EMP_SLOW_FACTOR, SLOWMO_FACTOR,
+    POWERUP_COLORS, POWERUP_MYSTERY_COLOR, COLOR_WHITE,
     CAR_SPRITES, SPRITE_SCALE, SPRITE_FRAME_SIZE,
 )
 from utils.helpers import create_car_surface, angle_to_vector
@@ -89,6 +90,11 @@ class Car:
         # Power-ups
         self.held_powerup = None           # tipo de power-up en inventario
         self.is_shielded = False           # si el escudo está activo
+        self.has_magnet = False            # imán de checkpoints activo
+        self.has_slowmo = False            # ralentización temporal activa
+        self.has_bounce = False            # rebote mejorado activo
+        self.has_autopilot = False         # piloto automático activo
+        self.is_spinning = False           # spin por mina
         self.active_effects = {}           # {effect_name: seconds_remaining}
 
         # Sprite (pixel art, frame 0 = apuntando arriba)
@@ -157,6 +163,11 @@ class Car:
         self.friction_multiplier = 1.0
         self.turn_multiplier = 1.0
         self.is_shielded = False
+        self.has_magnet = False
+        self.has_slowmo = False
+        self.has_bounce = False
+        self.has_autopilot = False
+        self.is_spinning = False
 
         if "boost" in self.active_effects:
             self.speed_multiplier = BOOST_SPEED_MULT
@@ -171,6 +182,27 @@ class Car:
 
         if "missile_slow" in self.active_effects:
             self.speed_multiplier = min(self.speed_multiplier, MISSILE_SLOW_FACTOR)
+
+        if "mine_spin" in self.active_effects:
+            self.speed_multiplier = min(self.speed_multiplier, MINE_SLOW_FACTOR)
+            self.turn_multiplier = 0.0  # no puede girar durante el spin
+            self.is_spinning = True
+            self.angle += 720 * dt      # gira 2 vueltas/segundo
+
+        if "emp_slow" in self.active_effects:
+            self.speed_multiplier = min(self.speed_multiplier, EMP_SLOW_FACTOR)
+
+        if "magnet" in self.active_effects:
+            self.has_magnet = True
+
+        if "slowmo" in self.active_effects:
+            self.has_slowmo = True
+
+        if "bounce" in self.active_effects:
+            self.has_bounce = True
+
+        if "autopilot" in self.active_effects:
+            self.has_autopilot = True
 
     def break_shield(self):
         """Rompe el escudo activo."""
@@ -253,7 +285,7 @@ class Car:
         ix = int(sx)
         iy = int(sy) - 28
 
-        color = POWERUP_COLORS.get(self.held_powerup, (200, 200, 200))
+        color = POWERUP_COLORS.get(self.held_powerup, POWERUP_MYSTERY_COLOR)
         pygame.draw.circle(surface, (30, 30, 30), (ix, iy), 8)
         pygame.draw.circle(surface, color, (ix, iy), 6)
         pygame.draw.circle(surface, COLOR_WHITE, (ix, iy), 8, 1)

@@ -107,7 +107,7 @@ BOOST_SPEED_MULT = 1.45        # multiplicador de velocidad máxima
 BOOST_ACCEL_MULT = 1.3         # multiplicador de aceleración
 
 # Shield
-SHIELD_DURATION = 12.0         # segundos (o hasta recibir impacto)
+SHIELD_DURATION = 5.0          # segundos (o hasta recibir impacto)
 
 # Missile
 MISSILE_SPEED = 700.0          # px/s
@@ -122,6 +122,48 @@ OIL_SLICK_LIFETIME = 8.0       # segundos en el suelo
 OIL_EFFECT_DURATION = 1.5      # segundos de efecto al pisar
 OIL_FRICTION_MULT = 3.0        # multiplicador de fricción (derrape)
 OIL_TURN_MULT = 0.3            # multiplicador de giro (pierde control)
+
+# Mine (Mina Explosiva)
+POWERUP_MINE = "mine"
+MINE_RADIUS = 25               # radio del collider
+MINE_LIFETIME = 15.0           # segundos en la pista
+MINE_SPIN_DURATION = 2.0       # duración del spin al pisar
+MINE_SLOW_FACTOR = 0.3         # multiplicador de velocidad al pisar
+
+# EMP (Pulso Electromagnético)
+POWERUP_EMP = "emp"
+EMP_RANGE = 300.0              # radio de efecto
+EMP_SLOW_DURATION = 3.0        # duración del slowdown
+EMP_SLOW_FACTOR = 0.5          # multiplicador de velocidad
+
+# Magnet (Imán de Checkpoints)
+POWERUP_MAGNET = "magnet"
+MAGNET_DURATION = 8.0          # duración del efecto
+MAGNET_RADIUS_MULT = 3.0       # multiplicador del radio de detección
+
+# SlowMo (Ralentización Temporal)
+POWERUP_SLOWMO = "slowmo"
+SLOWMO_DURATION = 3.0          # duración del bullet time
+SLOWMO_FACTOR = 0.7            # rivales a 70% velocidad
+
+# Bounce (Rebote Mejorado)
+POWERUP_BOUNCE = "bounce"
+BOUNCE_DURATION = 8.0          # duración del efecto
+
+# Autopilot
+POWERUP_AUTOPILOT = "autopilot"
+AUTOPILOT_DURATION = 1.0       # duración del piloto automático
+
+# Teleport
+POWERUP_TELEPORT = "teleport"
+TELEPORT_DISTANCE = 100.0      # píxeles hacia adelante
+
+# Smart Missile (Misil Inteligente)
+POWERUP_SMART_MISSILE = "smart_missile"
+SMART_MISSILE_SPEED = 500.0    # px/s
+SMART_MISSILE_LIFETIME = 5.0   # segundos
+SMART_MISSILE_TURN_SPEED = 180.0  # grados/s de giro
+SMART_MISSILE_SIZE = 8         # radio
 
 # ──────────────────────────────────────────────
 # PARTÍCULAS DE POLVO
@@ -144,10 +186,18 @@ DUST_COLORS = [
 
 # Colores de cada power-up
 POWERUP_COLORS = {
-    POWERUP_BOOST:   (0, 220, 80),
-    POWERUP_SHIELD:  (60, 140, 255),
-    POWERUP_MISSILE: (230, 50, 50),
-    POWERUP_OIL:     (180, 160, 30),
+    POWERUP_BOOST:          (0, 220, 80),      # verde
+    POWERUP_SHIELD:         (60, 140, 255),     # azul
+    POWERUP_MISSILE:        (230, 50, 50),      # rojo
+    POWERUP_OIL:            (180, 160, 30),     # amarillo oscuro
+    POWERUP_MINE:           (160, 40, 40),      # marrón rojizo
+    POWERUP_EMP:            (0, 200, 255),      # cian
+    POWERUP_MAGNET:         (220, 60, 220),     # magenta
+    POWERUP_SLOWMO:         (160, 80, 220),     # púrpura
+    POWERUP_BOUNCE:         (255, 160, 30),     # naranja
+    POWERUP_AUTOPILOT:      (30, 180, 130),     # teal
+    POWERUP_TELEPORT:       (100, 200, 255),    # celeste
+    POWERUP_SMART_MISSILE:  (255, 100, 30),     # naranja oscuro
 }
 POWERUP_MYSTERY_COLOR = (255, 200, 40)
 

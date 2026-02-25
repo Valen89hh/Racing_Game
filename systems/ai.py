@@ -21,6 +21,9 @@ from settings import (
     BOT_STUCK_TIME_THRESHOLD, BOT_RECOVERY_DURATION,
     BOT_LOOK_AHEAD, BOT_STEER_DEADZONE, BOT_STEER_RANGE,
     POWERUP_BOOST, POWERUP_SHIELD, POWERUP_MISSILE, POWERUP_OIL,
+    POWERUP_MINE, POWERUP_EMP, POWERUP_MAGNET, POWERUP_SLOWMO,
+    POWERUP_BOUNCE, POWERUP_AUTOPILOT, POWERUP_TELEPORT,
+    POWERUP_SMART_MISSILE, EMP_RANGE,
 )
 
 
@@ -256,6 +259,56 @@ class AISystem:
                     if dot < -0.3:  # detrás del bot
                         return True
             return random.random() < 0.005
+
+        elif ptype == POWERUP_MINE:
+            # Dejar mina si un auto viene detrás (como oil)
+            fx, fy = car.get_forward_vector()
+            for other in other_cars:
+                if other.player_id == car.player_id:
+                    continue
+                dx = other.x - car.x
+                dy = other.y - car.y
+                dist = math.hypot(dx, dy)
+                if dist < 300:
+                    dot = (dx * fx + dy * fy) / (dist + 0.01)
+                    if dot < -0.3:
+                        return True
+            return random.random() < 0.005
+
+        elif ptype == POWERUP_EMP:
+            # Usar EMP si hay rivales dentro del rango
+            for other in other_cars:
+                if other.player_id == car.player_id:
+                    continue
+                if distance((car.x, car.y), (other.x, other.y)) < EMP_RANGE:
+                    return True
+            return False
+
+        elif ptype == POWERUP_SMART_MISSILE:
+            # Disparar si hay un rival a distancia media
+            for other in other_cars:
+                if other.player_id == car.player_id:
+                    continue
+                dist = distance((car.x, car.y), (other.x, other.y))
+                if 100 < dist < 800:
+                    return True
+            return False
+
+        elif ptype in (POWERUP_MAGNET, POWERUP_SLOWMO, POWERUP_BOUNCE,
+                        POWERUP_AUTOPILOT):
+            # Efectos de duración: usar cuando hay rivales cerca
+            for other in other_cars:
+                if other.player_id == car.player_id:
+                    continue
+                if distance((car.x, car.y), (other.x, other.y)) < 400:
+                    return True
+            return random.random() < 0.01
+
+        elif ptype == POWERUP_TELEPORT:
+            # Usar teleport en rectas a velocidad moderada
+            wp_idx = self.current_waypoints.get(car.player_id, 0)
+            speed_factor = self._calculate_speed_factor(wp_idx)
+            return speed_factor > 0.85 and car.speed > 250
 
         return False
 

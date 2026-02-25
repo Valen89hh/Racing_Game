@@ -10,7 +10,7 @@ import math
 
 from entities.car import Car
 from entities.track import Track
-from entities.powerup import PowerUpItem, Missile, OilSlick
+from entities.powerup import PowerUpItem, Missile, OilSlick, Mine, SmartMissile
 from utils.helpers import distance
 from settings import (
     WORLD_WIDTH, WORLD_HEIGHT,
@@ -92,14 +92,25 @@ class CollisionSystem:
         Actualiza checkpoints y vueltas usando zonas rectangulares.
 
         Cada frame verifica si el auto está dentro de la zona del siguiente
-        checkpoint. Si pasa todos los checkpoints, incrementa la vuelta.
+        checkpoint. Si tiene efecto imán, usa una zona más grande.
         """
         zones = self.track.checkpoint_zones
         n = len(zones)
         if n == 0 or car.next_checkpoint_index >= n:
             return
         zone = zones[car.next_checkpoint_index]
-        if zone.collidepoint(int(car.x), int(car.y)):
+
+        if car.has_magnet:
+            # Zona inflada por el multiplicador del imán
+            from settings import MAGNET_RADIUS_MULT
+            expanded = zone.inflate(
+                int(zone.width * (MAGNET_RADIUS_MULT - 1)),
+                int(zone.height * (MAGNET_RADIUS_MULT - 1)))
+            hit = expanded.collidepoint(int(car.x), int(car.y))
+        else:
+            hit = zone.collidepoint(int(car.x), int(car.y))
+
+        if hit:
             car.next_checkpoint_index += 1
             if car.next_checkpoint_index >= n:
                 car.laps += 1
@@ -150,7 +161,20 @@ class CollisionSystem:
             return False
         return distance((car.x, car.y), (oil.x, oil.y)) < oil.radius + 10
 
-    def check_missile_vs_wall(self, missile: Missile) -> bool:
+    def check_car_vs_mine(self, car: Car, mine: Mine) -> bool:
+        """Verifica si un auto pisa una mina (que no sea el dueño)."""
+        if not mine.alive or car.player_id == mine.owner_id:
+            return False
+        return distance((car.x, car.y), (mine.x, mine.y)) < mine.radius + 15
+
+    def check_car_vs_smart_missile(self, car: Car,
+                                    missile: SmartMissile) -> bool:
+        """Verifica si un misil inteligente impacta un auto."""
+        if not missile.alive or car.player_id == missile.owner_id:
+            return False
+        return distance((car.x, car.y), (missile.x, missile.y)) < missile.radius + 18
+
+    def check_missile_vs_wall(self, missile) -> bool:
         """Verifica si un misil chocó con un muro de la pista."""
         if not missile.alive:
             return False

@@ -34,13 +34,20 @@ from settings import (
     HUD_SUBTITLE_FONT_SIZE, HUD_MARGIN, MINIMAP_MARGIN, MINIMAP_CAR_DOT,
     BOT_ACCELERATION, BOT_MAX_SPEED, BOT_TURN_SPEED,
     POWERUP_BOOST, POWERUP_SHIELD, POWERUP_MISSILE, POWERUP_OIL,
+    POWERUP_MINE, POWERUP_EMP, POWERUP_MAGNET, POWERUP_SLOWMO,
+    POWERUP_BOUNCE, POWERUP_AUTOPILOT, POWERUP_TELEPORT,
+    POWERUP_SMART_MISSILE,
     POWERUP_COLORS, POWERUP_MYSTERY_COLOR,
     BOOST_DURATION, SHIELD_DURATION,
     MISSILE_SLOW_DURATION, OIL_EFFECT_DURATION,
+    MINE_SPIN_DURATION, EMP_RANGE, EMP_SLOW_DURATION,
+    MAGNET_DURATION, SLOWMO_DURATION, BOUNCE_DURATION,
+    AUTOPILOT_DURATION, TELEPORT_DISTANCE,
+    SMART_MISSILE_LIFETIME,
 )
 from entities.car import Car
 from entities.track import Track
-from entities.powerup import PowerUpItem, Missile, OilSlick
+from entities.powerup import PowerUpItem, Missile, OilSlick, Mine, SmartMissile
 from entities.particles import DustParticleSystem
 from systems.physics import PhysicsSystem
 from systems.collision import CollisionSystem
@@ -96,6 +103,8 @@ class Game:
         self.powerup_items = []    # pickups en la pista
         self.missiles = []         # misiles activos
         self.oil_slicks = []       # manchas de aceite activas
+        self.mines = []            # minas activas
+        self.smart_missiles = []   # misiles inteligentes activos
         self._use_cooldown = 0.0   # cooldown para evitar doble uso
         self.dust_particles = None # sistema de partículas de polvo
 
@@ -291,6 +300,8 @@ class Game:
         ]
         self.missiles = []
         self.oil_slicks = []
+        self.mines = []
+        self.smart_missiles = []
         self._use_cooldown = 0.0
 
         # Partículas de polvo
@@ -344,6 +355,13 @@ class Game:
         keys = pygame.key.get_pressed()
         self._use_cooldown = max(0, self._use_cooldown - dt)
 
+        # Detectar si algún auto tiene slowmo activo
+        slowmo_owner = None
+        for car in self.cars:
+            if car.has_slowmo:
+                slowmo_owner = car
+                break
+
         # ── Actualizar autos ──
         for car in self.cars:
             if car.finished:
@@ -360,20 +378,36 @@ class Game:
                 else:
                     self.ai_system.update(car, dt, self.cars)
 
+            # Autopilot sobreescribe el input del jugador
+            if car.has_autopilot:
+                self._autopilot_steer(car)
+
             # Efectos de power-ups activos
             car.update_effects(dt)
 
+            # SlowMo: rivales se mueven más lento
+            car_dt = dt
+            if (slowmo_owner is not None and
+                    car.player_id != slowmo_owner.player_id):
+                from settings import SLOWMO_FACTOR
+                car_dt = dt * SLOWMO_FACTOR
+
             # Física (con per-tile friction si el track lo soporta)
-            self.physics.update(car, dt, self.track)
+            self.physics.update(car, car_dt, self.track)
             car.update_sprite()
 
             # Colisiones con bordes
             if self.collision_system.check_track_collision(car):
                 if car.is_shielded:
-                    # El escudo absorbe el impacto
                     car.break_shield()
                     normal = self.collision_system.resolve_track_collision(car)
                     car.speed *= 0.7
+                    car.update_sprite()
+                elif car.has_bounce:
+                    # Rebote mejorado: conserva más velocidad
+                    normal = self.collision_system.resolve_track_collision(car)
+                    self.physics.apply_collision_response(car, normal)
+                    car.speed *= 1.3  # recuperar velocidad tras el rebote
                     car.update_sprite()
                 else:
                     normal = self.collision_system.resolve_track_collision(car)
@@ -461,6 +495,34 @@ class Game:
                         car.apply_effect("oil_slow", OIL_EFFECT_DURATION)
         self.oil_slicks = [o for o in self.oil_slicks if o.alive]
 
+        # ── Actualizar minas ──
+        for mine in self.mines:
+            mine.update(dt)
+            for car in self.cars:
+                if self.collision_system.check_car_vs_mine(car, mine):
+                    mine.alive = False
+                    if car.is_shielded:
+                        car.break_shield()
+                    else:
+                        car.apply_effect("mine_spin", MINE_SPIN_DURATION)
+                        car.speed *= 0.3
+        self.mines = [m for m in self.mines if m.alive]
+
+        # ── Actualizar misiles inteligentes ──
+        for sm in self.smart_missiles:
+            sm.update(dt)
+            if self.collision_system.check_missile_vs_wall(sm):
+                sm.alive = False
+            for car in self.cars:
+                if self.collision_system.check_car_vs_smart_missile(car, sm):
+                    sm.alive = False
+                    if car.is_shielded:
+                        car.break_shield()
+                    else:
+                        car.apply_effect("missile_slow", MISSILE_SLOW_DURATION)
+                        car.speed *= 0.3
+        self.smart_missiles = [m for m in self.smart_missiles if m.alive]
+
         # ── Partículas de polvo ──
         if self.dust_particles:
             for car in self.cars:
@@ -497,18 +559,107 @@ class Game:
             car.apply_effect("shield", SHIELD_DURATION)
 
         elif ptype == POWERUP_MISSILE:
-            # Disparar misil desde la posición frontal del auto
             fx, fy = car.get_forward_vector()
             mx = car.x + fx * 30
             my = car.y + fy * 30
             self.missiles.append(Missile(mx, my, car.angle, car.player_id))
 
         elif ptype == POWERUP_OIL:
-            # Dejar mancha detrás del auto
             fx, fy = car.get_forward_vector()
             ox = car.x - fx * 30
             oy = car.y - fy * 30
             self.oil_slicks.append(OilSlick(ox, oy, car.player_id))
+
+        elif ptype == POWERUP_MINE:
+            fx, fy = car.get_forward_vector()
+            mx = car.x - fx * 35
+            my = car.y - fy * 35
+            self.mines.append(Mine(mx, my, car.player_id))
+
+        elif ptype == POWERUP_EMP:
+            # Efecto instantáneo: ralentizar rivales cercanos + quitar boost
+            for other in self.cars:
+                if other.player_id == car.player_id:
+                    continue
+                dist = math.hypot(other.x - car.x, other.y - car.y)
+                if dist < EMP_RANGE:
+                    other.apply_effect("emp_slow", EMP_SLOW_DURATION)
+                    # Desactivar boost si lo tienen
+                    if "boost" in other.active_effects:
+                        del other.active_effects["boost"]
+
+        elif ptype == POWERUP_MAGNET:
+            car.apply_effect("magnet", MAGNET_DURATION)
+
+        elif ptype == POWERUP_SLOWMO:
+            car.apply_effect("slowmo", SLOWMO_DURATION)
+
+        elif ptype == POWERUP_BOUNCE:
+            car.apply_effect("bounce", BOUNCE_DURATION)
+
+        elif ptype == POWERUP_AUTOPILOT:
+            car.apply_effect("autopilot", AUTOPILOT_DURATION)
+
+        elif ptype == POWERUP_TELEPORT:
+            # Mover auto hacia adelante si el destino está en pista
+            fx, fy = car.get_forward_vector()
+            new_x = car.x + fx * TELEPORT_DISTANCE
+            new_y = car.y + fy * TELEPORT_DISTANCE
+            if self.track.is_on_track(new_x, new_y):
+                car.x = new_x
+                car.y = new_y
+                car.update_sprite()
+
+        elif ptype == POWERUP_SMART_MISSILE:
+            # Buscar el auto rival más avanzado como objetivo
+            target = self._find_leader_rival(car)
+            if target:
+                fx, fy = car.get_forward_vector()
+                mx = car.x + fx * 30
+                my = car.y + fy * 30
+                self.smart_missiles.append(
+                    SmartMissile(mx, my, car.angle, car.player_id, target))
+
+    def _find_leader_rival(self, car: Car):
+        """Encuentra el auto rival más avanzado en la carrera."""
+        best = None
+        best_score = -1
+        for other in self.cars:
+            if other.player_id == car.player_id or other.finished:
+                continue
+            # Score: laps * 1000 + checkpoints
+            score = other.laps * 1000 + other.next_checkpoint_index
+            if score > best_score:
+                best_score = score
+                best = other
+        return best
+
+    def _autopilot_steer(self, car: Car):
+        """Piloto automático: dirige el auto hacia los waypoints."""
+        wps = self.track.waypoints
+        if not wps:
+            return
+        # Encontrar waypoint más cercano
+        min_dist = float('inf')
+        best_idx = 0
+        for i, (wx, wy) in enumerate(wps):
+            d = math.hypot(car.x - wx, car.y - wy)
+            if d < min_dist:
+                min_dist = d
+                best_idx = i
+        # Apuntar algunos waypoints adelante
+        target_idx = (best_idx + 3) % len(wps)
+        tx, ty = wps[target_idx]
+        dx = tx - car.x
+        dy = ty - car.y
+        target_angle = math.degrees(math.atan2(dx, -dy)) % 360
+        current = car.angle % 360
+        diff = (target_angle - current + 180) % 360 - 180
+        car.input_accelerate = 1.0
+        if diff > 5:
+            car.input_turn = 1.0
+        elif diff < -5:
+            car.input_turn = -1.0
 
     # ──────────────────────────────────────────────
     # RENDER
@@ -570,14 +721,22 @@ class Game:
         draw_text_centered(self.screen, "Power-Ups:", self.font,
                            COLOR_WHITE, y_pw)
         powerup_info = [
-            (POWERUP_BOOST,   "Boost   - Speed increase"),
-            (POWERUP_SHIELD,  "Shield  - Absorbs one hit"),
-            (POWERUP_MISSILE, "Missile - Slows enemy"),
-            (POWERUP_OIL,     "Oil     - Creates slippery hazard"),
+            (POWERUP_BOOST,          "Boost    - Speed increase"),
+            (POWERUP_SHIELD,         "Shield   - Absorbs one hit (5s)"),
+            (POWERUP_MISSILE,        "Missile  - Slows enemy"),
+            (POWERUP_OIL,            "Oil      - Slippery hazard"),
+            (POWERUP_MINE,           "Mine     - Spin + slow on contact"),
+            (POWERUP_EMP,            "EMP      - Slows nearby rivals"),
+            (POWERUP_MAGNET,         "Magnet   - Wider checkpoints"),
+            (POWERUP_SLOWMO,         "SlowMo   - Rivals move slower"),
+            (POWERUP_BOUNCE,         "Bounce   - Better wall bounce"),
+            (POWERUP_AUTOPILOT,      "Autopilot - Auto-steer 1s"),
+            (POWERUP_TELEPORT,       "Teleport  - Jump 100px forward"),
+            (POWERUP_SMART_MISSILE,  "SmartMsl - Homing missile"),
         ]
         for i, (ptype, desc) in enumerate(powerup_info):
             color = POWERUP_COLORS[ptype]
-            py = y_pw + 30 + i * 26
+            py = y_pw + 30 + i * 20
             cx = SCREEN_WIDTH // 2 - 160
             pygame.draw.circle(self.screen, color, (cx, py + 8), 6)
             rendered = self.font_small.render(desc, True, COLOR_GRAY)
@@ -601,6 +760,11 @@ class Game:
             if cam.is_visible(oil.x, oil.y, 50):
                 oil.draw(self.screen, cam)
 
+        # Minas (sobre la pista, bajo los autos)
+        for mine in self.mines:
+            if cam.is_visible(mine.x, mine.y, 40):
+                mine.draw(self.screen, cam)
+
         # Power-up pickups
         for item in self.powerup_items:
             if item.active and cam.is_visible(item.x, item.y, 30):
@@ -620,6 +784,11 @@ class Game:
         for missile in self.missiles:
             if cam.is_visible(missile.x, missile.y, 20):
                 missile.draw(self.screen, cam)
+
+        # Misiles inteligentes
+        for sm in self.smart_missiles:
+            if cam.is_visible(sm.x, sm.y, 20):
+                sm.draw(self.screen, cam)
 
         # Debug: dibujar checkpoint zones y next_checkpoint_index
         if DEBUG_CHECKPOINTS and hasattr(self.track, 'checkpoint_zones'):
@@ -793,6 +962,12 @@ class Game:
                     "shield": POWERUP_COLORS[POWERUP_SHIELD],
                     "oil_slow": POWERUP_COLORS[POWERUP_OIL],
                     "missile_slow": POWERUP_COLORS[POWERUP_MISSILE],
+                    "mine_spin": POWERUP_COLORS[POWERUP_MINE],
+                    "emp_slow": POWERUP_COLORS[POWERUP_EMP],
+                    "magnet": POWERUP_COLORS[POWERUP_MAGNET],
+                    "slowmo": POWERUP_COLORS[POWERUP_SLOWMO],
+                    "bounce": POWERUP_COLORS[POWERUP_BOUNCE],
+                    "autopilot": POWERUP_COLORS[POWERUP_AUTOPILOT],
                 }.get(name, COLOR_WHITE)
                 txt = f"{name}: {remaining:.1f}s"
                 surf = self.font_small.render(txt, True, color)
