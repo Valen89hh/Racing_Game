@@ -528,6 +528,7 @@ class Game:
             for car in self.cars:
                 if not car.finished:
                     self.dust_particles.emit_from_car(car)
+                    self.dust_particles.emit_drift_smoke(car)
             self.dust_particles.update(dt)
 
         # ── Cámara ──

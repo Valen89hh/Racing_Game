@@ -63,6 +63,25 @@ CAR_TURN_SPEED_MIN = 40.0
 CAR_DRIFT_FACTOR = 0.92
 CAR_REVERSE_MAX_SPEED = 150.0
 
+# ──────────────────────────────────────────────
+# DRIFT / DERRAPE
+# ──────────────────────────────────────────────
+DRIFT_MIN_SPEED = 80.0          # velocidad mínima para poder driftar
+DRIFT_MAX_ANGLE = 45.0          # ángulo máximo entre orientación y velocidad durante drift
+DRIFT_TURN_BOOST = 1.15          # multiplicador de giro durante drift
+DRIFT_SPEED_BOOST = 1.03         # multiplicador de velocidad durante drift
+DRIFT_LATERAL_GRIP_NORMAL = 0.2   # retención lateral sin drift (grip alto, agarre)
+DRIFT_LATERAL_GRIP_DRIFT = 0.85   # retención lateral en drift (grip bajo, desliza)
+DRIFT_EXIT_BOOST = 1.05           # boost de velocidad al salir del drift
+DRIFT_LATERAL_THRESHOLD = 20.0    # velocidad lateral mínima para considerar "deslizando"
+DRIFT_SMOKE_RATE = 4.0          # partículas de humo por frame durante drift
+DRIFT_SMOKE_COLORS = [
+    (180, 180, 180),  # gris claro
+    (160, 160, 170),  # gris azulado
+    (200, 200, 200),  # blanco humo
+    (140, 140, 150),  # gris medio
+]
+
 CAR_WIDTH = 22
 CAR_HEIGHT = 40
 

@@ -49,7 +49,7 @@ class Car:
         self.x = x
         self.y = y
         self.angle = angle
-        self.speed = 0.0
+        self.velocity = pygame.math.Vector2(0.0, 0.0)
 
         # Identificador
         self.player_id = player_id
@@ -83,6 +83,9 @@ class Car:
         self.finished = False
         self.finish_time = 0.0
         self.next_checkpoint_index = 0
+
+        # Drift / derrape
+        self.is_drifting = False   # flag activo durante handbrake drift
 
         # Colisión con pared (usado por physics.py)
         self._wall_normal = None
@@ -225,6 +228,32 @@ class Car:
     def get_forward_vector(self) -> tuple[float, float]:
         """Retorna el vector de dirección frontal del auto."""
         return angle_to_vector(self.angle)
+
+    @property
+    def speed(self) -> float:
+        """Velocidad proyectada sobre el forward vector (con signo)."""
+        fx, fy = self.get_forward_vector()
+        fwd = pygame.math.Vector2(fx, fy)
+        return self.velocity.dot(fwd)
+
+    @speed.setter
+    def speed(self, value: float):
+        """Escala velocity para que la componente forward sea `value`."""
+        current = self.speed
+        if abs(current) < 0.1:
+            # Si velocity es ~0, setear directamente en dirección forward
+            fx, fy = self.get_forward_vector()
+            self.velocity = pygame.math.Vector2(fx * value, fy * value)
+        else:
+            self.velocity *= (value / current)
+
+    def get_lateral_speed(self) -> float:
+        """Magnitud del componente lateral de velocity (perpendicular a forward)."""
+        fx, fy = self.get_forward_vector()
+        fwd = pygame.math.Vector2(fx, fy)
+        forward_proj = fwd * self.velocity.dot(fwd)
+        lateral = self.velocity - forward_proj
+        return lateral.length()
 
     def get_corners(self) -> list[tuple[float, float]]:
         """Calcula las esquinas del auto en coordenadas del mundo."""

@@ -17,6 +17,7 @@ from settings import (
     DUST_LIFETIME_MIN, DUST_LIFETIME_MAX,
     DUST_RADIUS_MIN, DUST_RADIUS_MAX,
     DUST_MAX_ALPHA, DUST_COLORS,
+    DRIFT_SMOKE_RATE, DRIFT_SMOKE_COLORS, DRIFT_LATERAL_THRESHOLD,
 )
 
 
@@ -63,7 +64,7 @@ class DustParticleSystem:
 
     def emit_from_car(self, car):
         """Emite partículas de polvo detrás de un carro según su velocidad."""
-        speed = abs(car.speed)
+        speed = car.velocity.length()
         if speed < DUST_SPEED_THRESHOLD:
             return
 
@@ -100,6 +101,48 @@ class DustParticleSystem:
             p.max_lifetime = p.lifetime
             p.radius = random.uniform(DUST_RADIUS_MIN, DUST_RADIUS_MAX)
             p.color = random.choice(DUST_COLORS)
+
+    def emit_drift_smoke(self, car):
+        """Emite partículas de humo durante drift (grises/blancas, más grandes)."""
+        lateral = car.get_lateral_speed()
+        if not car.is_drifting or lateral < DRIFT_LATERAL_THRESHOLD:
+            return
+
+        # Intensidad proporcional a la velocidad lateral
+        intensity = min(1.0, lateral / (car.effective_max_speed * 0.5))
+        count = int(intensity * DRIFT_SMOKE_RATE) + (
+            1 if random.random() < (intensity * DRIFT_SMOKE_RATE) % 1 else 0
+        )
+        if count < 1:
+            return
+
+        # Vector "detrás" del carro
+        rad = math.radians(car.angle)
+        behind_x = -math.sin(rad)
+        behind_y = math.cos(rad)
+        # Vector lateral
+        lat_x = math.cos(rad)
+        lat_y = math.sin(rad)
+
+        for _ in range(count):
+            p = self._acquire()
+            p.alive = True
+
+            # Spawn desde ruedas traseras (desplazadas lateralmente)
+            offset_back = random.uniform(16.0, 24.0)
+            offset_lat = random.choice([-1, 1]) * random.uniform(8.0, 14.0)
+            p.x = car.x + behind_x * offset_back + lat_x * offset_lat
+            p.y = car.y + behind_y * offset_back + lat_y * offset_lat
+
+            # Velocidad: dispersión lateral + algo hacia atrás
+            p.vx = behind_x * random.uniform(5.0, 20.0) + random.uniform(-20.0, 20.0)
+            p.vy = behind_y * random.uniform(5.0, 20.0) + random.uniform(-20.0, 20.0)
+
+            # Mayor lifetime y radio que el polvo normal
+            p.lifetime = random.uniform(0.5, 1.2)
+            p.max_lifetime = p.lifetime
+            p.radius = random.uniform(3.0, 7.0)
+            p.color = random.choice(DRIFT_SMOKE_COLORS)
 
     def update(self, dt: float):
         """Actualiza todas las partículas vivas."""

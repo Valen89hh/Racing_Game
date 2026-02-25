@@ -6,10 +6,25 @@ Usa las propiedades efectivas del auto (base * multiplicador) para que
 los power-ups modifiquen la física sin tocar este sistema.
 
 ──────────────────────────────────────────────────────────────────────
+DRIFT POR VECTOR DE VELOCIDAD REAL
+──────────────────────────────────────────────────────────────────────
+
+    velocity = vector 2D real de movimiento
+    forward  = dirección visual del auto (car.angle)
+
+    Cada frame, velocity se descompone en forward + lateral respecto
+    a car.angle. La componente lateral se amortigua según el grip:
+      - Normal (sin SPACE): lateral *= 0.2   → agarre alto
+      - Drift  (con SPACE): lateral *= 0.85  → deslizamiento
+
+    El drift emerge naturalmente de la diferencia entre orientación
+    y dirección real de velocidad.
+
+──────────────────────────────────────────────────────────────────────
 RESPUESTA A COLISIÓN POR PROYECCIÓN SOBRE VECTOR NORMAL
 ──────────────────────────────────────────────────────────────────────
 
-    V = velocidad del auto (vector 2D = speed * forward)
+    V = velocity del auto (vector 2D real)
     N = normal de la pared (apunta hacia la pista)
 
     V_normal     = dot(V, N) * N   → componente que penetra el muro
@@ -21,8 +36,13 @@ RESPUESTA A COLISIÓN POR PROYECCIÓN SOBRE VECTOR NORMAL
 """
 
 import math
+import pygame
 
 from entities.car import Car
+from settings import (
+    DRIFT_MIN_SPEED, DRIFT_MAX_ANGLE, DRIFT_TURN_BOOST, DRIFT_SPEED_BOOST,
+    DRIFT_LATERAL_GRIP_NORMAL, DRIFT_LATERAL_GRIP_DRIFT, DRIFT_EXIT_BOOST,
+)
 from utils.helpers import angle_to_vector, clamp, lerp
 
 
@@ -40,28 +60,43 @@ class PhysicsSystem:
             dt: delta time
             track: optional track with get_friction_at(x,y) for per-tile friction
         """
+        was_drifting = car.is_drifting
         self._apply_acceleration(car, dt)
         self._apply_friction(car, dt, track)
         self._apply_turning(car, dt, track)
+        self._apply_grip(car, dt)
         self._apply_movement(car, dt)
+
+        # Drift exit boost
+        if was_drifting and not car.is_drifting and not car.input_brake:
+            car.velocity *= DRIFT_EXIT_BOOST
 
     def _apply_acceleration(self, car: Car, dt: float):
         """Aplica aceleración o frenado según el input."""
+        fx, fy = car.get_forward_vector()
+        forward = pygame.math.Vector2(fx, fy)
+        speed_mag = car.velocity.length()
+
         if car.input_brake:
-            if car.speed > 0:
-                car.speed -= car.brake_force * dt
-                if car.speed < 0:
-                    car.speed = 0
-            elif car.speed < 0:
-                car.speed += car.brake_force * dt
-                if car.speed > 0:
-                    car.speed = 0
-            return
+            if speed_mag >= DRIFT_MIN_SPEED:
+                # Drift: activar flag, conservar inercia
+                car.is_drifting = True
+                return
+            else:
+                # Baja velocidad: freno duro hacia 0
+                car.is_drifting = False
+                if speed_mag > 0:
+                    brake_amount = car.brake_force * dt
+                    if brake_amount >= speed_mag:
+                        car.velocity.x = 0.0
+                        car.velocity.y = 0.0
+                    else:
+                        car.velocity.scale_to_length(speed_mag - brake_amount)
+                return
 
         # Bloquear aceleración si el auto empuja contra un muro
         if car._wall_normal is not None:
             nx, ny = car._wall_normal
-            fx, fy = car.get_forward_vector()
             if car.input_accelerate > 0:
                 if fx * nx + fy * ny < -0.3:
                     return
@@ -73,18 +108,26 @@ class PhysicsSystem:
         max_spd = car.effective_max_speed
 
         if car.input_accelerate > 0:
-            if car.speed < 0:
-                car.speed += car.brake_force * car.input_accelerate * dt
+            fwd_speed = car.speed  # proyección forward (con signo)
+            if fwd_speed < 0:
+                # Frenando marcha atrás
+                car.velocity += forward * car.brake_force * car.input_accelerate * dt
             else:
-                car.speed += accel * car.input_accelerate * dt
-            car.speed = min(car.speed, max_spd)
+                car.velocity += forward * accel * car.input_accelerate * dt
+            # Clamp magnitud a max_speed
+            if car.velocity.length() > max_spd:
+                car.velocity.scale_to_length(max_spd)
 
         elif car.input_accelerate < 0:
-            if car.speed > 0:
-                car.speed += car.brake_force * car.input_accelerate * dt
+            fwd_speed = car.speed
+            if fwd_speed > 0:
+                # Frenando marcha adelante
+                car.velocity += forward * car.brake_force * car.input_accelerate * dt
             else:
-                car.speed += accel * car.input_accelerate * dt * 0.5
-            car.speed = max(car.speed, -car.reverse_max_speed)
+                car.velocity += forward * accel * car.input_accelerate * dt * 0.5
+            # Clamp a reverse max speed
+            if car.velocity.length() > car.reverse_max_speed:
+                car.velocity.scale_to_length(car.reverse_max_speed)
 
     def _apply_friction(self, car: Car, dt: float, track=None):
         """Aplica fricción cuando no se acelera.
@@ -100,18 +143,18 @@ class PhysicsSystem:
             tile_friction = track.get_friction_at(car.x, car.y)
         friction *= tile_friction
 
-        if abs(car.speed) < 5.0:
-            car.speed = 0
+        speed_mag = car.velocity.length()
+        if speed_mag < 5.0:
+            car.velocity.x = 0.0
+            car.velocity.y = 0.0
             return
 
-        if car.speed > 0:
-            car.speed -= friction * dt
-            if car.speed < 0:
-                car.speed = 0
-        elif car.speed < 0:
-            car.speed += friction * dt
-            if car.speed > 0:
-                car.speed = 0
+        new_speed = speed_mag - friction * dt
+        if new_speed <= 0:
+            car.velocity.x = 0.0
+            car.velocity.y = 0.0
+        else:
+            car.velocity.scale_to_length(new_speed)
 
     def _apply_turning(self, car: Car, dt: float, track=None):
         """Aplica rotación basándose en input, velocidad y multiplicador de giro.
@@ -120,14 +163,19 @@ class PhysicsSystem:
             return
 
         wall_contact = car._wall_normal is not None
-        if abs(car.speed) < 1.0 and not wall_contact:
+        speed_mag = car.velocity.length()
+        if speed_mag < 1.0 and not wall_contact:
             return
 
-        speed_ratio = clamp(abs(car.speed) / car.effective_max_speed, 0.0, 1.0)
+        speed_ratio = clamp(speed_mag / car.effective_max_speed, 0.0, 1.0)
         base_turn = lerp(car.turn_speed_min, car.effective_turn_speed, speed_ratio)
 
-        if abs(car.speed) < 1.0 and wall_contact:
+        if speed_mag < 1.0 and wall_contact:
             base_turn = car.turn_speed_min
+
+        # Giro un poco más rápido durante drift
+        if car.is_drifting:
+            base_turn *= DRIFT_TURN_BOOST
 
         # Reduce turning on slippery tiles
         if track and hasattr(track, 'get_friction_at'):
@@ -136,16 +184,54 @@ class PhysicsSystem:
                 base_turn *= tile_friction
 
         direction = 1.0 if car.speed >= 0 else -1.0
-        car.angle += car.input_turn * base_turn * direction * dt
-        car.angle %= 360
+        new_angle = car.angle + car.input_turn * base_turn * direction * dt
+
+        # Durante drift: limitar ángulo máximo entre orientación y velocidad
+        if car.is_drifting and speed_mag > 1.0:
+            vel_angle = math.degrees(math.atan2(car.velocity.x, -car.velocity.y)) % 360
+            diff = (new_angle - vel_angle + 180) % 360 - 180
+            if abs(diff) > DRIFT_MAX_ANGLE:
+                clamped_diff = DRIFT_MAX_ANGLE if diff > 0 else -DRIFT_MAX_ANGLE
+                new_angle = vel_angle + clamped_diff
+
+        car.angle = new_angle % 360
+
+    def _apply_grip(self, car: Car, dt: float):
+        """Descompone velocity en forward + lateral y amortigua lateral según grip.
+        Durante drift conserva la magnitud total (inercia)."""
+        speed_mag = car.velocity.length()
+        if speed_mag < 0.1:
+            return
+
+        fx, fy = car.get_forward_vector()
+        forward = pygame.math.Vector2(fx, fy)
+
+        # Descomponer velocity
+        forward_dot = car.velocity.dot(forward)
+        forward_component = forward * forward_dot
+        lateral_component = car.velocity - forward_component
+
+        # Grip según estado de drift
+        grip = DRIFT_LATERAL_GRIP_DRIFT if car.is_drifting else DRIFT_LATERAL_GRIP_NORMAL
+        lateral_component *= grip
+
+        car.velocity = forward_component + lateral_component
+
+        # Durante drift: conservar magnitud + ligero boost de velocidad
+        if car.is_drifting:
+            new_mag = car.velocity.length()
+            if new_mag > 0.1:
+                boosted = min(speed_mag * DRIFT_SPEED_BOOST, car.effective_max_speed)
+                car.velocity.scale_to_length(boosted)
+
+        # Si no está en drift y no hay handbrake, desactivar flag
+        if not car.input_brake:
+            car.is_drifting = False
 
     def _apply_movement(self, car: Car, dt: float):
-        """Actualiza la posición del auto según su velocidad y dirección."""
-        if abs(car.speed) < 0.1:
-            return
-        dx, dy = angle_to_vector(car.angle)
-        car.x += dx * car.speed * dt
-        car.y += dy * car.speed * dt
+        """Actualiza la posición del auto según su velocity."""
+        car.x += car.velocity.x * dt
+        car.y += car.velocity.y * dt
 
     def apply_collision_response(self, car: Car,
                                   wall_normal: tuple[float, float]):
@@ -154,9 +240,8 @@ class PhysicsSystem:
         Elimina la componente hacia el muro y conserva la tangencial.
         """
         nx, ny = wall_normal
-        fx, fy = car.get_forward_vector()
-        vx = fx * car.speed
-        vy = fy * car.speed
+        vx = car.velocity.x
+        vy = car.velocity.y
 
         dot = vx * nx + vy * ny
 
@@ -167,14 +252,18 @@ class PhysicsSystem:
         # Componente tangencial
         vt_x = vx - dot * nx
         vt_y = vy - dot * ny
-        tangential_speed = math.hypot(vt_x, vt_y)
 
         # Penalización leve proporcional al impacto
-        impact_factor = 1.0 - abs(dot) / (abs(car.speed) + 0.01)
+        speed_mag = car.velocity.length()
+        impact_factor = 1.0 - abs(dot) / (speed_mag + 0.01)
         penalty = 1.0 - (1.0 - impact_factor) * 0.15
 
-        car.speed = tangential_speed * penalty
+        car.velocity.x = vt_x * penalty
+        car.velocity.y = vt_y * penalty
         car._wall_normal = (nx, ny)
+
+        # Resetear drift al impactar un muro
+        car.is_drifting = False
 
     def clear_wall_contact(self, car: Car):
         """Limpia el estado de contacto con pared."""
