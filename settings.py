@@ -149,6 +149,7 @@ POWERUP_COLORS = {
     POWERUP_MISSILE: (230, 50, 50),
     POWERUP_OIL:     (180, 160, 30),
 }
+POWERUP_MYSTERY_COLOR = (255, 200, 40)
 
 # ──────────────────────────────────────────────
 # MINIMAPA

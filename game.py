@@ -34,7 +34,7 @@ from settings import (
     HUD_SUBTITLE_FONT_SIZE, HUD_MARGIN, MINIMAP_MARGIN, MINIMAP_CAR_DOT,
     BOT_ACCELERATION, BOT_MAX_SPEED, BOT_TURN_SPEED,
     POWERUP_BOOST, POWERUP_SHIELD, POWERUP_MISSILE, POWERUP_OIL,
-    POWERUP_COLORS,
+    POWERUP_COLORS, POWERUP_MYSTERY_COLOR,
     BOOST_DURATION, SHIELD_DURATION,
     MISSILE_SLOW_DURATION, OIL_EFFECT_DURATION,
 )
@@ -220,6 +220,14 @@ class Game:
                         self._train_timesteps = min(self._train_timesteps + 50000, 1000000)
                     elif event.key == pygame.K_DOWN and self._train_status == "idle":
                         self._train_timesteps = max(self._train_timesteps - 50000, 50000)
+
+            # Click izquierdo del mouse para activar power-up
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self.state == STATE_RACING:
+                    if (self.player_car and self.player_car.held_powerup is not None
+                            and self._use_cooldown <= 0):
+                        self._activate_powerup(self.player_car)
+                        self._use_cooldown = 0.3
 
     # ──────────────────────────────────────────────
     # INICIALIZACIÓN DE CARRERA
@@ -412,11 +420,14 @@ class Game:
                     a.update_sprite()
                     b.update_sprite()
 
-        # ── Recoger power-ups ──
+        # ── Recoger power-ups (solo si no tiene uno ya) ──
         for car in self.cars:
+            if car.held_powerup is not None:
+                continue
             for item in self.powerup_items:
                 if self.collision_system.check_car_vs_powerup(car, item):
                     car.held_powerup = item.collect()
+                    break
 
         # ── Actualizar power-up items (respawn) ──
         for item in self.powerup_items:
@@ -546,7 +557,7 @@ class Game:
             "W / S   -  Accelerate / Reverse",
             "A / D   -  Turn Left / Right",
             "SPACE   -  Handbrake",
-            "L-SHIFT -  Use Power-Up",
+            "L-CLICK -  Use Power-Up",
             "E       -  Track Editor",
             "ESC     -  Back to Menu",
         ]
@@ -766,7 +777,7 @@ class Game:
             # Sin power-up
             pygame.draw.rect(self.screen, (60, 60, 60),
                              (px, py, pw_size, pw_size), 2, border_radius=6)
-            lbl = self.font_small.render("[SHIFT]", True, (80, 80, 80))
+            lbl = self.font_small.render("[CLICK]", True, (80, 80, 80))
             lbl_rect = lbl.get_rect(
                 centerx=px + pw_size // 2, top=py + pw_size + 3
             )
@@ -799,12 +810,11 @@ class Game:
             pygame.draw.circle(mm, car.color, (mx, my), MINIMAP_CAR_DOT)
             pygame.draw.circle(mm, COLOR_WHITE, (mx, my), MINIMAP_CAR_DOT, 1)
 
-        # Dibujar power-ups activos
+        # Dibujar power-ups activos (caja misteriosa dorada)
         for item in self.powerup_items:
             if item.active:
                 mx, my = self.track.get_minimap_pos(item.x, item.y)
-                color = POWERUP_COLORS.get(item.power_type, (200, 200, 200))
-                pygame.draw.circle(mm, color, (mx, my), 2)
+                pygame.draw.circle(mm, POWERUP_MYSTERY_COLOR, (mx, my), 2)
 
         # Posicionar en esquina inferior izquierda
         x = MINIMAP_MARGIN

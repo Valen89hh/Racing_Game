@@ -68,10 +68,7 @@ class InputHandler:
         elif car.player_id == 1 and keys[pygame.K_RSHIFT]:
             car.input_brake = True
 
-        # Usar power-up (Left Shift o F para jugador 1)
-        if car.player_id == 0:
-            if keys[pygame.K_LSHIFT] or keys[pygame.K_f]:
-                car.input_use_powerup = True
+        # Power-up se activa con click izquierdo del mouse (ver game.py)
 
     def add_player(self, player_id: int, controls: dict):
         """Agrega un esquema de control para un nuevo jugador."""

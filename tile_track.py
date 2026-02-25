@@ -84,7 +84,12 @@ class TileTrack:
         self.start_positions = self._compute_start_positions(raw_path)
 
         # ── Power-up spawn points ──
-        self.powerup_spawn_points = self._distribute_points(self.waypoints, 7)
+        manual_pu = tile_data.get("powerup_zones")
+        if manual_pu and len(manual_pu) > 0:
+            # Distribuir puntos en toda el área de cada zona
+            self.powerup_spawn_points = self._fill_powerup_zones(manual_pu)
+        else:
+            self.powerup_spawn_points = self._distribute_points(self.waypoints, 7)
 
         # ── Minimap ──
         self.minimap_surface = self._render_minimap()
@@ -264,6 +269,23 @@ class TileTrack:
             return list(waypoints)
         step = max(1, len(waypoints) // count)
         return [waypoints[i * step % len(waypoints)] for i in range(count)]
+
+    def _fill_powerup_zones(self, zones):
+        """Genera puntos de spawn distribuidos dentro de cada zona.
+
+        Coloca un power-up por cada tile que cubre la zona.
+        """
+        points = []
+        for z in zones:
+            zx, zy, zw, zh = z[0], z[1], z[2], z[3]
+            cols = max(1, int(zw / TILE_SIZE))
+            rows = max(1, int(zh / TILE_SIZE))
+            for r in range(rows):
+                for c in range(cols):
+                    px = zx + c * TILE_SIZE + TILE_SIZE / 2
+                    py = zy + r * TILE_SIZE + TILE_SIZE / 2
+                    points.append((px, py))
+        return points
 
     # ────────────────────────────────────────────
     # START POSITIONS

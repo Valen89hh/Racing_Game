@@ -15,7 +15,7 @@ import pygame
 from settings import (
     POWERUP_SIZE, POWERUP_RESPAWN_TIME, POWERUP_BOB_SPEED,
     POWERUP_BOOST, POWERUP_SHIELD, POWERUP_MISSILE, POWERUP_OIL,
-    POWERUP_COLORS,
+    POWERUP_COLORS, POWERUP_MYSTERY_COLOR,
     MISSILE_SPEED, MISSILE_LIFETIME, MISSILE_SIZE,
     OIL_SLICK_RADIUS, OIL_SLICK_LIFETIME,
     WORLD_WIDTH, WORLD_HEIGHT,
@@ -27,16 +27,19 @@ ALL_POWERUP_TYPES = [POWERUP_BOOST, POWERUP_SHIELD, POWERUP_MISSILE, POWERUP_OIL
 
 class PowerUpItem:
     """
-    Un pickup de power-up en la pista.
+    Un pickup de power-up en la pista (caja misteriosa).
 
-    Aparece en un punto fijo del circuito. Al ser recogido, desaparece
-    y reaparece después de un tiempo con un tipo aleatorio.
+    Aparece en un punto fijo del circuito como caja dorada con "?".
+    Al ser recogido, asigna un tipo aleatorio y desaparece.
+    Reaparece después de un tiempo.
     """
+
+    _q_font = None  # class-level cached font for "?" rendering
 
     def __init__(self, x: float, y: float):
         self.x = x
         self.y = y
-        self.power_type: str = random.choice(ALL_POWERUP_TYPES)
+        self.power_type = None          # tipo desconocido hasta recoger
         self.active = True              # visible y recogible
         self.respawn_timer = 0.0        # cuenta regresiva para reaparecer
         self.bob_offset = random.uniform(0, math.pi * 2)  # fase de animación
@@ -48,23 +51,24 @@ class PowerUpItem:
             self.respawn_timer -= dt
             if self.respawn_timer <= 0:
                 self.active = True
-                self.power_type = random.choice(ALL_POWERUP_TYPES)
+                self.power_type = None  # misterio de nuevo
 
     def collect(self) -> str:
         """
-        Recoge el power-up. Retorna el tipo y lo desactiva.
+        Recoge el power-up. Asigna tipo aleatorio y lo desactiva.
 
         Returns:
             Tipo de power-up recogido.
         """
-        ptype = self.power_type
+        ptype = random.choice(ALL_POWERUP_TYPES)
+        self.power_type = ptype
         self.active = False
         self.respawn_timer = POWERUP_RESPAWN_TIME
         return ptype
 
     def draw(self, surface: pygame.Surface, camera, time: float):
         """
-        Dibuja el power-up con animación de flotación.
+        Dibuja el power-up como caja misteriosa dorada con "?".
 
         Args:
             surface: superficie de destino (pantalla).
@@ -80,46 +84,22 @@ class PowerUpItem:
         bob = math.sin(time * POWERUP_BOB_SPEED + self.bob_offset) * 4
         sy += bob
 
-        color = POWERUP_COLORS.get(self.power_type, (200, 200, 200))
         r = self.radius
+        ix, iy = int(sx), int(sy)
 
-        # Fondo circular
-        pygame.draw.circle(surface, (30, 30, 30), (int(sx), int(sy)), r + 3)
-        pygame.draw.circle(surface, color, (int(sx), int(sy)), r)
+        # Fondo circular oscuro + dorado
+        pygame.draw.circle(surface, (30, 30, 30), (ix, iy), r + 3)
+        pygame.draw.circle(surface, POWERUP_MYSTERY_COLOR, (ix, iy), r)
 
-        # Icono según tipo
-        self._draw_icon(surface, int(sx), int(sy), r)
+        # "?" blanco centrado
+        if PowerUpItem._q_font is None:
+            PowerUpItem._q_font = pygame.font.SysFont("consolas", r * 2, bold=True)
+        q_surf = PowerUpItem._q_font.render("?", True, (255, 255, 255))
+        q_rect = q_surf.get_rect(center=(ix, iy))
+        surface.blit(q_surf, q_rect)
 
         # Borde blanco
-        pygame.draw.circle(surface, (255, 255, 255), (int(sx), int(sy)), r + 3, 2)
-
-    def _draw_icon(self, surface: pygame.Surface, cx: int, cy: int, r: int):
-        """Dibuja el icono interior del power-up."""
-        if self.power_type == POWERUP_BOOST:
-            # Flecha hacia arriba (velocidad)
-            pts = [(cx, cy - r // 2), (cx + r // 2, cy + r // 3),
-                   (cx - r // 2, cy + r // 3)]
-            pygame.draw.polygon(surface, (255, 255, 255), pts)
-
-        elif self.power_type == POWERUP_SHIELD:
-            # Escudo (arco)
-            pygame.draw.circle(surface, (255, 255, 255),
-                               (cx, cy), r - 5, 3)
-
-        elif self.power_type == POWERUP_MISSILE:
-            # Triángulo/cohete apuntando arriba
-            pts = [(cx, cy - r // 2), (cx + r // 3, cy + r // 2),
-                   (cx - r // 3, cy + r // 2)]
-            pygame.draw.polygon(surface, (255, 255, 255), pts)
-            pygame.draw.rect(surface, (255, 200, 50),
-                             (cx - 2, cy + r // 4, 4, r // 3))
-
-        elif self.power_type == POWERUP_OIL:
-            # Gota
-            pygame.draw.circle(surface, (40, 40, 40), (cx, cy + 2), r // 2)
-            pts = [(cx, cy - r // 2), (cx + r // 3, cy),
-                   (cx - r // 3, cy)]
-            pygame.draw.polygon(surface, (40, 40, 40), pts)
+        pygame.draw.circle(surface, (255, 255, 255), (ix, iy), r + 3, 2)
 
 
 class Missile:
