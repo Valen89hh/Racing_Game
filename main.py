@@ -20,6 +20,17 @@ if getattr(sys, "frozen", False):
 else:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Training subprocess mode: headless pygame, run train_ai, exit
+if "--train-subprocess" in sys.argv:
+    os.environ['SDL_VIDEODRIVER'] = 'dummy'
+    import pygame
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    sys.argv.remove("--train-subprocess")
+    from training.train_ai import main as train_main
+    train_main()
+    sys.exit(0)
+
 from game import Game
 
 

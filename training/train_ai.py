@@ -89,7 +89,19 @@ def make_env(track_path: str):
     return _init
 
 
+def _write_error(json_path, message):
+    """Write error status to JSON progress file."""
+    if json_path:
+        try:
+            with open(json_path, "w") as f:
+                json.dump({"status": "error", "message": message}, f)
+        except IOError:
+            pass
+
+
 def main():
+    import traceback
+
     parser = argparse.ArgumentParser(
         description="Train a PPO model for a specific racing track."
     )
@@ -119,29 +131,45 @@ def main():
     )
     args = parser.parse_args()
 
+    json_progress = args.json_progress
+
+    # Wrap everything so ANY error gets reported to the JSON file
+    try:
+        _run_training(args, json_progress)
+    except SystemExit:
+        raise
+    except Exception as e:
+        tb = traceback.format_exc()
+        # Write to stderr so game.py can capture it
+        print(tb, file=sys.stderr)
+        _write_error(json_progress, str(e))
+        sys.exit(1)
+
+
+def _run_training(args, json_progress):
+    """Core training logic, separated so main() can catch all errors."""
     # Resolve track path
     track_path = args.track_path
     if not os.path.isabs(track_path):
-        track_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            track_path
-        )
+        from utils.base_path import TRACKS_DIR
+        track_path = os.path.join(TRACKS_DIR, os.path.basename(track_path))
 
     if not os.path.exists(track_path):
-        print(f"Error: Track file not found: {track_path}")
+        msg = f"Track file not found: {track_path}"
+        _write_error(json_progress, msg)
+        print(f"Error: {msg}", file=sys.stderr)
         sys.exit(1)
 
     # Model name
     track_basename = os.path.splitext(os.path.basename(track_path))[0]
     model_name = args.name or track_basename
 
-    # Output path
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    models_dir = os.path.join(project_root, "models")
+    # Output path — use writable dir (next to exe) so models persist
+    from utils.base_path import get_writable_dir
+    models_dir = os.path.join(get_writable_dir(), "models")
     os.makedirs(models_dir, exist_ok=True)
     model_path = os.path.join(models_dir, f"{model_name}_model")
 
-    json_progress = args.json_progress
     quiet = json_progress is not None
 
     if not quiet:
@@ -154,17 +182,8 @@ def main():
         print()
 
     # Import RL libraries
-    try:
-        from stable_baselines3 import PPO
-        from stable_baselines3.common.vec_env import DummyVecEnv
-    except ImportError:
-        msg = "stable-baselines3 not installed. Run: pip install gymnasium stable-baselines3"
-        if json_progress:
-            with open(json_progress, "w") as f:
-                json.dump({"status": "error", "message": msg}, f)
-        else:
-            print(f"Error: {msg}")
-        sys.exit(1)
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import DummyVecEnv
 
     # Create vectorized environment
     env = DummyVecEnv([make_env(track_path) for _ in range(args.num_envs)])
@@ -205,13 +224,6 @@ def main():
     except KeyboardInterrupt:
         if not quiet:
             print("\nTraining interrupted by user.")
-    except Exception as e:
-        if json_progress:
-            with open(json_progress, "w") as f:
-                json.dump({"status": "error", "message": str(e)}, f)
-            env.close()
-            sys.exit(1)
-        raise
 
     # Save model
     model.save(model_path)

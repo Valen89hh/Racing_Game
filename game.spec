@@ -2,20 +2,26 @@
 # game.spec - PyInstaller spec for the game (--onedir)
 
 import os
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
 ROOT = os.path.abspath('.')
 
+# Collect ALL files for RL dependencies (submodules, data, binaries)
+gymnasium_datas, gymnasium_binaries, gymnasium_hiddenimports = collect_all('gymnasium')
+sb3_datas, sb3_binaries, sb3_hiddenimports = collect_all('stable_baselines3')
+cloudpickle_hiddenimports = collect_submodules('cloudpickle')
+
 a = Analysis(
     ['main.py'],
     pathex=[ROOT],
-    binaries=[],
+    binaries=gymnasium_binaries + sb3_binaries,
     datas=[
         ('assets', 'assets'),
         ('tracks', 'tracks'),
         ('brushes', 'brushes'),
         ('models', 'models'),
-    ],
+    ] + gymnasium_datas + sb3_datas,
     hiddenimports=[
         'game',
         'settings',
@@ -48,17 +54,12 @@ a = Analysis(
         'training',
         'training.racing_env',
         'training.train_ai',
-    ],
+    ] + gymnasium_hiddenimports + sb3_hiddenimports + cloudpickle_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
         'tkinter',
-        'unittest',
-        'email',
-        'html',
-        'http',
-        'xml',
         'pydoc',
         'doctest',
         'launcher',

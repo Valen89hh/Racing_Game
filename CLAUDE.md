@@ -4,16 +4,16 @@
 
 **2D top-down arcade racing game** built with **Pygame** (Python 3.12+). Features a tile-based track editor, AI opponents, power-ups, dust particles, and a rotating camera system. The game supports two track formats: classic (control points + Chaikin smoothing) and tile-based (painted grid).
 
-**Current version:** 1.0.1
+**Current version:** 1.1.0
 **Entry point:** `python main.py`
 
 ## Directory Structure
 
 ```
 racing_game/
-├── main.py              (29 lines)  - Entry point
-├── game.py              (~850 lines) - Game loop, state machine, orchestration
-├── settings.py          (~220 lines) - All configuration constants
+├── main.py              (~40 lines)  - Entry point + --train-subprocess routing
+├── game.py              (~1100 lines) - Game loop, state machine, orchestration
+├── settings.py          (~235 lines) - All configuration constants
 ├── track_manager.py     (~170 lines) - Track file I/O (JSON save/load)
 ├── tile_track.py        (~350 lines) - Tile-based track (TileTrack class)
 ├── tile_defs.py         (312 lines) - Tile definitions, classification, sprites
@@ -31,7 +31,7 @@ racing_game/
 │   ├── physics.py       (161 lines) - Acceleration, friction, turning, wall bounce
 │   ├── collision.py     (168 lines) - All collision detection & resolution
 │   ├── camera.py        (159 lines) - Smooth camera with look-ahead + rotation
-│   └── ai.py            (172 lines) - Bot waypoint following + power-up tactics
+│   └── ai.py            (~300 lines) - Bot waypoint following + power-up tactics + RLSystem
 │
 ├── utils/
 │   ├── helpers.py       (183 lines) - Math utilities, procedural car sprite
@@ -55,6 +55,13 @@ racing_game/
 │   ├── config.py        (79 lines)  - Path resolution, config.json loading
 │   └── ui.py            (216 lines) - Pygame launcher GUI (600x400)
 │
+├── training/
+│   ├── __init__.py                  - Package marker
+│   ├── racing_env.py    (~334 lines) - Gymnasium env for RL training (headless)
+│   └── train_ai.py      (~235 lines) - PPO training CLI + JSONProgressCallback
+│
+├── models/              - Trained RL models (*.zip, gitignored)
+│
 ├── tracks/              - Saved track files (JSON)
 │   ├── default_circuit.json  - Classic format (control points)
 │   └── *.json                - User-created tracks
@@ -74,11 +81,13 @@ racing_game/
 
 ```
 STATE_MENU → STATE_TRACK_SELECT → STATE_COUNTDOWN → STATE_RACING → STATE_VICTORY
+                  ↓ (T key)
+              STATE_TRAINING → (subprocess trains RL model) → back to track select
                                                                          ↓
 STATE_MENU → STATE_EDITOR → (test race) → STATE_COUNTDOWN → ... → back to editor
 ```
 
-States defined in `settings.py`: `STATE_MENU`, `STATE_COUNTDOWN`, `STATE_RACING`, `STATE_VICTORY`, `STATE_EDITOR`, `STATE_TRACK_SELECT`.
+States defined in `settings.py`: `STATE_MENU`, `STATE_COUNTDOWN`, `STATE_RACING`, `STATE_VICTORY`, `STATE_EDITOR`, `STATE_TRACK_SELECT`, `STATE_TRAINING`.
 
 ### Entity-System Pattern
 
@@ -254,10 +263,10 @@ Tracks stored in `tracks/` directory. `list_tracks()` returns both formats with 
 
 ## AI (systems/ai.py)
 
-- Follows ~60 waypoints around circuit
-- Proportional steering control
-- Looks 3 waypoints ahead to predict curves and brake
-- Tactical power-up usage (boost on straights, missile at aligned targets, etc.)
+- **AISystem**: Follows ~60 waypoints around circuit, proportional steering, looks 3 waypoints ahead
+- **RLSystem**: Loads a trained PPO model (`models/{track}_model.zip`) and uses it for bot control
+  - Falls back to AISystem if no model exists for the track
+  - Loaded automatically in `_start_race()` when a matching model file is found
 
 ## Collision (systems/collision.py)
 
@@ -266,6 +275,78 @@ Tracks stored in `tracks/` directory. `list_tracks()` returns both formats with 
 - **Car vs finish line:** Segment intersection (lap detection)
 - **Car vs checkpoints:** Zone rect collision (manual zones from editor, sequential order)
 - **Car vs power-ups/missiles/oil:** Distance checks
+
+## RL Training System
+
+### Architecture
+Training runs in a **subprocess** to avoid conflicts with the game's pygame display. The subprocess runs headless (`SDL_VIDEODRIVER=dummy`) while the game UI shows progress.
+
+```
+Game (pygame real)                    Subprocess (headless)
+┌──────────────────┐                 ┌──────────────────────┐
+│ STATE_TRAINING   │   reads JSON    │ main.py              │
+│ _render_training │ ◄────────────── │  --train-subprocess  │
+│ _update_training │                 │  → train_ai.main()   │
+│                  │   Popen()       │  → PPO.learn()       │
+│ _launch_training │ ──────────────► │  writes progress.json│
+└──────────────────┘                 └──────────────────────┘
+```
+
+### Subprocess Routing (main.py)
+`main.py` checks for `--train-subprocess` flag **before** importing the game:
+- If present: sets `SDL_VIDEODRIVER=dummy`, inits headless pygame, runs `train_ai.main()`, exits
+- If absent: imports `Game` and runs normally
+- This allows the same `game.exe` to serve as both game and training worker
+
+### Launch Command (game.py `_launch_training`)
+- **From source**: `[python.exe, main.py, --train-subprocess, track_path, --timesteps, N, --json-progress, path]`
+- **From frozen exe**: `[game.exe, --train-subprocess, track_path, --timesteps, N, --json-progress, path]`
+- Uses `getattr(sys, "frozen", False)` to choose the correct command
+
+### Progress Communication
+- Subprocess writes `progress.json` to `%TEMP%` every 2048 steps via `JSONProgressCallback`
+- Game reads it each frame in `_update_training(dt)`
+- JSON statuses: `"training"` → `"done"` | `"error"`
+- On process crash: reads stderr and shows last line as error message
+
+### Training UI (STATE_TRAINING)
+- Enter from Track Select with **T** key (tile-based tracks only)
+- UP/DOWN adjust timesteps (50k–1M), ENTER starts, ESC cancels
+- Shows progress bar, elapsed time, mean reward, episodes count
+- On completion, model saved to `models/{track_name}_model.zip`
+
+### Training Environment (training/racing_env.py)
+- Gymnasium env wrapping real game physics (PhysicsSystem, CollisionSystem, TileTrack, Car)
+- Observation: 9 floats (7 raycasts + normalized speed + angle to next checkpoint)
+- Actions: Discrete(4) — forward, left+forward, right+forward, brake
+- Reward: continuous progress toward checkpoints + bonuses for crossing checkpoints/laps
+
+### game.spec Requirements for Training
+- Uses `collect_all('gymnasium')` and `collect_all('stable_baselines3')` to bundle all submodules/data
+- Uses `collect_submodules('cloudpickle')`
+- `datas`: `('models', 'models')`
+- Do NOT exclude `email` or `unittest` in game.spec — SB3/torch depend on them
+- PyTorch is auto-detected by PyInstaller via torch import chain
+
+### Path Resolution in Frozen Builds (CRITICAL)
+All paths to `tracks/` and `models/` **must** use `utils/base_path.py`, never `os.path.dirname(__file__)`:
+- `__file__` in frozen → `dist/game/_internal/` (read-only bundled data)
+- `TRACKS_DIR` → `dist/game/tracks/` (writable, next to exe)
+- `get_writable_dir()/models/` → `dist/game/models/` (writable, next to exe)
+
+```python
+# WRONG (breaks in frozen exe):
+path = os.path.join(os.path.dirname(__file__), "tracks", filename)
+
+# CORRECT:
+from utils.base_path import TRACKS_DIR
+path = os.path.join(TRACKS_DIR, filename)
+```
+
+### Error Logging
+- On subprocess crash, stderr is saved to `training_error.log` next to the exe
+- UI shows last 3 lines of the traceback + path to the full log file
+- `train_ai.main()` wraps all logic in a global try/except that writes errors to both stderr and the JSON progress file
 
 ## Important Patterns
 
@@ -278,6 +359,7 @@ Tracks stored in `tracks/` directory. `list_tracks()` returns both formats with 
 4. **Event handling:** Pygame 2.x uses `TEXTINPUT` for character input (not `KEYDOWN.unicode`)
 5. **Track interface compatibility:** Any new track type must provide the same attributes/methods as Track
 6. **Particle pool:** `DustParticleSystem` pre-allocates 120 `Particle` objects (with `__slots__`) to avoid per-frame allocations. Circular index reuses dead particles.
+7. **Path resolution:** Always use `utils/base_path.py` (`TRACKS_DIR`, `ASSETS_DIR`, `get_writable_dir()`) for file paths. Never use `os.path.dirname(__file__)` for data files — it breaks in PyInstaller frozen builds.
 
 ## Render Order (_render_race)
 
@@ -298,6 +380,7 @@ Tracks stored in `tracks/` directory. `list_tracks()` returns both formats with 
 - **Release:** Compress `dist/game/` as ZIP, upload to GitHub Release with tag `vX.Y.Z`
 - **PyInstaller specs:** `game.spec` (hiddenimports must include all modules), `launcher.spec`
 - **Adding new modules:** Remember to add to `hiddenimports` in `game.spec`
+- **RL Training deps:** `game.spec` uses `collect_all()` for `gymnasium` and `stable_baselines3`. Do NOT add `email`/`unittest` to excludes. Build size ~500MB+ due to PyTorch.
 
 ## Auto-Update System (launcher/)
 
@@ -325,6 +408,7 @@ On failure: automatic rollback from `game_backup/`.
 ```bash
 cd racing_game
 pip install pygame
+pip install gymnasium stable-baselines3  # for RL training feature
 python main.py
 ```
 
@@ -344,4 +428,32 @@ python main.py
 - **UP/DOWN** — Navigate
 - **ENTER** — Start race
 - **E** — Edit selected track (tile-based only)
+- **T** — Train AI model (tile-based only)
 - **ESC** — Back to menu
+
+### Training Screen
+- **UP/DOWN** — Adjust timesteps (50k–1M)
+- **ENTER** — Start training (idle) / Back (done/error)
+- **ESC** — Cancel training / Back
+
+## Known Bugs / Pending
+
+*No known open bugs at this time.*
+
+### Resolved Issues (v1.1.0 development)
+
+Documented here for context if similar issues arise:
+
+1. **Training subprocess launched another game window** — `sys.executable` in frozen exe points to `game.exe`, not python. Fixed with `--train-subprocess` flag in `main.py` that routes to headless training mode.
+
+2. **ENTER key did nothing in training screen** — The `if/elif` chain in `_handle_events` handled ENTER/ESC before reaching `STATE_TRAINING`. Fixed by adding training state checks inside the existing ENTER and ESC blocks.
+
+3. **Missing RL dependencies in PyInstaller build** — `hiddenimports` alone doesn't bundle all submodules. Fixed with `collect_all('gymnasium')` and `collect_all('stable_baselines3')` in `game.spec`.
+
+4. **`No module named 'email'` / `'unittest'` in build** — These were in `excludes` in `game.spec` but SB3/torch need them. Fixed by removing from excludes.
+
+5. **Track file not found in frozen exe** — `os.path.dirname(__file__)` points to `_internal/`, but tracks live next to the exe. Fixed by using `TRACKS_DIR` from `utils/base_path.py`.
+
+6. **Trained model not loaded in frozen exe** — Same path issue as #5 but for `models/`. Fixed by using `get_writable_dir()` from `utils/base_path.py`.
+
+7. **Errors invisible in training UI** — Subprocess crashes showed generic "exited unexpectedly". Fixed with: global try/except in `train_ai.main()`, stderr capture, `training_error.log` file, multi-line error display in UI.

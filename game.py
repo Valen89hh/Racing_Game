@@ -118,6 +118,7 @@ class Game:
         self._train_track_file = ""
         self._train_timesteps = 200000
         self._train_status = "idle"  # idle | training | done | error
+        self._train_error_log = ""  # ruta al archivo de log de error
 
         # Exportar circuito por defecto si no existe
         track_manager.export_default_track()
@@ -252,8 +253,9 @@ class Game:
         # Intentar cargar modelo RL para esta pista
         self.rl_system = None
         if hasattr(self, 'track_list') and self.track_list and self.track_selected < len(self.track_list):
+            from utils.base_path import get_writable_dir
             track_name = os.path.splitext(self.track_list[self.track_selected]["filename"])[0]
-            model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", f"{track_name}_model.zip")
+            model_path = os.path.join(get_writable_dir(), "models", f"{track_name}_model.zip")
             if os.path.exists(model_path):
                 rl = RLSystem(self.track, model_path)
                 if rl.is_loaded:
@@ -931,8 +933,10 @@ class Game:
 
     def _launch_training(self):
         """Lanza el subproceso de entrenamiento RL."""
-        project_root = os.path.dirname(os.path.abspath(__file__))
-        track_path = os.path.join(project_root, "tracks", self._train_track_file)
+        from utils.base_path import TRACKS_DIR, get_writable_dir
+
+        track_path = os.path.join(TRACKS_DIR, self._train_track_file)
+        writable_dir = get_writable_dir()
 
         self._train_progress_file = os.path.join(
             tempfile.gettempdir(), f"rl_progress_{os.getpid()}.json"
@@ -941,12 +945,19 @@ class Game:
         if os.path.exists(self._train_progress_file):
             os.remove(self._train_progress_file)
 
+        # Construir comando: frozen exe no necesita script, source sí
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--train-subprocess"]
+        else:
+            project_root = os.path.dirname(os.path.abspath(__file__))
+            main_script = os.path.join(project_root, "main.py")
+            cmd = [sys.executable, main_script, "--train-subprocess"]
+        cmd += [track_path,
+                "--timesteps", str(self._train_timesteps),
+                "--json-progress", self._train_progress_file]
+
         self._train_process = subprocess.Popen(
-            [sys.executable, "-m", "training.train_ai",
-             track_path,
-             "--timesteps", str(self._train_timesteps),
-             "--json-progress", self._train_progress_file],
-            cwd=project_root,
+            cmd, cwd=writable_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -973,13 +984,29 @@ class Game:
         if self._train_process and self._train_process.poll() is not None:
             if self._train_status == "training":
                 self._train_status = "error"
-                # Intentar leer stderr para un mensaje útil
+                # Leer stderr completo para diagnóstico
                 err_msg = ""
+                self._train_error_log = ""
                 try:
                     _, stderr = self._train_process.communicate(timeout=2)
                     if stderr:
-                        lines = stderr.decode(errors="replace").strip().splitlines()
-                        err_msg = lines[-1] if lines else ""
+                        full_err = stderr.decode(errors="replace").strip()
+                        # Guardar error completo a archivo log
+                        self._train_error_log = os.path.join(
+                            os.path.dirname(os.path.abspath(__file__)),
+                            "training_error.log"
+                        )
+                        with open(self._train_error_log, "w") as f:
+                            f.write(full_err)
+                        # Extraer líneas útiles del traceback
+                        lines = full_err.splitlines()
+                        # Tomar las últimas líneas relevantes
+                        err_lines = []
+                        for line in reversed(lines):
+                            err_lines.insert(0, line.strip())
+                            if len(err_lines) >= 3:
+                                break
+                        err_msg = "\n".join(err_lines)
                 except Exception:
                     pass
                 self._train_progress["message"] = (
@@ -1109,8 +1136,19 @@ class Game:
             draw_text_centered(self.screen, "Training Error",
                                self.font_subtitle, COLOR_RED, status_y)
             msg = progress.get("message", "Unknown error")
-            draw_text_centered(self.screen, msg,
-                               self.font_small, COLOR_RED, status_y + 35)
+            # Mostrar cada línea del error
+            err_y = status_y + 35
+            for line in msg.splitlines():
+                if err_y > SCREEN_HEIGHT - 100:
+                    break
+                draw_text_centered(self.screen, line,
+                                   self.font_small, COLOR_RED, err_y)
+                err_y += 20
+            # Mostrar ruta del log si existe
+            log_path = getattr(self, "_train_error_log", "")
+            if log_path:
+                draw_text_centered(self.screen, f"Full log: {log_path}",
+                                   self.font_small, COLOR_GRAY, err_y + 5)
 
         # Footer
         sep_y = SCREEN_HEIGHT - 80
