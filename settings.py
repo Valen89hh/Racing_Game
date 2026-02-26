@@ -93,6 +93,10 @@ DRIFT_LEVEL_COLORS = [
 ]
 DRIFT_MT_BOOST_DURATION = 0.6       # duración del mini-turbo boost tras soltar
 
+# ── Counter-steer drift (derrape diagonal) ──
+DRIFT_COUNTERSTEER_TURN_MULT = 0.15  # (reservado para uso futuro)
+DRIFT_COUNTERSTEER_GRIP = 1.0        # sin corrección lateral → mantiene trayectoria diagonal exacta
+
 # ── Grip progresivo ──
 DRIFT_GRIP_TRANSITION_TIME = 0.3    # segundos para transicionar de grip normal a drift
 

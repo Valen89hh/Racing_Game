@@ -93,6 +93,8 @@ class Car:
         self.drift_charge = 0.0   # carga de mini-turbo (0.0 - 1.0)
         self.drift_level = 0      # nivel de mini-turbo (0-3)
         self.drift_mt_boost_timer = 0.0  # tiempo restante de boost post-drift
+        self.drift_direction = 0  # dirección del drift: -1 izq, +1 der, 0 sin asignar
+        self.is_countersteer = False  # True cuando contra-gira durante drift
 
         # Colisión con pared (usado por physics.py)
         self._wall_normal = None

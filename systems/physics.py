@@ -44,6 +44,7 @@ from settings import (
     DRIFT_LATERAL_GRIP_NORMAL, DRIFT_LATERAL_GRIP_DRIFT, DRIFT_EXIT_BOOST,
     DRIFT_GRIP_TRANSITION_TIME, DRIFT_CHARGE_RATE,
     DRIFT_LEVEL_BOOSTS, DRIFT_MT_BOOST_DURATION,
+    DRIFT_COUNTERSTEER_TURN_MULT, DRIFT_COUNTERSTEER_GRIP,
 )
 from utils.helpers import angle_to_vector, clamp, lerp
 
@@ -86,10 +87,12 @@ class PhysicsSystem:
                 car.drift_mt_boost_timer = DRIFT_MT_BOOST_DURATION
             else:
                 car.velocity *= DRIFT_EXIT_BOOST
-            # Reset drift charge
+            # Reset drift state
             car.drift_charge = 0.0
             car.drift_level = 0
             car.drift_time = 0.0
+            car.drift_direction = 0
+            car.is_countersteer = False
 
     def _apply_acceleration(self, car: Car, dt: float):
         """Aplica aceleración o frenado según el input."""
@@ -101,6 +104,11 @@ class PhysicsSystem:
             if speed_mag >= DRIFT_MIN_SPEED:
                 # Drift: activar flag, conservar inercia
                 car.is_drifting = True
+                # drift_direction sigue el input actual (dinámico)
+                if car.input_turn != 0:
+                    car.drift_direction = 1 if car.input_turn > 0 else -1
+                # Counter-steer: ambas teclas presionadas (input_turn = 0) mientras ya hay dirección
+                car.is_countersteer = (car.input_turn == 0 and car.drift_direction != 0)
                 return
             else:
                 # Baja velocidad: freno duro hacia 0
@@ -193,7 +201,7 @@ class PhysicsSystem:
         if speed_mag < 1.0 and wall_contact:
             base_turn = car.turn_speed_min
 
-        # Giro un poco más rápido durante drift
+        # Giro durante drift
         if car.is_drifting:
             base_turn *= DRIFT_TURN_BOOST
 
@@ -235,13 +243,18 @@ class PhysicsSystem:
         # Grip progresivo: lerp entre normal y drift basado en drift_time
         if car.is_drifting:
             car.drift_time += dt
-            t = clamp(car.drift_time / DRIFT_GRIP_TRANSITION_TIME, 0.0, 1.0)
-            grip = lerp(DRIFT_LATERAL_GRIP_NORMAL, DRIFT_LATERAL_GRIP_DRIFT, t)
+            if car.is_countersteer:
+                # Counter-steer (A+D): NO tocar lateral → dirección se mantiene = diagonal
+                pass
+            else:
+                t = clamp(car.drift_time / DRIFT_GRIP_TRANSITION_TIME, 0.0, 1.0)
+                grip = lerp(DRIFT_LATERAL_GRIP_NORMAL, DRIFT_LATERAL_GRIP_DRIFT, t)
+                lateral_component *= grip
+                car.velocity = forward_component + lateral_component
         else:
             grip = DRIFT_LATERAL_GRIP_NORMAL
-        lateral_component *= grip
-
-        car.velocity = forward_component + lateral_component
+            lateral_component *= grip
+            car.velocity = forward_component + lateral_component
 
         # Durante drift: conservar magnitud + ligero boost de velocidad
         if car.is_drifting:
@@ -254,6 +267,8 @@ class PhysicsSystem:
         if not car.input_brake:
             car.is_drifting = False
             car.drift_time = 0.0
+            car.drift_direction = 0
+            car.is_countersteer = False
 
     def _update_drift_charge(self, car: Car, dt: float):
         """Acumula carga de mini-turbo durante drift, basado en input de giro y velocidad lateral."""
@@ -312,6 +327,8 @@ class PhysicsSystem:
         car.drift_time = 0.0
         car.drift_charge = 0.0
         car.drift_level = 0
+        car.drift_direction = 0
+        car.is_countersteer = False
 
     def clear_wall_contact(self, car: Car):
         """Limpia el estado de contacto con pared."""

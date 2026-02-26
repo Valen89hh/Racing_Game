@@ -56,11 +56,11 @@ class InputHandler:
         elif keys[controls["down"]]:
             car.input_accelerate = -1.0
 
-        # Giro
+        # Giro (A+D se cancelan a 0 para permitir drift diagonal)
         if keys[controls["left"]]:
-            car.input_turn = -1.0
-        elif keys[controls["right"]]:
-            car.input_turn = 1.0
+            car.input_turn -= 1.0
+        if keys[controls["right"]]:
+            car.input_turn += 1.0
 
         # Freno de mano
         if car.player_id == 0 and keys[pygame.K_SPACE]:
