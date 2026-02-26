@@ -18,6 +18,10 @@ from settings import (
     DUST_RADIUS_MIN, DUST_RADIUS_MAX,
     DUST_MAX_ALPHA, DUST_COLORS,
     DRIFT_SMOKE_RATE, DRIFT_SMOKE_COLORS, DRIFT_LATERAL_THRESHOLD,
+    SPARK_EMIT_RATE, SPARK_LIFETIME_MIN, SPARK_LIFETIME_MAX,
+    SPARK_RADIUS, SPARK_SPEED,
+    DRIFT_LEVEL_COLORS,
+    SKID_MARK_POOL_SIZE, SKID_MARK_LIFETIME, SKID_MARK_WIDTH, SKID_MARK_COLOR,
 )
 
 
@@ -39,10 +43,10 @@ class Particle:
 
 
 class DustParticleSystem:
-    """Sistema de partículas de polvo con pool fijo."""
+    """Sistema de partículas de polvo con pool fijo (incluye sparks)."""
 
     def __init__(self):
-        self._pool = [Particle() for _ in range(DUST_MAX_PARTICLES)]
+        self._pool = [Particle() for _ in range(DUST_MAX_PARTICLES + 80)]
         self._next = 0  # índice circular para buscar partículas libres
         # Surface reutilizable para dibujar partículas
         self._surf = pygame.Surface((12, 12), pygame.SRCALPHA)
@@ -144,6 +148,51 @@ class DustParticleSystem:
             p.radius = random.uniform(3.0, 7.0)
             p.color = random.choice(DRIFT_SMOKE_COLORS)
 
+    def emit_drift_sparks(self, car):
+        """Emite chispas coloreadas por nivel de mini-turbo desde ruedas traseras."""
+        if not car.is_drifting or car.drift_level < 1:
+            return
+
+        lateral = car.get_lateral_speed()
+        if lateral < DRIFT_LATERAL_THRESHOLD:
+            return
+
+        intensity = min(1.0, lateral / (car.effective_max_speed * 0.4))
+        count = int(intensity * SPARK_EMIT_RATE) + (
+            1 if random.random() < (intensity * SPARK_EMIT_RATE) % 1 else 0
+        )
+        if count < 1:
+            return
+
+        color = DRIFT_LEVEL_COLORS[min(car.drift_level - 1, 2)]
+        # Variantes de brillo
+        bright = (
+            min(255, color[0] + 60),
+            min(255, color[1] + 60),
+            min(255, color[2] + 60),
+        )
+
+        wheels = car.get_rear_wheel_positions()
+        for _ in range(count):
+            p = self._acquire()
+            p.alive = True
+
+            # Spawn desde una rueda trasera aleatoria
+            wx, wy = random.choice(wheels)
+            p.x = wx + random.uniform(-3.0, 3.0)
+            p.y = wy + random.uniform(-3.0, 3.0)
+
+            # Velocidad: dispersión aleatoria
+            angle = random.uniform(0, math.pi * 2)
+            spd = random.uniform(SPARK_SPEED * 0.5, SPARK_SPEED)
+            p.vx = math.cos(angle) * spd
+            p.vy = math.sin(angle) * spd
+
+            p.lifetime = random.uniform(SPARK_LIFETIME_MIN, SPARK_LIFETIME_MAX)
+            p.max_lifetime = p.lifetime
+            p.radius = SPARK_RADIUS
+            p.color = random.choice([color, bright, (255, 255, 200)])
+
     def update(self, dt: float):
         """Actualiza todas las partículas vivas."""
         for p in self._pool:
@@ -186,3 +235,110 @@ class DustParticleSystem:
         """Mata todas las partículas (para reset de carrera)."""
         for p in self._pool:
             p.alive = False
+
+
+class SkidMark:
+    """Un segmento de marca de derrape."""
+    __slots__ = ('alive', 'x1', 'y1', 'x2', 'y2', 'lifetime', 'max_lifetime')
+
+    def __init__(self):
+        self.alive = False
+        self.x1 = 0.0
+        self.y1 = 0.0
+        self.x2 = 0.0
+        self.y2 = 0.0
+        self.lifetime = 0.0
+        self.max_lifetime = 0.0
+
+
+class SkidMarkSystem:
+    """Sistema de marcas de derrape en la pista."""
+
+    def __init__(self):
+        self._pool = [SkidMark() for _ in range(SKID_MARK_POOL_SIZE)]
+        self._next = 0
+        # Posiciones previas de ruedas por car_id: {id: [(x,y), (x,y)]}
+        self._prev_wheels = {}
+
+    def _acquire(self) -> SkidMark:
+        pool = self._pool
+        n = len(pool)
+        for i in range(n):
+            idx = (self._next + i) % n
+            m = pool[idx]
+            if not m.alive:
+                self._next = (idx + 1) % n
+                return m
+        oldest = pool[self._next]
+        self._next = (self._next + 1) % n
+        return oldest
+
+    def record_from_car(self, car):
+        """Registra marcas de derrape si el auto está drifteando."""
+        cid = car.player_id
+        wheels = car.get_rear_wheel_positions()
+
+        if not car.is_drifting or car.get_lateral_speed() < DRIFT_LATERAL_THRESHOLD:
+            # No driftea: borrar posición previa para no conectar segmentos
+            self._prev_wheels.pop(cid, None)
+            return
+
+        prev = self._prev_wheels.get(cid)
+        if prev is not None:
+            for i in range(2):
+                px, py = prev[i]
+                wx, wy = wheels[i]
+                # Solo crear marca si se movió lo suficiente
+                dx = wx - px
+                dy = wy - py
+                if dx * dx + dy * dy > 4.0:
+                    m = self._acquire()
+                    m.alive = True
+                    m.x1 = px
+                    m.y1 = py
+                    m.x2 = wx
+                    m.y2 = wy
+                    m.lifetime = SKID_MARK_LIFETIME
+                    m.max_lifetime = SKID_MARK_LIFETIME
+
+        self._prev_wheels[cid] = wheels
+
+    def update(self, dt: float):
+        """Decrementa lifetime de las marcas."""
+        for m in self._pool:
+            if not m.alive:
+                continue
+            m.lifetime -= dt
+            if m.lifetime <= 0:
+                m.alive = False
+
+    def draw(self, surface: pygame.Surface, camera):
+        """Dibuja las marcas de derrape con alpha fade."""
+        for m in self._pool:
+            if not m.alive:
+                continue
+            # Visibilidad rápida (punto medio del segmento)
+            mx = (m.x1 + m.x2) * 0.5
+            my = (m.y1 + m.y2) * 0.5
+            if not camera.is_visible(mx, my, 40):
+                continue
+
+            sx1, sy1 = camera.world_to_screen(m.x1, m.y1)
+            sx2, sy2 = camera.world_to_screen(m.x2, m.y2)
+
+            t = m.lifetime / m.max_lifetime
+            alpha = int(180 * t)
+            r, g, b = SKID_MARK_COLOR
+            # Dibujar directamente con color atenuado (sin surface extra para rendimiento)
+            color = (r + int((80 - r) * (1 - t)),
+                     g + int((80 - g) * (1 - t)),
+                     b + int((80 - b) * (1 - t)))
+            pygame.draw.line(surface, color,
+                             (int(sx1), int(sy1)), (int(sx2), int(sy2)),
+                             SKID_MARK_WIDTH)
+
+    def clear(self):
+        """Limpia todas las marcas."""
+        for m in self._pool:
+            m.alive = False
+        self._prev_wheels.clear()

@@ -42,6 +42,8 @@ from entities.car import Car
 from settings import (
     DRIFT_MIN_SPEED, DRIFT_MAX_ANGLE, DRIFT_TURN_BOOST, DRIFT_SPEED_BOOST,
     DRIFT_LATERAL_GRIP_NORMAL, DRIFT_LATERAL_GRIP_DRIFT, DRIFT_EXIT_BOOST,
+    DRIFT_GRIP_TRANSITION_TIME, DRIFT_CHARGE_RATE,
+    DRIFT_LEVEL_BOOSTS, DRIFT_MT_BOOST_DURATION,
 )
 from utils.helpers import angle_to_vector, clamp, lerp
 
@@ -65,11 +67,29 @@ class PhysicsSystem:
         self._apply_friction(car, dt, track)
         self._apply_turning(car, dt, track)
         self._apply_grip(car, dt)
+        self._update_drift_charge(car, dt)
         self._apply_movement(car, dt)
 
-        # Drift exit boost
+        # Mini-turbo boost timer (post-drift boost activo)
+        if car.drift_mt_boost_timer > 0:
+            car.drift_mt_boost_timer -= dt
+            if car.drift_mt_boost_timer <= 0:
+                car.drift_mt_boost_timer = 0.0
+
+        # Drift exit boost (escalado por nivel de mini-turbo)
         if was_drifting and not car.is_drifting and not car.input_brake:
-            car.velocity *= DRIFT_EXIT_BOOST
+            level = car.drift_level
+            car._last_drift_level = level  # guardar para efecto visual
+            if level > 0 and level <= len(DRIFT_LEVEL_BOOSTS):
+                boost = DRIFT_LEVEL_BOOSTS[level - 1]
+                car.velocity *= boost
+                car.drift_mt_boost_timer = DRIFT_MT_BOOST_DURATION
+            else:
+                car.velocity *= DRIFT_EXIT_BOOST
+            # Reset drift charge
+            car.drift_charge = 0.0
+            car.drift_level = 0
+            car.drift_time = 0.0
 
     def _apply_acceleration(self, car: Car, dt: float):
         """Aplica aceleración o frenado según el input."""
@@ -198,6 +218,7 @@ class PhysicsSystem:
 
     def _apply_grip(self, car: Car, dt: float):
         """Descompone velocity en forward + lateral y amortigua lateral según grip.
+        Grip progresivo: transiciona suavemente de normal a drift en DRIFT_GRIP_TRANSITION_TIME.
         Durante drift conserva la magnitud total (inercia)."""
         speed_mag = car.velocity.length()
         if speed_mag < 0.1:
@@ -211,8 +232,13 @@ class PhysicsSystem:
         forward_component = forward * forward_dot
         lateral_component = car.velocity - forward_component
 
-        # Grip según estado de drift
-        grip = DRIFT_LATERAL_GRIP_DRIFT if car.is_drifting else DRIFT_LATERAL_GRIP_NORMAL
+        # Grip progresivo: lerp entre normal y drift basado en drift_time
+        if car.is_drifting:
+            car.drift_time += dt
+            t = clamp(car.drift_time / DRIFT_GRIP_TRANSITION_TIME, 0.0, 1.0)
+            grip = lerp(DRIFT_LATERAL_GRIP_NORMAL, DRIFT_LATERAL_GRIP_DRIFT, t)
+        else:
+            grip = DRIFT_LATERAL_GRIP_NORMAL
         lateral_component *= grip
 
         car.velocity = forward_component + lateral_component
@@ -227,6 +253,25 @@ class PhysicsSystem:
         # Si no está en drift y no hay handbrake, desactivar flag
         if not car.input_brake:
             car.is_drifting = False
+            car.drift_time = 0.0
+
+    def _update_drift_charge(self, car: Car, dt: float):
+        """Acumula carga de mini-turbo durante drift, basado en input de giro y velocidad lateral."""
+        if car.is_drifting:
+            # Factor de input de giro (más carga si giras activamente)
+            turn_factor = abs(car.input_turn)
+            # Factor de velocidad lateral (más carga si deslizas más)
+            lateral = car.get_lateral_speed()
+            lat_factor = clamp(lateral / (car.effective_max_speed * 0.4), 0.0, 1.0)
+            # Combinar: necesita algo de giro Y deslizamiento
+            charge_rate = DRIFT_CHARGE_RATE * (0.3 + 0.7 * turn_factor) * (0.4 + 0.6 * lat_factor)
+            car.drift_charge = clamp(car.drift_charge + charge_rate * dt, 0.0, 1.0)
+            car.update_drift_level()
+        else:
+            # Decay rápido cuando no driftea
+            if car.drift_charge > 0:
+                car.drift_charge = max(0.0, car.drift_charge - 2.0 * dt)
+                car.update_drift_level()
 
     def _apply_movement(self, car: Car, dt: float):
         """Actualiza la posición del auto según su velocity."""
@@ -264,6 +309,9 @@ class PhysicsSystem:
 
         # Resetear drift al impactar un muro
         car.is_drifting = False
+        car.drift_time = 0.0
+        car.drift_charge = 0.0
+        car.drift_level = 0
 
     def clear_wall_contact(self, car: Car):
         """Limpia el estado de contacto con pared."""

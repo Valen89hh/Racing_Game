@@ -21,12 +21,16 @@ de pantalla aplicando traslacion + rotacion:
 """
 
 import math
+import random
 
 from settings import (
     SCREEN_WIDTH, SCREEN_HEIGHT,
     CAMERA_SMOOTHING, CAMERA_LOOK_AHEAD,
     CAMERA_ROTATION_SPEED, CAMERA_MAX_ANGULAR_SPEED,
+    CAMERA_SHAKE_MAX_OFFSET, CAMERA_SHAKE_INTENSITY_SCALE,
+    CAMERA_SHAKE_DECAY_RATE,
 )
+from utils.helpers import clamp, lerp
 
 
 # Radio de visibilidad = mitad de la diagonal de la pantalla + margen
@@ -47,6 +51,11 @@ class Camera:
         # Look-ahead actual (suavizado)
         self._look_x = 0.0
         self._look_y = 0.0
+
+        # Camera shake (drift)
+        self._shake_intensity = 0.0
+        self._shake_offset_x = 0.0
+        self._shake_offset_y = 0.0
 
         # Coseno/seno de -angle, pre-calculados para world_to_screen
         self._cos = 1.0
@@ -118,6 +127,23 @@ class Camera:
 
         self._update_trig()
 
+    def update_shake(self, lateral_speed: float, is_drifting: bool, dt: float):
+        """Actualiza el shake de cámara basado en drift."""
+        if is_drifting and lateral_speed > 20.0:
+            target = clamp(lateral_speed * CAMERA_SHAKE_INTENSITY_SCALE, 0.0, 1.0)
+            self._shake_intensity = lerp(self._shake_intensity, target, min(6.0 * dt, 1.0))
+        else:
+            self._shake_intensity = lerp(self._shake_intensity, 0.0,
+                                          min(CAMERA_SHAKE_DECAY_RATE * dt, 1.0))
+
+        if self._shake_intensity > 0.01:
+            offset = CAMERA_SHAKE_MAX_OFFSET * self._shake_intensity
+            self._shake_offset_x = random.uniform(-offset, offset)
+            self._shake_offset_y = random.uniform(-offset, offset)
+        else:
+            self._shake_offset_x = 0.0
+            self._shake_offset_y = 0.0
+
     def _update_trig(self):
         """Pre-calcula cos/sin para transformaciones rapidas."""
         rad = math.radians(-self.angle)
@@ -135,8 +161,8 @@ class Camera:
         """
         dx = wx - self.cx
         dy = wy - self.cy
-        sx = dx * self._cos - dy * self._sin + SCREEN_WIDTH * 0.5
-        sy = dx * self._sin + dy * self._cos + SCREEN_HEIGHT * 0.5
+        sx = dx * self._cos - dy * self._sin + SCREEN_WIDTH * 0.5 + self._shake_offset_x
+        sy = dx * self._sin + dy * self._cos + SCREEN_HEIGHT * 0.5 + self._shake_offset_y
         return sx, sy
 
     def is_visible(self, wx: float, wy: float, margin: float = 60) -> bool:

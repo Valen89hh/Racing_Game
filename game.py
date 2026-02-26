@@ -48,7 +48,7 @@ from settings import (
 from entities.car import Car
 from entities.track import Track
 from entities.powerup import PowerUpItem, Missile, OilSlick, Mine, SmartMissile
-from entities.particles import DustParticleSystem
+from entities.particles import DustParticleSystem, SkidMarkSystem
 from systems.physics import PhysicsSystem
 from systems.collision import CollisionSystem
 from systems.input_handler import InputHandler
@@ -304,8 +304,9 @@ class Game:
         self.smart_missiles = []
         self._use_cooldown = 0.0
 
-        # Partículas de polvo
+        # Partículas de polvo y marcas de derrape
         self.dust_particles = DustParticleSystem()
+        self.skid_marks = SkidMarkSystem()
 
         # Timer
         self.race_timer.reset()
@@ -523,17 +524,24 @@ class Game:
                         car.speed *= 0.3
         self.smart_missiles = [m for m in self.smart_missiles if m.alive]
 
-        # ── Partículas de polvo ──
+        # ── Partículas de polvo, sparks y skid marks ──
         if self.dust_particles:
             for car in self.cars:
                 if not car.finished:
                     self.dust_particles.emit_from_car(car)
                     self.dust_particles.emit_drift_smoke(car)
+                    self.dust_particles.emit_drift_sparks(car)
+                    self.skid_marks.record_from_car(car)
             self.dust_particles.update(dt)
+            self.skid_marks.update(dt)
 
         # ── Cámara ──
         self.camera.update(self.player_car.x, self.player_car.y,
                            self.player_car.angle, self.player_car.speed, dt)
+        self.camera.update_shake(
+            self.player_car.get_lateral_speed(),
+            self.player_car.is_drifting, dt
+        )
 
         # ── Timer ──
         self.race_timer.update(dt)
@@ -755,6 +763,10 @@ class Game:
 
         # Pista (porción visible, rotada según la cámara)
         self.track.draw(self.screen, cam)
+
+        # Marcas de derrape (sobre la pista, bajo todo lo demás)
+        if self.skid_marks:
+            self.skid_marks.draw(self.screen, cam)
 
         # Manchas de aceite (se dibujan sobre la pista, bajo los autos)
         for oil in self.oil_slicks:

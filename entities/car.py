@@ -25,6 +25,9 @@ from settings import (
     MINE_SLOW_FACTOR, EMP_SLOW_FACTOR, SLOWMO_FACTOR,
     POWERUP_COLORS, POWERUP_MYSTERY_COLOR, COLOR_WHITE,
     CAR_SPRITES, SPRITE_SCALE, SPRITE_FRAME_SIZE,
+    DRIFT_LEVEL_THRESHOLDS, DRIFT_LEVEL_COLORS,
+    DRIFT_BAR_WIDTH, DRIFT_BAR_HEIGHT, DRIFT_BAR_OFFSET_Y,
+    SKID_MARK_WHEEL_OFFSET,
 )
 from utils.helpers import create_car_surface, angle_to_vector
 from utils.sprites import load_car_frames
@@ -86,6 +89,10 @@ class Car:
 
         # Drift / derrape
         self.is_drifting = False   # flag activo durante handbrake drift
+        self.drift_time = 0.0     # tiempo acumulado en drift actual
+        self.drift_charge = 0.0   # carga de mini-turbo (0.0 - 1.0)
+        self.drift_level = 0      # nivel de mini-turbo (0-3)
+        self.drift_mt_boost_timer = 0.0  # tiempo restante de boost post-drift
 
         # Colisión con pared (usado por physics.py)
         self._wall_normal = None
@@ -214,6 +221,38 @@ class Car:
             self.is_shielded = False
 
     # ────────────────────────────────────────────
+    # DRIFT HELPERS
+    # ────────────────────────────────────────────
+
+    def update_drift_level(self):
+        """Calcula el nivel de mini-turbo (0-3) basado en drift_charge."""
+        level = 0
+        for i, threshold in enumerate(DRIFT_LEVEL_THRESHOLDS):
+            if self.drift_charge >= threshold:
+                level = i + 1
+        self.drift_level = level
+
+    def get_rear_wheel_positions(self) -> list[tuple[float, float]]:
+        """Retorna las posiciones de las ruedas traseras en world coords."""
+        rad = math.radians(self.angle)
+        # Vector "detrás" del auto
+        behind_x = -math.sin(rad)
+        behind_y = math.cos(rad)
+        # Vector lateral
+        lat_x = math.cos(rad)
+        lat_y = math.sin(rad)
+        # Offset hacia atrás desde el centro
+        back_dist = self.height * 0.35
+        bx = self.x + behind_x * back_dist
+        by = self.y + behind_y * back_dist
+        # Dos ruedas: izquierda y derecha
+        off = SKID_MARK_WHEEL_OFFSET
+        return [
+            (bx - lat_x * off, by - lat_y * off),
+            (bx + lat_x * off, by + lat_y * off),
+        ]
+
+    # ────────────────────────────────────────────
     # SPRITE Y DIBUJO
     # ────────────────────────────────────────────
 
@@ -292,6 +331,55 @@ class Car:
             pygame.draw.circle(shield_surf, (60, 140, 255, 80), (30, 30), 28)
             pygame.draw.circle(shield_surf, (100, 180, 255, 150), (30, 30), 28, 2)
             surface.blit(shield_surf, (int(sx) - 30, int(sy) - 30))
+
+        # Barra de carga de mini-turbo durante drift
+        if self.is_drifting and self.drift_charge > 0.01:
+            bar_w = DRIFT_BAR_WIDTH
+            bar_h = DRIFT_BAR_HEIGHT
+            bar_x = int(sx) - bar_w // 2
+            bar_y = int(sy) + DRIFT_BAR_OFFSET_Y
+            # Surface temporal con alpha para el fondo
+            bar_surf = pygame.Surface((bar_w + 2, bar_h + 2), pygame.SRCALPHA)
+            bar_surf.fill((20, 20, 20, 180))
+            surface.blit(bar_surf, (bar_x - 1, bar_y - 1))
+            # Color de la barra según nivel
+            if self.drift_level > 0:
+                color = DRIFT_LEVEL_COLORS[min(self.drift_level - 1, 2)]
+            else:
+                color = (180, 180, 180)  # gris mientras carga al nivel 1
+            fill_w = int(bar_w * min(self.drift_charge, 1.0))
+            if fill_w > 0:
+                pygame.draw.rect(surface, color,
+                                 (bar_x, bar_y, fill_w, bar_h))
+
+        # Efecto visual de mini-turbo boost (speed lines tras soltar drift)
+        if self.drift_mt_boost_timer > 0:
+            t = self.drift_mt_boost_timer / 0.6  # normalizado 0-1
+            rad_scr = math.radians(screen_ang)
+            behind_x = -math.sin(rad_scr)
+            behind_y = math.cos(rad_scr)
+            lat_x = math.cos(rad_scr)
+            lat_y = math.sin(rad_scr)
+            # Color según el último nivel alcanzado (usar nivel guardado o default)
+            mt_color = DRIFT_LEVEL_COLORS[min(max(self._last_drift_level - 1, 0), 2)] if hasattr(self, '_last_drift_level') and self._last_drift_level > 0 else (80, 160, 255)
+            alpha = int(200 * t)
+            # Dibujar varias líneas de velocidad detrás del auto
+            for i in range(5):
+                offset_lat = (i - 2) * 6.0
+                line_len = 14.0 + i * 4.0
+                start_x = int(sx + behind_x * 18 + lat_x * offset_lat)
+                start_y = int(sy + behind_y * 18 + lat_y * offset_lat)
+                end_x = int(start_x + behind_x * line_len * t)
+                end_y = int(start_y + behind_y * line_len * t)
+                line_surf = pygame.Surface((abs(end_x - start_x) + 4, abs(end_y - start_y) + 4), pygame.SRCALPHA)
+                # Dibujar directamente con alpha
+                col = (*mt_color, alpha)
+                ox = min(start_x, end_x) - 2
+                oy = min(start_y, end_y) - 2
+                pygame.draw.line(line_surf, col,
+                                 (start_x - ox, start_y - oy),
+                                 (end_x - ox, end_y - oy), 2)
+                surface.blit(line_surf, (ox, oy))
 
         # Efecto visual del boost: llama detrás del auto
         if "boost" in self.active_effects:

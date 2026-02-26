@@ -82,6 +82,44 @@ DRIFT_SMOKE_COLORS = [
     (140, 140, 150),  # gris medio
 ]
 
+# ── Mini-turbo (carga durante drift) ──
+DRIFT_CHARGE_RATE = 0.55            # carga por segundo drifteando (a full input)
+DRIFT_LEVEL_THRESHOLDS = (0.33, 0.66, 1.0)  # L1, L2, L3
+DRIFT_LEVEL_BOOSTS = (1.08, 1.15, 1.25)     # boost de velocidad al soltar por nivel
+DRIFT_LEVEL_COLORS = [
+    (80, 160, 255),    # L1: azul
+    (255, 160, 40),    # L2: naranja
+    (255, 80, 200),    # L3: rosa
+]
+DRIFT_MT_BOOST_DURATION = 0.6       # duración del mini-turbo boost tras soltar
+
+# ── Grip progresivo ──
+DRIFT_GRIP_TRANSITION_TIME = 0.3    # segundos para transicionar de grip normal a drift
+
+# ── Skid marks (marcas de derrape) ──
+SKID_MARK_POOL_SIZE = 600
+SKID_MARK_LIFETIME = 3.0            # segundos antes de desaparecer
+SKID_MARK_WIDTH = 3                 # ancho de la línea
+SKID_MARK_COLOR = (30, 30, 30)      # negro oscuro
+SKID_MARK_WHEEL_OFFSET = 9.0        # offset lateral de ruedas traseras
+
+# ── Camera shake durante drift ──
+CAMERA_SHAKE_MAX_OFFSET = 3.0       # píxeles máx de desplazamiento
+CAMERA_SHAKE_INTENSITY_SCALE = 0.008  # escala de intensidad por velocidad lateral
+CAMERA_SHAKE_DECAY_RATE = 8.0       # velocidad de decaimiento cuando no driftea
+
+# ── Spark particles (chispas durante drift) ──
+SPARK_EMIT_RATE = 6.0               # partículas por frame durante drift
+SPARK_LIFETIME_MIN = 0.15
+SPARK_LIFETIME_MAX = 0.4
+SPARK_RADIUS = 2.0
+SPARK_SPEED = 80.0                  # velocidad de dispersión
+
+# ── HUD drift charge bar ──
+DRIFT_BAR_WIDTH = 30
+DRIFT_BAR_HEIGHT = 4
+DRIFT_BAR_OFFSET_Y = 22            # offset debajo del auto
+
 CAR_WIDTH = 22
 CAR_HEIGHT = 40
 
