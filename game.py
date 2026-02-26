@@ -538,10 +538,6 @@ class Game:
         # ── Cámara ──
         self.camera.update(self.player_car.x, self.player_car.y,
                            self.player_car.angle, self.player_car.speed, dt)
-        self.camera.update_shake(
-            self.player_car.get_lateral_speed(),
-            self.player_car.is_drifting, dt
-        )
 
         # ── Timer ──
         self.race_timer.update(dt)
