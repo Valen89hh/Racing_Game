@@ -99,6 +99,10 @@ class Car:
         # Colisión con pared (usado por physics.py)
         self._wall_normal = None
 
+        # Networking flags
+        self.is_remote = False       # True si es controlado por un cliente remoto
+        self.is_bot_car = False      # True si es un bot en modo online
+
         # Power-ups
         self.held_powerup = None           # tipo de power-up en inventario
         self.is_shielded = False           # si el escudo está activo
@@ -408,6 +412,38 @@ class Car:
         pygame.draw.circle(surface, (30, 30, 30), (ix, iy), 8)
         pygame.draw.circle(surface, color, (ix, iy), 6)
         pygame.draw.circle(surface, COLOR_WHITE, (ix, iy), 8, 1)
+
+    # ────────────────────────────────────────────
+    # NETWORK SERIALIZATION
+    # ────────────────────────────────────────────
+
+    def apply_net_state(self, state):
+        """Aplica estado recibido del servidor (para autos remotos/interpolación)."""
+        self.x = state.x
+        self.y = state.y
+        self.velocity.x = state.vx
+        self.velocity.y = state.vy
+        self.angle = state.angle
+        self.laps = state.laps
+        self.next_checkpoint_index = state.next_checkpoint_index
+        self.held_powerup = state.held_powerup
+        self.is_drifting = state.is_drifting
+        self.is_countersteer = state.is_countersteer
+        self.drift_charge = state.drift_charge
+        self.drift_level = state.drift_level
+        self.finished = state.finished
+        self.finish_time = state.finish_time
+
+        # Reconstruir active_effects desde la lista de nombres
+        # Solo setear flags, no duración exacta (el host la maneja)
+        for ename in state.effects:
+            if ename not in self.active_effects:
+                self.active_effects[ename] = 1.0  # duración placeholder
+        to_remove = [k for k in self.active_effects if k not in state.effects]
+        for k in to_remove:
+            del self.active_effects[k]
+
+        self.update_sprite()
 
     def __repr__(self) -> str:
         return (f"Car({self.name}, pos=({self.x:.0f},{self.y:.0f}), "

@@ -28,8 +28,10 @@ from settings import (
     COLOR_RED, COLOR_GRAY, COLOR_DARK_GRAY, COLOR_ORANGE, COLOR_BLUE,
     STATE_MENU, STATE_COUNTDOWN, STATE_RACING, STATE_VICTORY,
     STATE_EDITOR, STATE_TRACK_SELECT, STATE_TRAINING,
+    STATE_HOST_LOBBY, STATE_JOIN_LOBBY, STATE_CONNECTING,
+    STATE_ONLINE_RACING, STATE_ONLINE_COUNTDOWN,
     COLOR_PROGRESS_BAR, COLOR_PROGRESS_BG,
-    PLAYER_COLORS, TOTAL_LAPS, DEBUG_CHECKPOINTS,
+    PLAYER_COLORS, MAX_PLAYERS, TOTAL_LAPS, DEBUG_CHECKPOINTS,
     HUD_FONT_SIZE, HUD_TITLE_FONT_SIZE,
     HUD_SUBTITLE_FONT_SIZE, HUD_MARGIN, MINIMAP_MARGIN, MINIMAP_CAR_DOT,
     BOT_ACCELERATION, BOT_MAX_SPEED, BOT_TURN_SPEED,
@@ -44,6 +46,8 @@ from settings import (
     MAGNET_DURATION, SLOWMO_DURATION, BOUNCE_DURATION,
     AUTOPILOT_DURATION, TELEPORT_DISTANCE,
     SMART_MISSILE_LIFETIME,
+    NET_DEFAULT_PORT, NET_TICK_RATE,
+    NET_RECONCILE_SNAP_DIST, NET_RECONCILE_BLEND,
 )
 from entities.car import Car
 from entities.track import Track
@@ -66,7 +70,14 @@ class Game:
     """Clase principal que orquesta todo el juego."""
 
     def __init__(self):
-        pygame.init()
+        # Inicializar subsistemas por separado para permitir múltiples instancias.
+        # pygame.init() puede bloquear si otra instancia tiene el driver de audio.
+        pygame.display.init()
+        pygame.font.init()
+        try:
+            pygame.mixer.init()
+        except pygame.error:
+            pass  # Audio no disponible (otra instancia lo usa)
         pygame.display.set_caption(TITLE)
 
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
@@ -129,6 +140,26 @@ class Game:
         self._train_status = "idle"  # idle | training | done | error
         self._train_error_log = ""  # ruta al archivo de log de error
 
+        # Multiplayer online
+        self.net_server = None       # GameServer (host only)
+        self.net_client = None       # GameClient (client only)
+        self.is_host = False
+        self.is_online = False
+        self.my_player_id = 0
+        self._lobby_ip_input = ""
+        self._lobby_name_input = "Player"
+        self._lobby_bot_count = 1
+        self._lobby_players = []     # [(pid, name), ...]
+        self._snapshot_timer = 0.0
+        self._snapshot_seq = 0
+        self._online_countdown_timer = 0.0
+        self._online_countdown_value = 3
+        self._net_error_msg = ""
+        self._ip_cursor_blink = 0.0
+        self._lobby_broadcast_timer = 0.0
+        self._host_starting_race = False  # True mientras envía track data
+        self._pending_track_data = None
+
         # Exportar circuito por defecto si no existe
         track_manager.export_default_track()
 
@@ -147,6 +178,8 @@ class Game:
             self._update(dt)
             self._render()
 
+        # Limpiar networking al salir
+        self._stop_online()
         pygame.quit()
         sys.exit()
 
@@ -181,11 +214,20 @@ class Game:
                             self._open_editor_with_points()
                         else:
                             self.state = STATE_MENU
+                    elif self.state in (STATE_ONLINE_RACING, STATE_ONLINE_COUNTDOWN):
+                        self._stop_online()
+                        self.state = STATE_MENU
                     elif self.state == STATE_TRACK_SELECT:
                         self.state = STATE_MENU
                     elif self.state == STATE_TRAINING:
                         self._cancel_training()
                         self.state = STATE_TRACK_SELECT
+                    elif self.state == STATE_HOST_LOBBY:
+                        self._stop_online()
+                        self.state = STATE_TRACK_SELECT
+                    elif self.state in (STATE_JOIN_LOBBY, STATE_CONNECTING):
+                        self._stop_online()
+                        self.state = STATE_MENU
                     else:
                         self.running = False
 
@@ -195,6 +237,14 @@ class Game:
                     elif self.state == STATE_TRACK_SELECT:
                         self._edit_selected_track()
 
+                elif event.key == pygame.K_h:
+                    if self.state == STATE_TRACK_SELECT:
+                        self._start_host_lobby()
+
+                elif event.key == pygame.K_j:
+                    if self.state == STATE_MENU:
+                        self._start_join_screen()
+
                 elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER,
                                    pygame.K_SPACE):
                     if self.state == STATE_MENU:
@@ -202,7 +252,10 @@ class Game:
                     elif self.state == STATE_TRACK_SELECT:
                         self._start_selected_track()
                     elif self.state == STATE_VICTORY:
-                        if self.return_to_editor:
+                        if self.is_online:
+                            self._stop_online()
+                            self.state = STATE_MENU
+                        elif self.return_to_editor:
                             self._open_editor_with_points()
                         else:
                             self.state = STATE_MENU
@@ -211,6 +264,10 @@ class Game:
                             self._launch_training()
                         elif self._train_status in ("done", "error"):
                             self.state = STATE_TRACK_SELECT
+                    elif self.state == STATE_HOST_LOBBY:
+                        self._start_online_race_as_host()
+                    elif self.state == STATE_CONNECTING:
+                        self._attempt_connect()
 
                 elif self.state == STATE_TRACK_SELECT:
                     if event.key == pygame.K_UP:
@@ -224,15 +281,33 @@ class Game:
                             if entry.get("type") == "tiles":
                                 self._start_training_screen()
 
+                elif self.state == STATE_HOST_LOBBY:
+                    if event.key == pygame.K_UP:
+                        self._lobby_bot_count = min(
+                            self._lobby_bot_count + 1,
+                            MAX_PLAYERS - 1 - (self.net_server.get_connected_count() if self.net_server else 0))
+                    elif event.key == pygame.K_DOWN:
+                        self._lobby_bot_count = max(0, self._lobby_bot_count - 1)
+
+                elif self.state == STATE_CONNECTING:
+                    if event.key == pygame.K_BACKSPACE:
+                        self._lobby_ip_input = self._lobby_ip_input[:-1]
+
                 elif self.state == STATE_TRAINING:
                     if event.key == pygame.K_UP and self._train_status == "idle":
                         self._train_timesteps = min(self._train_timesteps + 50000, 1000000)
                     elif event.key == pygame.K_DOWN and self._train_status == "idle":
                         self._train_timesteps = max(self._train_timesteps - 50000, 50000)
 
+            # Text input for IP address in connecting screen
+            if event.type == pygame.TEXTINPUT and self.state == STATE_CONNECTING:
+                char = event.text
+                if char in "0123456789.":
+                    self._lobby_ip_input += char
+
             # Click izquierdo del mouse para activar power-up
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if self.state == STATE_RACING:
+                if self.state in (STATE_RACING, STATE_ONLINE_RACING):
                     if (self.player_car and self.player_car.held_powerup is not None
                             and self._use_cooldown <= 0):
                         self._activate_powerup(self.player_car)
@@ -332,6 +407,20 @@ class Game:
             self.editor.update(dt)
         elif self.state == STATE_TRAINING:
             self._update_training(dt)
+        elif self.state == STATE_HOST_LOBBY:
+            self._update_host_lobby(dt)
+        elif self.state == STATE_JOIN_LOBBY:
+            self._update_join_lobby(dt)
+        elif self.state == STATE_ONLINE_COUNTDOWN:
+            self._update_online_countdown(dt)
+        elif self.state == STATE_ONLINE_RACING:
+            if self.is_host:
+                self._update_online_racing_host(dt)
+            else:
+                self._update_online_racing_client(dt)
+        elif self.state == STATE_CONNECTING:
+            self._ip_cursor_blink += dt
+            self._update_connecting(dt)
 
     def _update_countdown(self, dt: float):
         """Actualiza la cuenta regresiva."""
@@ -692,6 +781,19 @@ class Game:
             self._render_track_select()
         elif self.state == STATE_TRAINING:
             self._render_training()
+        elif self.state == STATE_HOST_LOBBY:
+            self._render_host_lobby()
+        elif self.state == STATE_CONNECTING:
+            self._render_connecting()
+        elif self.state == STATE_JOIN_LOBBY:
+            self._render_join_lobby()
+        elif self.state == STATE_ONLINE_COUNTDOWN:
+            self._render_race()
+            self._render_hud()
+            self._render_countdown()
+        elif self.state == STATE_ONLINE_RACING:
+            self._render_race()
+            self._render_hud()
 
         pygame.display.flip()
 
@@ -715,6 +817,7 @@ class Game:
             "SPACE   -  Handbrake",
             "L-CLICK -  Use Power-Up",
             "E       -  Track Editor",
+            "J       -  Join Online Game",
             "ESC     -  Back to Menu",
         ]
         for i, text in enumerate(instructions):
@@ -1011,7 +1114,7 @@ class Game:
         overlay.fill((0, 0, 0, 160))
         self.screen.blit(overlay, (0, 0))
 
-        if self.winner and self.winner.player_id == 0:
+        if self.winner and self.winner.player_id == self.my_player_id:
             title = "YOU WIN!"
             title_color = COLOR_YELLOW
         else:
@@ -1406,8 +1509,1034 @@ class Game:
                 draw_text_centered(self.screen, f"({fname})",
                                    self.font_small, COLOR_GRAY, yy + 22)
 
-        draw_text_centered(self.screen, "UP/DOWN select | ENTER race | E edit | T train AI | ESC back",
+        draw_text_centered(self.screen, "UP/DOWN select | ENTER race | E edit | H host | T train | ESC back",
                            self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
+
+    # ──────────────────────────────────────────────
+    # MULTIPLAYER ONLINE
+    # ──────────────────────────────────────────────
+
+    def _render_gradient_bg(self):
+        """Renderiza fondo degradado reutilizable."""
+        for y in range(SCREEN_HEIGHT):
+            ratio = y / SCREEN_HEIGHT
+            r = int(10 + 20 * ratio)
+            g = int(10 + 15 * ratio)
+            b = int(30 + 40 * ratio)
+            pygame.draw.line(self.screen, (r, g, b), (0, y), (SCREEN_WIDTH, y))
+
+    def _stop_online(self):
+        """Limpia toda la infraestructura de red."""
+        if self.net_server:
+            self.net_server.stop()
+            self.net_server = None
+        if self.net_client:
+            self.net_client.disconnect()
+            self.net_client = None
+        self.is_host = False
+        self.is_online = False
+        self.my_player_id = 0
+        self._net_error_msg = ""
+
+    # ── HOST LOBBY ──
+
+    def _start_host_lobby(self):
+        """Crea el servidor y muestra el lobby del host."""
+        if not self.track_list:
+            return
+        entry = self.track_list[self.track_selected]
+
+        from networking.server import GameServer
+        self.net_server = GameServer()
+        self.net_server.host_name = "Host"
+        self.net_server.track_name = entry["name"]
+        try:
+            self.net_server.start()
+        except OSError as e:
+            self._net_error_msg = f"Cannot start server: {e}"
+            self.net_server = None
+            return
+
+        self.is_host = True
+        self.is_online = True
+        self.my_player_id = 0
+        self._lobby_bot_count = 1
+        self._lobby_players = [(0, "Host")]
+        self.state = STATE_HOST_LOBBY
+
+    def _update_host_lobby(self, dt):
+        """Actualiza lobby del host: broadcast estado cada 0.25s."""
+        if not self.net_server:
+            return
+
+        # Si estamos enviando track data, poll el resultado
+        if self._host_starting_race:
+            if self.net_server.is_track_send_done():
+                self._host_starting_race = False
+                if self.net_server.is_track_send_ok():
+                    self._finish_online_race_start()
+                else:
+                    self._net_error_msg = "Failed to send track data"
+            return
+
+        self.net_server.bot_count = self._lobby_bot_count
+        self._lobby_players = self.net_server.get_player_list()
+
+        # Rate-limit broadcast a ~4/segundo
+        self._lobby_broadcast_timer += dt
+        if self._lobby_broadcast_timer >= 0.25:
+            self._lobby_broadcast_timer = 0.0
+            self.net_server.broadcast_lobby_state()
+
+    def _render_host_lobby(self):
+        """Renderiza pantalla de lobby del host."""
+        self._render_gradient_bg()
+
+        draw_text_centered(self.screen, "HOST LOBBY",
+                           self.font_title, COLOR_YELLOW, 60)
+
+        # IP y puerto
+        ip = self.net_server.get_local_ip() if self.net_server else "..."
+        port = self.net_server.port if self.net_server else NET_DEFAULT_PORT
+        draw_text_centered(self.screen, f"IP: {ip}:{port}",
+                           self.font_subtitle, COLOR_WHITE, 140)
+
+        # Track
+        entry = self.track_list[self.track_selected] if self.track_list else {}
+        draw_text_centered(self.screen, f"Track: {entry.get('name', '?')}",
+                           self.font, COLOR_GRAY, 185)
+
+        # Players
+        y = 240
+        draw_text_centered(self.screen, "Players:", self.font_subtitle,
+                           COLOR_WHITE, y)
+        y += 40
+        for pid, name in self._lobby_players:
+            tag = " (You)" if pid == 0 else ""
+            color = PLAYER_COLORS[pid] if pid < len(PLAYER_COLORS) else COLOR_WHITE
+            draw_text_centered(self.screen, f"P{pid + 1}: {name}{tag}",
+                               self.font, color, y)
+            y += 30
+
+        # Bots
+        y += 10
+        max_bots = MAX_PLAYERS - len(self._lobby_players)
+        self._lobby_bot_count = min(self._lobby_bot_count, max_bots)
+        draw_text_centered(self.screen, f"Bots: < {self._lobby_bot_count} >",
+                           self.font_subtitle, COLOR_WHITE, y)
+        draw_text_centered(self.screen, "UP/DOWN to adjust bots",
+                           self.font_small, COLOR_GRAY, y + 30)
+
+        # Total
+        total = len(self._lobby_players) + self._lobby_bot_count
+        draw_text_centered(self.screen, f"Total racers: {total}/{MAX_PLAYERS}",
+                           self.font, COLOR_GRAY, y + 60)
+
+        # Status message (sending track data, etc.)
+        if self._host_starting_race:
+            draw_text_centered(self.screen, "Sending track data to clients...",
+                               self.font, COLOR_YELLOW, SCREEN_HEIGHT - 90)
+        elif self._net_error_msg:
+            draw_text_centered(self.screen, self._net_error_msg,
+                               self.font, COLOR_RED, SCREEN_HEIGHT - 90)
+
+        # Footer
+        draw_text_centered(self.screen, "ENTER: Start Race  |  ESC: Cancel",
+                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
+
+    def _start_online_race_as_host(self):
+        """Host inicia carrera: envía track data async, luego configura la carrera."""
+        if not self.net_server or not self.track_list:
+            return
+        if self._host_starting_race:
+            return  # Ya está en proceso
+
+        entry = self.track_list[self.track_selected]
+        self.net_server.racing = True
+
+        # Guardar datos del track para uso posterior
+        try:
+            self._pending_track_data = track_manager.load_track(entry["filename"])
+        except (OSError, KeyError):
+            return
+
+        # Enviar track data a clientes de forma async (no bloquea game loop)
+        import json as _json
+        track_json_str = _json.dumps(self._pending_track_data)
+
+        if self.net_server.get_connected_count() > 0:
+            self.net_server.send_track_data_async(track_json_str, timeout=10.0)
+            self._host_starting_race = True
+            self._net_error_msg = "Sending track data..."
+            print("[GAME] Sending track data to clients...")
+        else:
+            # Sin clientes remotos, iniciar directo
+            self._finish_online_race_start()
+
+    def _finish_online_race_start(self):
+        """Segunda fase del inicio: crea autos, envía RACE_START."""
+        data = self._pending_track_data
+        self._pending_track_data = None
+        self._net_error_msg = ""
+
+        # Crear el track localmente
+        if data.get("format") == "tiles":
+            self.track = TileTrack(data)
+        else:
+            self.track = Track(control_points=data["control_points"])
+
+        # Crear autos
+        self.cars = []
+        players = self.net_server.get_player_list()
+        sp = self.track.start_positions
+
+        for i, (pid, name) in enumerate(players):
+            pos_idx = min(i, len(sp) - 1)
+            car = Car(sp[pos_idx][0], sp[pos_idx][1], sp[pos_idx][2],
+                      PLAYER_COLORS[pid % len(PLAYER_COLORS)], pid)
+            car.name = name
+            if pid == 0:
+                self.player_car = car
+            else:
+                car.is_remote = True
+            self.cars.append(car)
+
+        # Bots
+        bot_start_idx = len(players)
+        for b in range(self._lobby_bot_count):
+            bot_pid_visual = bot_start_idx + b
+            pos_idx = min(bot_pid_visual, len(sp) - 1)
+            bot = Car(sp[pos_idx][0], sp[pos_idx][1], sp[pos_idx][2],
+                      PLAYER_COLORS[bot_pid_visual % len(PLAYER_COLORS)],
+                      100 + b)  # bot IDs: 100, 101, ...
+            bot.name = f"Bot {b + 1}"
+            bot.is_bot_car = True
+            bot.acceleration = BOT_ACCELERATION
+            bot.max_speed = BOT_MAX_SPEED
+            bot.turn_speed = BOT_TURN_SPEED
+            self.cars.append(bot)
+
+        # Sistemas
+        self.collision_system = CollisionSystem(self.track)
+        self.ai_system = AISystem(self.track)
+        for car in self.cars:
+            if car.is_bot_car:
+                self.ai_system.register_bot(car)
+
+        # Race progress
+        fl = self.track.finish_line
+        fl_center = ((fl[0][0] + fl[1][0]) / 2, (fl[0][1] + fl[1][1]) / 2)
+        self.race_progress = RaceProgressTracker(
+            self.track.checkpoints, fl_center)
+        for car in self.cars:
+            self.race_progress.register_car(car.player_id)
+
+        # Cámara
+        self.camera.snap_to(self.player_car.x, self.player_car.y,
+                            self.player_car.angle)
+
+        # Power-ups
+        self.powerup_items = [
+            PowerUpItem(p[0], p[1]) for p in self.track.powerup_spawn_points
+        ]
+        self.missiles = []
+        self.oil_slicks = []
+        self.mines = []
+        self.smart_missiles = []
+        self._use_cooldown = 0.0
+
+        # Partículas
+        self.dust_particles = DustParticleSystem()
+        self.skid_marks = SkidMarkSystem()
+
+        # Timer
+        self.race_timer = RaceTimer()
+        self.race_timer.reset()
+        self.winner = None
+        self.final_times = {}
+        self._snapshot_timer = 0.0
+        self._snapshot_seq = 0
+
+        # Enviar RACE_START a clientes
+        self.net_server.broadcast_race_start(3)
+        print("[GAME] Race starting!")
+
+        # Countdown
+        self._online_countdown_timer = 0.0
+        self._online_countdown_value = 3
+        self.countdown_timer = 0.0
+        self.countdown_value = 3
+        self.state = STATE_ONLINE_COUNTDOWN
+
+    def _update_online_countdown(self, dt):
+        """Cuenta regresiva en modo online."""
+        self.countdown_timer += dt
+        if self.player_car:
+            self.camera.update(self.player_car.x, self.player_car.y,
+                               self.player_car.angle, 0, dt)
+
+        if self.countdown_timer >= 1.0:
+            self.countdown_timer -= 1.0
+            self.countdown_value -= 1
+            if self.countdown_value < 0:
+                self.state = STATE_ONLINE_RACING
+                self.race_timer.start()
+
+    def _update_online_racing_host(self, dt):
+        """Update principal del host: lee inputs remotos, simula, broadcast."""
+        keys = pygame.key.get_pressed()
+        self._use_cooldown = max(0, self._use_cooldown - dt)
+
+        # Obtener inputs remotos
+        remote_inputs = self.net_server.get_client_inputs() if self.net_server else {}
+
+        # Detectar slowmo
+        slowmo_owner = None
+        for car in self.cars:
+            if car.has_slowmo:
+                slowmo_owner = car
+                break
+
+        for car in self.cars:
+            if car.finished:
+                continue
+
+            # Input según tipo de auto
+            if car.player_id == 0:
+                # Host: teclado local
+                self.input_handler.update(car, keys)
+            elif car.is_remote:
+                # Cliente remoto: inputs de red
+                inp = remote_inputs.get(car.player_id)
+                if inp:
+                    car.reset_inputs()
+                    car.input_accelerate = inp.accel
+                    car.input_turn = inp.turn
+                    car.input_brake = inp.brake
+                    car.input_use_powerup = inp.use_powerup
+            elif car.is_bot_car:
+                # Bot: IA
+                self.ai_system.update(car, dt, self.cars)
+
+            # Autopilot sobreescribe
+            if car.has_autopilot:
+                self._autopilot_steer(car)
+
+            # Efectos
+            car.update_effects(dt)
+
+            # SlowMo
+            car_dt = dt
+            if (slowmo_owner is not None and
+                    car.player_id != slowmo_owner.player_id):
+                from settings import SLOWMO_FACTOR
+                car_dt = dt * SLOWMO_FACTOR
+
+            # Física
+            self.physics.update(car, car_dt, self.track)
+            car.update_sprite()
+
+            # Colisiones con bordes
+            if self.collision_system.check_track_collision(car):
+                if car.is_shielded:
+                    car.break_shield()
+                    normal = self.collision_system.resolve_track_collision(car)
+                    car.speed *= 0.7
+                    car.update_sprite()
+                elif car.has_bounce:
+                    normal = self.collision_system.resolve_track_collision(car)
+                    self.physics.apply_collision_response(car, normal)
+                    car.speed *= 1.3
+                    car.update_sprite()
+                else:
+                    normal = self.collision_system.resolve_track_collision(car)
+                    self.physics.apply_collision_response(car, normal)
+                    car.update_sprite()
+            else:
+                self.physics.clear_wall_contact(car)
+
+            # Checkpoints y vueltas
+            old_laps = car.laps
+            self.collision_system.update_checkpoints(car)
+            if car.laps > old_laps:
+                if car == self.player_car:
+                    self.race_timer.complete_lap()
+                if car.laps >= TOTAL_LAPS:
+                    car.finished = True
+                    car.finish_time = self.race_timer.total_time
+                    self.final_times[car.name] = car.finish_time
+                    if self.winner is None:
+                        self.winner = car
+
+            # Progress
+            self.race_progress.update(car)
+
+            # Power-up usage
+            if car.input_use_powerup and car.held_powerup is not None:
+                if car.player_id != 0 or self._use_cooldown <= 0:
+                    self._activate_powerup(car)
+                    if car.player_id == 0:
+                        self._use_cooldown = 0.3
+
+        # Car vs car
+        for i in range(len(self.cars)):
+            for j in range(i + 1, len(self.cars)):
+                if self.collision_system.check_car_vs_car(
+                        self.cars[i], self.cars[j]):
+                    a, b = self.cars[i], self.cars[j]
+                    if a.is_shielded:
+                        a.break_shield()
+                    elif b.is_shielded:
+                        b.break_shield()
+                    self.collision_system.resolve_car_vs_car(a, b)
+                    a.update_sprite()
+                    b.update_sprite()
+
+        # Recoger power-ups
+        for car in self.cars:
+            if car.held_powerup is not None:
+                continue
+            for idx, item in enumerate(self.powerup_items):
+                if self.collision_system.check_car_vs_powerup(car, item):
+                    ptype = item.collect()
+                    car.held_powerup = ptype
+                    # Broadcast evento de power-up a clientes
+                    if self.net_server:
+                        from networking.protocol import pack_powerup_event, PW_EVENT_COLLECT
+                        evt = pack_powerup_event(PW_EVENT_COLLECT, car.player_id,
+                                                 ptype, idx, item.x, item.y)
+                        for _ in range(3):
+                            self.net_server.broadcast(evt)
+                    break
+
+        # Update power-up items
+        for item in self.powerup_items:
+            item.update(dt)
+
+        # Missiles
+        for missile in self.missiles:
+            missile.update(dt)
+            if self.collision_system.check_missile_vs_wall(missile):
+                missile.alive = False
+            for car in self.cars:
+                if self.collision_system.check_car_vs_missile(car, missile):
+                    missile.alive = False
+                    if car.is_shielded:
+                        car.break_shield()
+                    else:
+                        car.apply_effect("missile_slow", MISSILE_SLOW_DURATION)
+                        car.speed *= 0.3
+        self.missiles = [m for m in self.missiles if m.alive]
+
+        # Oil slicks
+        for oil in self.oil_slicks:
+            oil.update(dt)
+            for car in self.cars:
+                if car.player_id == oil.owner_id:
+                    continue
+                if self.collision_system.check_car_vs_oil(car, oil):
+                    if "oil_slow" not in car.active_effects:
+                        car.apply_effect("oil_slow", OIL_EFFECT_DURATION)
+        self.oil_slicks = [o for o in self.oil_slicks if o.alive]
+
+        # Mines
+        for mine in self.mines:
+            mine.update(dt)
+            for car in self.cars:
+                if self.collision_system.check_car_vs_mine(car, mine):
+                    mine.alive = False
+                    if car.is_shielded:
+                        car.break_shield()
+                    else:
+                        car.apply_effect("mine_spin", MINE_SPIN_DURATION)
+                        car.speed *= 0.3
+        self.mines = [m for m in self.mines if m.alive]
+
+        # Smart missiles
+        for sm in self.smart_missiles:
+            sm.update(dt)
+            if self.collision_system.check_missile_vs_wall(sm):
+                sm.alive = False
+            for car in self.cars:
+                if self.collision_system.check_car_vs_smart_missile(car, sm):
+                    sm.alive = False
+                    if car.is_shielded:
+                        car.break_shield()
+                    else:
+                        car.apply_effect("missile_slow", MISSILE_SLOW_DURATION)
+                        car.speed *= 0.3
+        self.smart_missiles = [m for m in self.smart_missiles if m.alive]
+
+        # Partículas
+        if self.dust_particles:
+            for car in self.cars:
+                if not car.finished:
+                    self.dust_particles.emit_from_car(car)
+                    self.dust_particles.emit_drift_smoke(car)
+                    self.dust_particles.emit_drift_sparks(car)
+                    self.skid_marks.record_from_car(car)
+            self.dust_particles.update(dt)
+            self.skid_marks.update(dt)
+
+        # Cámara
+        self.camera.update(self.player_car.x, self.player_car.y,
+                           self.player_car.angle, self.player_car.speed, dt)
+
+        # Timer
+        self.race_timer.update(dt)
+
+        # Broadcast snapshot @NET_TICK_RATE
+        self._snapshot_timer += dt
+        if self._snapshot_timer >= 1.0 / NET_TICK_RATE:
+            self._snapshot_timer = 0.0
+            self._broadcast_state_snapshot()
+
+        # Victoria
+        all_finished = all(car.finished for car in self.cars)
+        if all_finished or (self.winner and
+                            self.race_timer.total_time > self.winner.finish_time + 15):
+            self.state = STATE_VICTORY
+
+    def _broadcast_state_snapshot(self):
+        """Empaqueta y envía snapshot de estado a todos los clientes."""
+        if not self.net_server:
+            return
+        from networking.protocol import pack_state_snapshot
+        self._snapshot_seq = (self._snapshot_seq + 1) % 65536
+        data = pack_state_snapshot(
+            self.cars, self.missiles, self.smart_missiles,
+            self.oil_slicks, self.mines, self.powerup_items,
+            self.race_timer.total_time, self._snapshot_seq
+        )
+        self.net_server.broadcast(data)
+
+    # ── CLIENT JOIN ──
+
+    def _start_join_screen(self):
+        """Muestra la pantalla de input de IP."""
+        self._lobby_ip_input = ""
+        self._lobby_name_input = "Player"
+        self._net_error_msg = ""
+        self._ip_cursor_blink = 0.0
+        self.state = STATE_CONNECTING
+
+    def _update_connecting(self, dt):
+        """Poll resultado de connect_async."""
+        if not self.net_client:
+            return
+        if not self.net_client._connect_done:
+            return  # Todavía conectando...
+
+        if self.net_client._connect_ok:
+            self.my_player_id = self.net_client.player_id
+            self.is_online = True
+            self.is_host = False
+            self.state = STATE_JOIN_LOBBY
+            self._net_error_msg = ""
+            print(f"[GAME] Connected to host as Player {self.my_player_id + 1}")
+        else:
+            reason = self.net_client.reject_reason
+            if reason == 1:
+                self._net_error_msg = "Lobby is full"
+            elif reason == 2:
+                self._net_error_msg = "Race already in progress"
+            else:
+                self._net_error_msg = "Could not connect to host"
+            self.net_client.disconnect()
+            self.net_client = None
+
+    def _attempt_connect(self):
+        """Inicia conexión async al host con la IP introducida."""
+        ip = self._lobby_ip_input.strip()
+        if not ip:
+            self._net_error_msg = "Enter host IP address"
+            return
+
+        # Si ya hay una conexión en progreso, ignorar
+        if self.net_client:
+            return
+
+        from networking.client import GameClient
+        self.net_client = GameClient(ip)
+        self._net_error_msg = "Connecting..."
+
+        name = self._lobby_name_input or "Player"
+        self.net_client.connect_async(name)
+
+    def _render_connecting(self):
+        """Renderiza pantalla de input de IP para unirse."""
+        self._render_gradient_bg()
+
+        draw_text_centered(self.screen, "JOIN GAME",
+                           self.font_title, COLOR_YELLOW, 100)
+
+        # IP input
+        draw_text_centered(self.screen, "Enter Host IP:",
+                           self.font_subtitle, COLOR_WHITE, 240)
+
+        # Input box
+        box_w = 350
+        box_h = 40
+        box_x = SCREEN_WIDTH // 2 - box_w // 2
+        box_y = 290
+        pygame.draw.rect(self.screen, (40, 40, 60),
+                         (box_x, box_y, box_w, box_h), border_radius=4)
+        pygame.draw.rect(self.screen, COLOR_WHITE,
+                         (box_x, box_y, box_w, box_h), 2, border_radius=4)
+
+        # IP text with cursor
+        cursor = "|" if int(self._ip_cursor_blink * 2) % 2 == 0 else ""
+        ip_text = self._lobby_ip_input + cursor
+        ip_surf = self.font_subtitle.render(ip_text, True, COLOR_WHITE)
+        self.screen.blit(ip_surf, (box_x + 10, box_y + 6))
+
+        # Error message
+        if self._net_error_msg:
+            color = COLOR_YELLOW if "Connecting" in self._net_error_msg else COLOR_RED
+            draw_text_centered(self.screen, self._net_error_msg,
+                               self.font, color, 360)
+
+        # Footer
+        draw_text_centered(self.screen, "ENTER: Connect  |  ESC: Back",
+                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
+
+    # ── CLIENT LOBBY ──
+
+    def _update_join_lobby(self, dt):
+        """Actualiza lobby del cliente: recibe estado y espera RACE_START."""
+        if not self.net_client:
+            return
+
+        if not self.net_client.connected:
+            self._net_error_msg = "Host disconnected"
+            self._stop_online()
+            self.state = STATE_MENU
+            return
+
+        # Verificar si la carrera ha comenzado
+        if self.net_client.race_started:
+            self._start_online_race_as_client()
+
+    def _render_join_lobby(self):
+        """Renderiza lobby del cliente."""
+        self._render_gradient_bg()
+
+        draw_text_centered(self.screen, "LOBBY",
+                           self.font_title, COLOR_YELLOW, 80)
+
+        draw_text_centered(self.screen, f"Connected as Player {self.my_player_id + 1}",
+                           self.font_subtitle, COLOR_WHITE, 160)
+
+        # Mostrar estado del lobby
+        lobby = self.net_client.get_lobby_state() if self.net_client else None
+        if lobby:
+            draw_text_centered(self.screen, f"Track: {lobby['track_name']}",
+                               self.font, COLOR_GRAY, 210)
+
+            y = 260
+            draw_text_centered(self.screen, "Players:", self.font_subtitle,
+                               COLOR_WHITE, y)
+            y += 35
+            for pid, name in lobby["players"]:
+                tag = " (You)" if pid == self.my_player_id else ""
+                color = PLAYER_COLORS[pid] if pid < len(PLAYER_COLORS) else COLOR_WHITE
+                draw_text_centered(self.screen, f"P{pid + 1}: {name}{tag}",
+                                   self.font, color, y)
+                y += 28
+
+            if lobby["bot_count"] > 0:
+                y += 10
+                draw_text_centered(self.screen, f"Bots: {lobby['bot_count']}",
+                                   self.font, COLOR_GRAY, y)
+
+        # Track transfer progress
+        progress = self.net_client.get_track_progress() if self.net_client else 0.0
+        if progress > 0 and progress < 1.0:
+            draw_text_centered(self.screen,
+                               f"Receiving track... {int(progress * 100)}%",
+                               self.font, COLOR_YELLOW, 500)
+
+        draw_text_centered(self.screen, "Waiting for host to start...",
+                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 90)
+        draw_text_centered(self.screen, "ESC: Leave",
+                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
+
+    def _start_online_race_as_client(self):
+        """Cliente: construye track local, crea Cars, entra en countdown."""
+        if not self.net_client:
+            return
+
+        # Esperar a que el track data esté completo
+        track_data = self.net_client.get_track_data()
+        if not track_data:
+            # Reintentar en el siguiente frame (no resetear race_started)
+            return
+
+        # Crear track local
+        if track_data.get("format") == "tiles":
+            self.track = TileTrack(track_data)
+        else:
+            self.track = Track(control_points=track_data["control_points"])
+
+        # Crear autos basándose en lobby state
+        self.cars = []
+        lobby = self.net_client.get_lobby_state()
+        sp = self.track.start_positions
+
+        if lobby:
+            for i, (pid, name) in enumerate(lobby["players"]):
+                pos_idx = min(i, len(sp) - 1)
+                car = Car(sp[pos_idx][0], sp[pos_idx][1], sp[pos_idx][2],
+                          PLAYER_COLORS[pid % len(PLAYER_COLORS)], pid)
+                car.name = name
+                if pid == self.my_player_id:
+                    self.player_car = car
+                else:
+                    car.is_remote = True
+                self.cars.append(car)
+
+            # Bots
+            bot_start = len(lobby["players"])
+            for b in range(lobby.get("bot_count", 0)):
+                bot_idx = bot_start + b
+                pos_idx = min(bot_idx, len(sp) - 1)
+                bot = Car(sp[pos_idx][0], sp[pos_idx][1], sp[pos_idx][2],
+                          PLAYER_COLORS[bot_idx % len(PLAYER_COLORS)],
+                          100 + b)
+                bot.name = f"Bot {b + 1}"
+                bot.is_bot_car = True
+                bot.is_remote = True  # el cliente no corre IA para bots
+                self.cars.append(bot)
+
+        if not self.player_car and self.cars:
+            self.player_car = self.cars[0]
+
+        # Sistemas
+        self.collision_system = CollisionSystem(self.track)
+
+        # Race progress
+        fl = self.track.finish_line
+        fl_center = ((fl[0][0] + fl[1][0]) / 2, (fl[0][1] + fl[1][1]) / 2)
+        self.race_progress = RaceProgressTracker(
+            self.track.checkpoints, fl_center)
+        for car in self.cars:
+            self.race_progress.register_car(car.player_id)
+
+        # Cámara
+        self.camera.snap_to(self.player_car.x, self.player_car.y,
+                            self.player_car.angle)
+
+        # Power-ups
+        self.powerup_items = [
+            PowerUpItem(p[0], p[1]) for p in self.track.powerup_spawn_points
+        ]
+        self.missiles = []
+        self.oil_slicks = []
+        self.mines = []
+        self.smart_missiles = []
+        self._use_cooldown = 0.0
+
+        # Partículas
+        self.dust_particles = DustParticleSystem()
+        self.skid_marks = SkidMarkSystem()
+
+        # Timer
+        self.race_timer = RaceTimer()
+        self.race_timer.reset()
+        self.winner = None
+        self.final_times = {}
+
+        # Countdown
+        self.countdown_timer = 0.0
+        self.countdown_value = self.net_client.countdown
+        self.state = STATE_ONLINE_COUNTDOWN
+
+    def _update_online_racing_client(self, dt):
+        """Update del cliente: envía inputs, predicción local, interpolación."""
+        if not self.net_client:
+            return
+
+        # Verificar conexión
+        if not self.net_client.connected:
+            self._net_error_msg = "Host disconnected"
+            self._stop_online()
+            self.state = STATE_MENU
+            return
+
+        keys = pygame.key.get_pressed()
+        self._use_cooldown = max(0, self._use_cooldown - dt)
+
+        # 1. Input local (siempre WASD+Space para el jugador local)
+        if self.player_car and not self.player_car.finished:
+            self.player_car.reset_inputs()
+            if keys[pygame.K_w]:
+                self.player_car.input_accelerate = 1.0
+            elif keys[pygame.K_s]:
+                self.player_car.input_accelerate = -1.0
+            if keys[pygame.K_a]:
+                self.player_car.input_turn -= 1.0
+            if keys[pygame.K_d]:
+                self.player_car.input_turn += 1.0
+            if keys[pygame.K_SPACE]:
+                self.player_car.input_brake = True
+
+            # Enviar input al servidor
+            self.net_client.send_input(
+                self.player_car.input_accelerate,
+                self.player_car.input_turn,
+                self.player_car.input_brake,
+                self.player_car.input_use_powerup,
+            )
+
+            # 2. Predicción local del auto propio (física completa)
+            self.player_car.update_effects(dt)
+            self.physics.update(self.player_car, dt, self.track)
+            self.player_car.update_sprite()
+
+            # Colisiones locales
+            if self.collision_system.check_track_collision(self.player_car):
+                if self.player_car.is_shielded:
+                    self.player_car.break_shield()
+                    normal = self.collision_system.resolve_track_collision(self.player_car)
+                    self.player_car.speed *= 0.7
+                    self.player_car.update_sprite()
+                elif self.player_car.has_bounce:
+                    normal = self.collision_system.resolve_track_collision(self.player_car)
+                    self.physics.apply_collision_response(self.player_car, normal)
+                    self.player_car.speed *= 1.3
+                    self.player_car.update_sprite()
+                else:
+                    normal = self.collision_system.resolve_track_collision(self.player_car)
+                    self.physics.apply_collision_response(self.player_car, normal)
+                    self.player_car.update_sprite()
+            else:
+                self.physics.clear_wall_contact(self.player_car)
+
+        # 3. Recibir y aplicar estado del servidor
+        prev, curr = self.net_client.get_interpolation_states()
+        if curr:
+            for car_state in curr.cars:
+                if car_state.player_id == self.my_player_id:
+                    # Reconciliación del auto propio
+                    self._reconcile_local_car(car_state)
+                else:
+                    # Interpolar autos remotos
+                    target_car = self._find_car_by_pid(car_state.player_id)
+                    if target_car:
+                        if prev:
+                            # Interpolar entre prev y curr
+                            prev_state = self._find_car_state_in_snapshot(
+                                prev, car_state.player_id)
+                            if prev_state:
+                                self._interpolate_car(target_car, prev_state,
+                                                      car_state, prev, curr)
+                            else:
+                                target_car.apply_net_state(car_state)
+                        else:
+                            target_car.apply_net_state(car_state)
+
+            # Sincronizar proyectiles y hazards desde snapshot
+            self._sync_projectiles(curr)
+            self._sync_hazards(curr)
+            self._sync_powerup_items(curr)
+
+            # Update race time from server
+            self.race_timer.total_time = curr.race_time
+
+        # Procesar eventos de power-up
+        for event in self.net_client.pop_powerup_events():
+            self._handle_remote_powerup_event(event)
+
+        # Partículas
+        if self.dust_particles:
+            for car in self.cars:
+                if not car.finished:
+                    self.dust_particles.emit_from_car(car)
+                    self.dust_particles.emit_drift_smoke(car)
+                    self.dust_particles.emit_drift_sparks(car)
+                    self.skid_marks.record_from_car(car)
+            self.dust_particles.update(dt)
+            self.skid_marks.update(dt)
+
+        # Cámara
+        if self.player_car:
+            self.camera.update(self.player_car.x, self.player_car.y,
+                               self.player_car.angle, self.player_car.speed, dt)
+
+        # Timer
+        self.race_timer.update(dt)
+
+        # Update progress
+        for car in self.cars:
+            self.race_progress.update(car)
+
+        # Victoria
+        all_finished = all(car.finished for car in self.cars)
+        if all_finished or (self.winner and
+                            self.race_timer.total_time > self.winner.finish_time + 15):
+            self.state = STATE_VICTORY
+
+    def _reconcile_local_car(self, server_state):
+        """Corrección suave del auto local basándose en estado del servidor."""
+        if not self.player_car:
+            return
+
+        dx = server_state.x - self.player_car.x
+        dy = server_state.y - self.player_car.y
+        dist = math.hypot(dx, dy)
+
+        if dist > NET_RECONCILE_SNAP_DIST:
+            # Teleport
+            self.player_car.x = server_state.x
+            self.player_car.y = server_state.y
+            self.player_car.velocity.x = server_state.vx
+            self.player_car.velocity.y = server_state.vy
+            self.player_car.angle = server_state.angle
+        elif dist > 2.0:
+            # Blend suave
+            self.player_car.x += dx * NET_RECONCILE_BLEND
+            self.player_car.y += dy * NET_RECONCILE_BLEND
+
+        # Siempre sincronizar datos discretos
+        self.player_car.laps = server_state.laps
+        self.player_car.next_checkpoint_index = server_state.next_checkpoint_index
+        self.player_car.held_powerup = server_state.held_powerup
+        self.player_car.finished = server_state.finished
+        self.player_car.finish_time = server_state.finish_time
+
+        if self.player_car.finished and self.winner is None:
+            self.winner = self.player_car
+            self.final_times[self.player_car.name] = self.player_car.finish_time
+
+        self.player_car.update_sprite()
+
+    def _interpolate_car(self, car, prev_state, curr_state, prev_snap, curr_snap):
+        """Interpola un auto remoto entre dos snapshots."""
+        import time as _time
+        now = _time.time()
+        dt_snaps = curr_snap.recv_time - prev_snap.recv_time
+        if dt_snaps <= 0:
+            car.apply_net_state(curr_state)
+            return
+
+        t = min(1.0, (now - curr_snap.recv_time) / dt_snaps + 1.0)
+        t = max(0.0, min(1.0, t))
+
+        # Lerp posición
+        car.x = prev_state.x + (curr_state.x - prev_state.x) * t
+        car.y = prev_state.y + (curr_state.y - prev_state.y) * t
+        car.velocity.x = curr_state.vx
+        car.velocity.y = curr_state.vy
+
+        # Angle lerp (camino corto)
+        a1 = prev_state.angle % 360
+        a2 = curr_state.angle % 360
+        diff = (a2 - a1 + 180) % 360 - 180
+        car.angle = (a1 + diff * t) % 360
+
+        # Datos discretos: snap al más reciente
+        car.laps = curr_state.laps
+        car.next_checkpoint_index = curr_state.next_checkpoint_index
+        car.held_powerup = curr_state.held_powerup
+        car.is_drifting = curr_state.is_drifting
+        car.drift_charge = curr_state.drift_charge
+        car.drift_level = curr_state.drift_level
+        car.finished = curr_state.finished
+        car.finish_time = curr_state.finish_time
+
+        # Effects
+        for ename in curr_state.effects:
+            if ename not in car.active_effects:
+                car.active_effects[ename] = 1.0
+        to_remove = [k for k in car.active_effects if k not in curr_state.effects]
+        for k in to_remove:
+            del car.active_effects[k]
+
+        if car.finished and car.finish_time > 0:
+            self.final_times[car.name] = car.finish_time
+            if self.winner is None:
+                self.winner = car
+
+        car.update_sprite()
+
+    def _find_car_by_pid(self, player_id):
+        """Busca un auto por player_id."""
+        for car in self.cars:
+            if car.player_id == player_id:
+                return car
+        return None
+
+    def _find_car_state_in_snapshot(self, snapshot, player_id):
+        """Busca estado de un auto en un snapshot."""
+        for cs in snapshot.cars:
+            if cs.player_id == player_id:
+                return cs
+        return None
+
+    def _sync_projectiles(self, snapshot):
+        """Sincroniza misiles y smart_missiles desde snapshot."""
+        from networking.protocol import PROJ_MISSILE, PROJ_SMART_MISSILE
+
+        # Recrear listas desde snapshot
+        new_missiles = []
+        new_smart = []
+        for proj in snapshot.projectiles:
+            if proj.proj_type == PROJ_MISSILE:
+                m = Missile(proj.x, proj.y, proj.angle, proj.owner_id)
+                new_missiles.append(m)
+            elif proj.proj_type == PROJ_SMART_MISSILE:
+                target = self._find_car_by_pid(proj.target_pid)
+                sm = SmartMissile(proj.x, proj.y, proj.angle,
+                                  proj.owner_id, target)
+                new_smart.append(sm)
+
+        self.missiles = new_missiles
+        self.smart_missiles = new_smart
+
+    def _sync_hazards(self, snapshot):
+        """Sincroniza oil slicks y mines desde snapshot."""
+        from networking.protocol import HAZARD_OIL, HAZARD_MINE
+
+        new_oils = []
+        new_mines = []
+        for h in snapshot.hazards:
+            if h.hazard_type == HAZARD_OIL:
+                o = OilSlick(h.x, h.y, h.owner_id)
+                o.lifetime = h.lifetime
+                new_oils.append(o)
+            elif h.hazard_type == HAZARD_MINE:
+                m = Mine(h.x, h.y, h.owner_id)
+                m.lifetime = h.lifetime
+                new_mines.append(m)
+
+        self.oil_slicks = new_oils
+        self.mines = new_mines
+
+    def _sync_powerup_items(self, snapshot):
+        """Sincroniza estado de los pickups de power-up."""
+        for item_state in snapshot.items:
+            idx = item_state.index
+            if idx < len(self.powerup_items):
+                item = self.powerup_items[idx]
+                if item_state.active and not item.active:
+                    item.active = True
+                    item.power_type = None
+                elif not item_state.active and item.active:
+                    item.active = False
+                    item.respawn_timer = item_state.respawn_timer
+
+    def _handle_remote_powerup_event(self, event):
+        """Procesa evento de power-up recibido del servidor."""
+        from networking.protocol import PW_EVENT_COLLECT
+        if event["event_type"] == PW_EVENT_COLLECT:
+            pid = event["player_id"]
+            ptype = event["powerup_type"]
+            idx = event["item_index"]
+            car = self._find_car_by_pid(pid)
+            if car and ptype:
+                car.held_powerup = ptype
+                if idx < len(self.powerup_items):
+                    self.powerup_items[idx].collect_with_type(ptype)
 
     # ──────────────────────────────────────────────
     # HELPERS

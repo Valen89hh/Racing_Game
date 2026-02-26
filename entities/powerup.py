@@ -77,6 +77,22 @@ class PowerUpItem:
         self.respawn_timer = POWERUP_RESPAWN_TIME
         return ptype
 
+    def collect_with_type(self, ptype: str) -> str:
+        """
+        Recoge el power-up con un tipo predeterminado (para sync de red).
+        El host determina el tipo y lo envía a los clientes.
+
+        Args:
+            ptype: tipo de power-up a asignar.
+
+        Returns:
+            Tipo de power-up recogido.
+        """
+        self.power_type = ptype
+        self.active = False
+        self.respawn_timer = POWERUP_RESPAWN_TIME
+        return ptype
+
     def draw(self, surface: pygame.Surface, camera, time: float):
         """
         Dibuja el power-up como caja misteriosa dorada con "?".

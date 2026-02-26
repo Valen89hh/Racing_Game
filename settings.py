@@ -288,6 +288,13 @@ STATE_EDITOR = "editor"
 STATE_TRACK_SELECT = "track_select"
 STATE_TRAINING = "training"
 
+# Online multiplayer states
+STATE_HOST_LOBBY = "host_lobby"
+STATE_JOIN_LOBBY = "join_lobby"
+STATE_CONNECTING = "connecting"
+STATE_ONLINE_RACING = "online_racing"
+STATE_ONLINE_COUNTDOWN = "online_countdown"
+
 # ──────────────────────────────────────────────
 # JUGADORES (preparado para multiplayer futuro)
 # ──────────────────────────────────────────────
@@ -343,3 +350,16 @@ TILE_CAT_TERRAIN = "terrain"       # driveable surfaces
 TILE_CAT_PROPS = "props"           # decorative, blocks movement
 TILE_CAT_OBSTACLES = "obstacles"   # walls, barriers
 TILE_CAT_SPECIAL = "special"       # finish, checkpoints
+
+# ──────────────────────────────────────────────
+# NETWORKING (multiplayer online)
+# ──────────────────────────────────────────────
+NET_DEFAULT_PORT = 5555
+NET_TICK_RATE = 30              # snapshots/segundo del host a clientes
+NET_INPUT_RATE = 60             # inputs/segundo del cliente al host
+NET_TIMEOUT = 5.0               # segundos sin heartbeat → disconnect
+NET_HEARTBEAT_INTERVAL = 1.0    # segundos entre pings
+NET_INTERPOLATION_DELAY = 0.05  # 50ms de buffer para interpolación
+NET_MAX_SNAPSHOT_BUFFER = 5     # snapshots en buffer circular
+NET_RECONCILE_SNAP_DIST = 100.0 # distancia para snap teleport
+NET_RECONCILE_BLEND = 0.2      # factor de blend hacia servidor
