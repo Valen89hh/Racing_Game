@@ -267,17 +267,24 @@ class Car:
     # SPRITE Y DIBUJO
     # ────────────────────────────────────────────
 
-    def update_sprite(self):
-        """Actualiza el sprite rotado según el ángulo actual."""
+    def update_collision_mask(self):
+        """Actualiza surface/rect/mask para colisión. NO toca render state."""
         self.surface = pygame.transform.rotate(
             self.original_surface, -self.angle
         )
         self.rect = self.surface.get_rect(center=(self.x, self.y))
         self.mask = pygame.mask.from_surface(self.surface)
-        # Sync render state (offline y autos remotos: render = sim)
+
+    def sync_render_to_sim(self):
+        """Snap render → sim. Para offline, remotos, setup inicial."""
         self.render_x = self.x
         self.render_y = self.y
         self.render_angle = self.angle
+
+    def update_sprite(self):
+        """Collision mask + render sync. Usado por offline/server/remotos."""
+        self.update_collision_mask()
+        self.sync_render_to_sim()
 
     def get_forward_vector(self) -> tuple[float, float]:
         """Retorna el vector de dirección frontal del auto."""
@@ -443,14 +450,25 @@ class Car:
         self.finished = state.finished
         self.finish_time = state.finish_time
 
-        # Reconstruir active_effects desde la lista de nombres
-        # Solo setear flags, no duración exacta (el host la maneja)
-        for ename in state.effects:
-            if ename not in self.active_effects:
-                self.active_effects[ename] = 1.0  # duración placeholder
-        to_remove = [k for k in self.active_effects if k not in state.effects]
-        for k in to_remove:
-            del self.active_effects[k]
+        # Sync drift state completo
+        self.drift_time = state.drift_time
+        self.drift_direction = state.drift_direction
+        self.drift_mt_boost_timer = state.drift_mt_boost_timer
+
+        # Reconstruir active_effects con duraciones reales del servidor
+        if hasattr(state, 'effect_durations') and state.effect_durations:
+            new_effects = {}
+            for ename in state.effects:
+                new_effects[ename] = state.effect_durations.get(ename, 1.0)
+            self.active_effects = new_effects
+        else:
+            # Fallback legacy (servidor sin duraciones)
+            for ename in state.effects:
+                if ename not in self.active_effects:
+                    self.active_effects[ename] = 1.0
+            to_remove = [k for k in self.active_effects if k not in state.effects]
+            for k in to_remove:
+                del self.active_effects[k]
 
         self.update_sprite()
 

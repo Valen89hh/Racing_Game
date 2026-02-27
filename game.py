@@ -28,10 +28,8 @@ from settings import (
     COLOR_RED, COLOR_GRAY, COLOR_DARK_GRAY, COLOR_ORANGE, COLOR_BLUE,
     STATE_MENU, STATE_COUNTDOWN, STATE_RACING, STATE_VICTORY,
     STATE_EDITOR, STATE_TRACK_SELECT, STATE_TRAINING,
-    STATE_HOST_LOBBY, STATE_JOIN_LOBBY, STATE_CONNECTING,
+    STATE_JOIN_LOBBY, STATE_CONNECTING,
     STATE_ONLINE_RACING, STATE_ONLINE_COUNTDOWN,
-    STATE_RELAY_HOST, STATE_RELAY_JOIN,
-    RELAY_DEFAULT_PORT,
     COLOR_PROGRESS_BAR, COLOR_PROGRESS_BG,
     PLAYER_COLORS, MAX_PLAYERS, TOTAL_LAPS, DEBUG_CHECKPOINTS,
     HUD_FONT_SIZE, HUD_TITLE_FONT_SIZE,
@@ -48,8 +46,9 @@ from settings import (
     MAGNET_DURATION, SLOWMO_DURATION, BOUNCE_DURATION,
     AUTOPILOT_DURATION, TELEPORT_DISTANCE,
     SMART_MISSILE_LIFETIME,
-    NET_DEFAULT_PORT, NET_TICK_RATE,
-    NET_RECONCILE_SNAP_DIST, FIXED_DT, VISUAL_SMOOTH_RATE,
+    NET_DEFAULT_PORT, NET_TICK_RATE, NET_INTERPOLATION_DELAY,
+    NET_TELEPORT_THRESHOLD,
+    FIXED_DT, VISUAL_SMOOTH_RATE,
     SLOWMO_FACTOR,
 )
 from entities.car import Car
@@ -71,13 +70,14 @@ import track_manager
 
 class InputRecord:
     """Record de un input enviado al servidor, para replay en reconciliación."""
-    __slots__ = ('seq', 'accel', 'turn', 'brake')
+    __slots__ = ('seq', 'accel', 'turn', 'brake', 'use_powerup')
 
-    def __init__(self, seq, accel, turn, brake):
+    def __init__(self, seq, accel, turn, brake, use_powerup=False):
         self.seq = seq
         self.accel = accel
         self.turn = turn
         self.brake = brake
+        self.use_powerup = use_powerup
 
 
 class Game:
@@ -154,44 +154,41 @@ class Game:
         self._train_status = "idle"  # idle | training | done | error
         self._train_error_log = ""  # ruta al archivo de log de error
 
-        # Multiplayer online
-        self.net_server = None       # GameServer (host only)
-        self.net_client = None       # GameClient (client only)
-        self.is_host = False
+        # Multiplayer online (client-only, server is separate process)
+        self.net_client = None       # GameClient
         self.is_online = False
         self.my_player_id = 0
         self._lobby_ip_input = ""
         self._lobby_name_input = "Player"
-        self._lobby_bot_count = 1
-        self._lobby_players = []     # [(pid, name), ...]
-        self._snapshot_timer = 0.0
-        self._snapshot_seq = 0
         self._online_countdown_timer = 0.0
         self._online_countdown_value = 3
         self._net_error_msg = ""
         self._ip_cursor_blink = 0.0
-        self._lobby_broadcast_timer = 0.0
-        self._host_starting_race = False  # True mientras envía track data
-        self._pending_track_data = None
-
-        # Relay server
-        self._relay_addr_input = ""      # IP:port del relay
-        self._relay_room_code = ""       # código de sala (4 chars)
-        self._relay_room_input = ""      # input del usuario para room code
-        self._relay_status = ""          # estado del relay ("creating", "ready", etc.)
-        self._relay_sock = None          # socket UDP temporal para create/join
-        self._relay_addr = None          # (ip, port) parsed
 
         # Fixed timestep accumulator
         self._physics_accumulator = 0.0
+        self._client_slowmo_on_me = False
+        self._last_reconcile_seq = -1
 
         # Input replay buffer (client-side prediction + reconciliation)
         self._input_buffer = [None] * 128  # circular buffer of InputRecord
         self._input_buffer_head = 0
         self._input_buffer_count = 0
 
-        # Host: track last processed input seq per player
-        self._host_last_input_seq = {}
+        # Net debug overlay (toggle con F3)
+        self._show_net_stats = False
+        self._net_stats = {
+            'ping': 0.0,
+            'unacked': 0,
+            'reconcile_error': 0.0,
+            'snap_rate': 0.0,
+            'server_tick': 0,
+            'input_seq': 0,
+            'last_server_seq': 0,
+        }
+        self._snap_count = 0
+        self._snap_rate_timer = 0.0
+        self._snap_rate_value = 0.0
 
         # Exportar circuito por defecto si no existe
         track_manager.export_default_track()
@@ -255,17 +252,8 @@ class Game:
                     elif self.state == STATE_TRAINING:
                         self._cancel_training()
                         self.state = STATE_TRACK_SELECT
-                    elif self.state == STATE_HOST_LOBBY:
-                        self._stop_online()
-                        self.state = STATE_TRACK_SELECT
                     elif self.state in (STATE_JOIN_LOBBY, STATE_CONNECTING):
                         self._stop_online()
-                        self.state = STATE_MENU
-                    elif self.state == STATE_RELAY_HOST:
-                        self._cancel_relay()
-                        self.state = STATE_TRACK_SELECT
-                    elif self.state == STATE_RELAY_JOIN:
-                        self._cancel_relay()
                         self.state = STATE_MENU
                     else:
                         self.running = False
@@ -276,19 +264,9 @@ class Game:
                     elif self.state == STATE_TRACK_SELECT:
                         self._edit_selected_track()
 
-                elif event.key == pygame.K_h:
-                    if self.state == STATE_TRACK_SELECT:
-                        self._start_host_lobby()
-
                 elif event.key == pygame.K_j:
                     if self.state == STATE_MENU:
                         self._start_join_screen()
-
-                elif event.key == pygame.K_r:
-                    if self.state == STATE_TRACK_SELECT:
-                        self._start_relay_host()
-                    elif self.state == STATE_MENU:
-                        self._start_relay_join()
 
                 elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER,
                                    pygame.K_SPACE):
@@ -309,14 +287,8 @@ class Game:
                             self._launch_training()
                         elif self._train_status in ("done", "error"):
                             self.state = STATE_TRACK_SELECT
-                    elif self.state == STATE_HOST_LOBBY:
-                        self._start_online_race_as_host()
                     elif self.state == STATE_CONNECTING:
                         self._attempt_connect()
-                    elif self.state == STATE_RELAY_HOST:
-                        self._relay_host_enter()
-                    elif self.state == STATE_RELAY_JOIN:
-                        self._relay_join_enter()
 
                 elif self.state == STATE_TRACK_SELECT:
                     if event.key == pygame.K_UP:
@@ -330,28 +302,9 @@ class Game:
                             if entry.get("type") == "tiles":
                                 self._start_training_screen()
 
-                elif self.state == STATE_HOST_LOBBY:
-                    if event.key == pygame.K_UP:
-                        self._lobby_bot_count = min(
-                            self._lobby_bot_count + 1,
-                            MAX_PLAYERS - 1 - (self.net_server.get_connected_count() if self.net_server else 0))
-                    elif event.key == pygame.K_DOWN:
-                        self._lobby_bot_count = max(0, self._lobby_bot_count - 1)
-
                 elif self.state == STATE_CONNECTING:
                     if event.key == pygame.K_BACKSPACE:
                         self._lobby_ip_input = self._lobby_ip_input[:-1]
-
-                elif self.state == STATE_RELAY_HOST:
-                    if event.key == pygame.K_BACKSPACE:
-                        self._relay_addr_input = self._relay_addr_input[:-1]
-
-                elif self.state == STATE_RELAY_JOIN:
-                    if event.key == pygame.K_BACKSPACE:
-                        if self._relay_status == "input_code":
-                            self._relay_room_input = self._relay_room_input[:-1]
-                        else:
-                            self._relay_addr_input = self._relay_addr_input[:-1]
 
                 elif self.state == STATE_TRAINING:
                     if event.key == pygame.K_UP and self._train_status == "idle":
@@ -359,35 +312,23 @@ class Game:
                     elif event.key == pygame.K_DOWN and self._train_status == "idle":
                         self._train_timesteps = max(self._train_timesteps - 50000, 50000)
 
+                # F3: Toggle net stats overlay (cualquier estado online)
+                if event.key == pygame.K_F3:
+                    self._show_net_stats = not self._show_net_stats
+
             # Text input for IP address in connecting screen
             if event.type == pygame.TEXTINPUT and self.state == STATE_CONNECTING:
                 char = event.text
                 if char in "0123456789.":
                     self._lobby_ip_input += char
 
-            # Text input for relay address
-            if event.type == pygame.TEXTINPUT and self.state == STATE_RELAY_HOST:
-                char = event.text
-                if char in "0123456789.:":
-                    self._relay_addr_input += char
-
-            # Text input for relay join (address or room code)
-            if event.type == pygame.TEXTINPUT and self.state == STATE_RELAY_JOIN:
-                char = event.text
-                if self._relay_status == "input_code":
-                    if char.upper() in "ABCDEFGHJKMNPQRSTUVWXYZ23456789":
-                        self._relay_room_input += char.upper()
-                else:
-                    if char in "0123456789.:":
-                        self._relay_addr_input += char
-
             # Click izquierdo del mouse para activar power-up
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if self.state in (STATE_RACING, STATE_ONLINE_RACING):
                     if (self.player_car and self.player_car.held_powerup is not None
                             and self._use_cooldown <= 0):
-                        if self.is_online and not self.is_host:
-                            # Cliente online: señalar al servidor, no activar localmente
+                        if self.is_online:
+                            # Online: señalar al servidor, no activar localmente
                             self.player_car.input_use_powerup = True
                         else:
                             self._activate_powerup(self.player_car)
@@ -487,26 +428,15 @@ class Game:
             self.editor.update(dt)
         elif self.state == STATE_TRAINING:
             self._update_training(dt)
-        elif self.state == STATE_HOST_LOBBY:
-            self._update_host_lobby(dt)
         elif self.state == STATE_JOIN_LOBBY:
             self._update_join_lobby(dt)
         elif self.state == STATE_ONLINE_COUNTDOWN:
             self._update_online_countdown(dt)
         elif self.state == STATE_ONLINE_RACING:
-            if self.is_host:
-                self._update_online_racing_host(dt)
-            else:
-                self._update_online_racing_client(dt)
+            self._update_online_racing_client(dt)
         elif self.state == STATE_CONNECTING:
             self._ip_cursor_blink += dt
             self._update_connecting(dt)
-        elif self.state == STATE_RELAY_HOST:
-            self._ip_cursor_blink += dt
-            self._update_relay_host(dt)
-        elif self.state == STATE_RELAY_JOIN:
-            self._ip_cursor_blink += dt
-            self._update_relay_join(dt)
 
     def _update_countdown(self, dt: float):
         """Actualiza la cuenta regresiva."""
@@ -867,16 +797,10 @@ class Game:
             self._render_track_select()
         elif self.state == STATE_TRAINING:
             self._render_training()
-        elif self.state == STATE_HOST_LOBBY:
-            self._render_host_lobby()
         elif self.state == STATE_CONNECTING:
             self._render_connecting()
         elif self.state == STATE_JOIN_LOBBY:
             self._render_join_lobby()
-        elif self.state == STATE_RELAY_HOST:
-            self._render_relay_host()
-        elif self.state == STATE_RELAY_JOIN:
-            self._render_relay_join()
         elif self.state == STATE_ONLINE_COUNTDOWN:
             self._render_race()
             self._render_hud()
@@ -884,6 +808,7 @@ class Game:
         elif self.state == STATE_ONLINE_RACING:
             self._render_race()
             self._render_hud()
+            self._render_net_stats()
 
         pygame.display.flip()
 
@@ -907,8 +832,7 @@ class Game:
             "SPACE   -  Handbrake",
             "L-CLICK -  Use Power-Up",
             "E       -  Track Editor",
-            "J       -  Join Online Game (LAN)",
-            "R       -  Join Online Game (Relay)",
+            "J       -  Join Online Game",
             "ESC     -  Back to Menu",
         ]
         for i, text in enumerate(instructions):
@@ -1116,6 +1040,67 @@ class Game:
 
         # ── Minimapa (esquina inferior izquierda) ──
         self._render_minimap()
+
+    def _render_net_stats(self):
+        """Renderiza overlay de estadísticas de red (toggle con F3)."""
+        if not self._show_net_stats or not self.net_client:
+            return
+
+        s = self._net_stats
+        lines = [
+            f"-- NET DEBUG (F3) --",
+            f"Ping:      {s['ping']:.0f} ms",
+            f"Snap rate: {s['snap_rate']:.0f} Hz",
+            f"Unacked:   {s['unacked']}",
+            f"Recon err: {s['reconcile_error']:.1f} px",
+            f"Srv tick:  {s['server_tick']}",
+            f"Input seq: {s['input_seq']}",
+            f"Srv ack:   {s['last_server_seq']}",
+        ]
+
+        line_h = 18
+        panel_w = 220
+        panel_h = len(lines) * line_h + 10
+        panel_x = SCREEN_WIDTH - panel_w - HUD_MARGIN
+        panel_y = SCREEN_HEIGHT - panel_h - HUD_MARGIN - 80
+
+        bg = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        bg.fill((0, 0, 0, 180))
+        self.screen.blit(bg, (panel_x, panel_y))
+
+        for i, line in enumerate(lines):
+            # Color coding
+            if i == 0:
+                color = COLOR_YELLOW
+            elif "Ping" in line:
+                ping_val = s['ping']
+                if ping_val < 50:
+                    color = COLOR_GREEN
+                elif ping_val < 100:
+                    color = COLOR_YELLOW
+                else:
+                    color = COLOR_RED
+            elif "Recon err" in line:
+                err = s['reconcile_error']
+                if err < 5:
+                    color = COLOR_GREEN
+                elif err < 20:
+                    color = COLOR_YELLOW
+                else:
+                    color = COLOR_RED
+            elif "Snap rate" in line:
+                rate = s['snap_rate']
+                if rate >= 27:
+                    color = COLOR_GREEN
+                elif rate >= 20:
+                    color = COLOR_YELLOW
+                else:
+                    color = COLOR_RED
+            else:
+                color = COLOR_WHITE
+
+            rendered = self.font_small.render(line, True, color)
+            self.screen.blit(rendered, (panel_x + 6, panel_y + 5 + i * line_h))
 
     def _render_powerup_hud(self):
         """Dibuja el indicador de power-up del jugador en la parte inferior."""
@@ -1600,7 +1585,7 @@ class Game:
                 draw_text_centered(self.screen, f"({fname})",
                                    self.font_small, COLOR_GRAY, yy + 22)
 
-        draw_text_centered(self.screen, "UP/DOWN select | ENTER race | E edit | H host(LAN) | R host(Relay) | T train | ESC",
+        draw_text_centered(self.screen, "UP/DOWN select | ENTER race | E edit | T train | ESC",
                            self.font_small, COLOR_GRAY, SCREEN_HEIGHT - 50)
 
     # ──────────────────────────────────────────────
@@ -1618,569 +1603,30 @@ class Game:
 
     def _stop_online(self):
         """Limpia toda la infraestructura de red."""
-        if self.net_server:
-            self.net_server.stop()
-            self.net_server = None
         if self.net_client:
             self.net_client.disconnect()
             self.net_client = None
-        self.is_host = False
         self.is_online = False
         self.my_player_id = 0
         self._net_error_msg = ""
-        self._cancel_relay()
-
-    def _cancel_relay(self):
-        """Limpia estado del relay."""
-        if self._relay_sock:
-            try:
-                self._relay_sock.close()
-            except OSError:
-                pass
-            self._relay_sock = None
-        self._relay_addr = None
-        self._relay_room_code = ""
-        self._relay_status = ""
-
-    def _parse_relay_addr(self, text):
-        """Parsea 'ip:port' o 'ip' → (ip, port). Retorna None si inválido."""
-        text = text.strip()
-        if not text:
-            return None
-        if ":" in text:
-            parts = text.rsplit(":", 1)
-            try:
-                port = int(parts[1])
-            except ValueError:
-                return None
-            return (parts[0], port)
-        return (text, RELAY_DEFAULT_PORT)
-
-    # ── RELAY HOST ──
-
-    def _start_relay_host(self):
-        """Muestra pantalla para ingresar dirección del relay server."""
-        if not self.track_list:
-            return
-        self._relay_addr_input = ""
-        self._relay_status = "input_addr"
-        self._relay_room_code = ""
-        self._net_error_msg = ""
-        self._ip_cursor_blink = 0.0
-        self.state = STATE_RELAY_HOST
-
-    def _relay_host_enter(self):
-        """Procesa ENTER en la pantalla de relay host."""
-        if self._relay_status == "input_addr":
-            # Parsear dirección y crear sala
-            addr = self._parse_relay_addr(self._relay_addr_input)
-            if not addr:
-                self._net_error_msg = "Enter relay address (ip or ip:port)"
-                return
-            self._relay_addr = addr
-            self._relay_status = "creating"
-            self._net_error_msg = "Creating room..."
-            # Crear sala en un hilo para no bloquear
-            import threading
-            threading.Thread(
-                target=self._relay_create_worker, daemon=True).start()
-
-        elif self._relay_status == "ready":
-            # Sala creada, pasar a HOST_LOBBY con relay
-            self._start_host_lobby_relay()
-
-    def _relay_create_worker(self):
-        """Worker thread: crea sala en el relay usando RelaySocket."""
-        from networking.relay_socket import RelaySocket
-        rs = RelaySocket(self._relay_addr)
-        code = rs.create_room(timeout=5.0)
-        if code:
-            self._relay_sock = rs  # guardar RelaySocket para pasar al GameServer
-            self._relay_room_code = code
-            self._relay_status = "ready"
-            self._net_error_msg = ""
-        else:
-            rs.close()
-            self._relay_status = "input_addr"
-            self._net_error_msg = "Could not connect to relay server"
-
-    def _start_host_lobby_relay(self):
-        """Crea GameServer usando el RelaySocket ya conectado al relay."""
-        if not self.track_list:
-            return
-        entry = self.track_list[self.track_selected]
-
-        from networking.server import GameServer
-        # Pasar el RelaySocket que ya hizo el handshake (mismo socket UDP)
-        self.net_server = GameServer(relay_socket=self._relay_sock)
-        self._relay_sock = None  # GameServer es dueño ahora
-        self.net_server.host_name = "Host"
-        self.net_server.track_name = entry["name"]
-        try:
-            self.net_server.start()
-        except OSError as e:
-            self._net_error_msg = f"Cannot start server: {e}"
-            self.net_server = None
-            return
-
-        self.is_host = True
-        self.is_online = True
-        self.my_player_id = 0
-        self._lobby_bot_count = 1
-        self._lobby_players = [(0, "Host")]
-        self.state = STATE_HOST_LOBBY
-
-    def _update_relay_host(self, dt):
-        """Actualiza pantalla de relay host (poll de creación de sala)."""
-        pass  # El worker thread actualiza _relay_status directamente
-
-    def _render_relay_host(self):
-        """Renderiza pantalla de relay host."""
-        self._render_gradient_bg()
-
-        draw_text_centered(self.screen, "HOST (RELAY)",
-                           self.font_title, COLOR_YELLOW, 80)
-
-        entry = self.track_list[self.track_selected] if self.track_list else {}
-        draw_text_centered(self.screen, f"Track: {entry.get('name', '?')}",
-                           self.font, COLOR_GRAY, 150)
-
-        if self._relay_status in ("input_addr", ""):
-            draw_text_centered(self.screen, "Enter Relay Server Address:",
-                               self.font_subtitle, COLOR_WHITE, 240)
-
-            # Input box
-            box_w = 400
-            box_h = 40
-            box_x = SCREEN_WIDTH // 2 - box_w // 2
-            box_y = 290
-            pygame.draw.rect(self.screen, (40, 40, 60),
-                             (box_x, box_y, box_w, box_h), border_radius=4)
-            pygame.draw.rect(self.screen, COLOR_WHITE,
-                             (box_x, box_y, box_w, box_h), 2, border_radius=4)
-
-            cursor = "|" if int(self._ip_cursor_blink * 2) % 2 == 0 else ""
-            ip_text = self._relay_addr_input + cursor
-            ip_surf = self.font_subtitle.render(ip_text, True, COLOR_WHITE)
-            self.screen.blit(ip_surf, (box_x + 10, box_y + 6))
-
-            draw_text_centered(self.screen, "(ip:port  or  ip  for default port 7777)",
-                               self.font_small, COLOR_GRAY, 345)
-
-        elif self._relay_status == "creating":
-            draw_text_centered(self.screen, "Creating room...",
-                               self.font_subtitle, COLOR_YELLOW, 300)
-
-        elif self._relay_status == "ready":
-            draw_text_centered(self.screen, "Room Created!",
-                               self.font_subtitle, COLOR_GREEN, 240)
-            draw_text_centered(self.screen, f"Room Code:  {self._relay_room_code}",
-                               self.font_title, COLOR_WHITE, 310)
-            draw_text_centered(self.screen, "Share this code with other players",
-                               self.font, COLOR_GRAY, 400)
-            draw_text_centered(self.screen, "Press ENTER to open lobby",
-                               self.font, COLOR_YELLOW, 450)
-
-        # Error
-        if self._net_error_msg:
-            color = COLOR_YELLOW if "Creating" in self._net_error_msg else COLOR_RED
-            draw_text_centered(self.screen, self._net_error_msg,
-                               self.font, color, SCREEN_HEIGHT - 90)
-
-        draw_text_centered(self.screen, "ENTER: Confirm  |  ESC: Cancel",
-                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
-
-    # ── RELAY JOIN ──
-
-    def _start_relay_join(self):
-        """Muestra pantalla para ingresar relay addr + room code."""
-        self._relay_addr_input = ""
-        self._relay_room_input = ""
-        self._relay_status = "input_addr"
-        self._relay_room_code = ""
-        self._net_error_msg = ""
-        self._ip_cursor_blink = 0.0
-        self.state = STATE_RELAY_JOIN
-
-    def _relay_join_enter(self):
-        """Procesa ENTER en la pantalla de relay join."""
-        if self._relay_status == "input_addr":
-            addr = self._parse_relay_addr(self._relay_addr_input)
-            if not addr:
-                self._net_error_msg = "Enter relay address (ip or ip:port)"
-                return
-            self._relay_addr = addr
-            self._relay_status = "input_code"
-            self._net_error_msg = ""
-
-        elif self._relay_status == "input_code":
-            code = self._relay_room_input.strip().upper()
-            if len(code) != 4:
-                self._net_error_msg = "Room code must be 4 characters"
-                return
-            self._relay_room_code = code
-            self._relay_status = "joining"
-            self._net_error_msg = "Joining room..."
-            import threading
-            threading.Thread(
-                target=self._relay_join_worker, daemon=True).start()
-
-    def _relay_join_worker(self):
-        """Worker thread: se une a la sala del relay usando RelaySocket."""
-        from networking.relay_socket import RelaySocket
-        rs = RelaySocket(self._relay_addr)
-        slot = rs.join_room(self._relay_room_code, timeout=5.0)
-        if slot is not None:
-            self._relay_sock = rs  # guardar para pasar al GameClient
-            self._relay_status = "joined"
-            # Crear GameClient con el RelaySocket ya conectado
-            self._start_client_relay()
-        else:
-            rs.close()
-            self._relay_status = "input_code"
-            self._net_error_msg = "Room not found or full"
-
-    def _start_client_relay(self):
-        """Crea GameClient usando el RelaySocket ya conectado al relay."""
-        from networking.client import GameClient
-        # Pasar el RelaySocket que ya hizo el handshake (mismo socket UDP)
-        self.net_client = GameClient(
-            host_ip="relay",
-            relay_socket=self._relay_sock)
-        self._relay_sock = None  # GameClient es dueño ahora
-        self._net_error_msg = "Connecting..."
-
-        name = self._lobby_name_input or "Player"
-        self.net_client.connect_async(name)
-        self.state = STATE_CONNECTING
-
-    def _update_relay_join(self, dt):
-        """Actualiza pantalla de relay join (poll de join)."""
-        pass  # Worker thread actualiza _relay_status directamente
-
-    def _render_relay_join(self):
-        """Renderiza pantalla de relay join."""
-        self._render_gradient_bg()
-
-        draw_text_centered(self.screen, "JOIN (RELAY)",
-                           self.font_title, COLOR_YELLOW, 80)
-
-        if self._relay_status in ("input_addr", ""):
-            draw_text_centered(self.screen, "Enter Relay Server Address:",
-                               self.font_subtitle, COLOR_WHITE, 220)
-
-            box_w = 400
-            box_h = 40
-            box_x = SCREEN_WIDTH // 2 - box_w // 2
-            box_y = 270
-            pygame.draw.rect(self.screen, (40, 40, 60),
-                             (box_x, box_y, box_w, box_h), border_radius=4)
-            pygame.draw.rect(self.screen, COLOR_WHITE,
-                             (box_x, box_y, box_w, box_h), 2, border_radius=4)
-
-            cursor = "|" if int(self._ip_cursor_blink * 2) % 2 == 0 else ""
-            ip_text = self._relay_addr_input + cursor
-            ip_surf = self.font_subtitle.render(ip_text, True, COLOR_WHITE)
-            self.screen.blit(ip_surf, (box_x + 10, box_y + 6))
-
-            draw_text_centered(self.screen, "(ip:port  or  ip  for default port 7777)",
-                               self.font_small, COLOR_GRAY, 325)
-
-        elif self._relay_status == "input_code":
-            draw_text_centered(self.screen, f"Relay: {self._relay_addr_input}",
-                               self.font, COLOR_GRAY, 180)
-
-            draw_text_centered(self.screen, "Enter Room Code:",
-                               self.font_subtitle, COLOR_WHITE, 250)
-
-            box_w = 200
-            box_h = 50
-            box_x = SCREEN_WIDTH // 2 - box_w // 2
-            box_y = 300
-            pygame.draw.rect(self.screen, (40, 40, 60),
-                             (box_x, box_y, box_w, box_h), border_radius=4)
-            pygame.draw.rect(self.screen, COLOR_WHITE,
-                             (box_x, box_y, box_w, box_h), 2, border_radius=4)
-
-            cursor = "|" if int(self._ip_cursor_blink * 2) % 2 == 0 else ""
-            code_text = self._relay_room_input + cursor
-            code_surf = self.font_title.render(code_text, True, COLOR_WHITE)
-            text_x = box_x + (box_w - code_surf.get_width()) // 2
-            self.screen.blit(code_surf, (text_x, box_y + 2))
-
-            draw_text_centered(self.screen, "(4 characters, e.g. A3K9)",
-                               self.font_small, COLOR_GRAY, 365)
-
-        elif self._relay_status == "joining":
-            draw_text_centered(self.screen, f"Joining room {self._relay_room_code}...",
-                               self.font_subtitle, COLOR_YELLOW, 300)
-
-        # Error
-        if self._net_error_msg:
-            color = COLOR_YELLOW if "Connecting" in self._net_error_msg or "Joining" in self._net_error_msg else COLOR_RED
-            draw_text_centered(self.screen, self._net_error_msg,
-                               self.font, color, SCREEN_HEIGHT - 90)
-
-        draw_text_centered(self.screen, "ENTER: Confirm  |  ESC: Cancel",
-                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
-
-    # ── HOST LOBBY ──
-
-    def _start_host_lobby(self):
-        """Crea el servidor y muestra el lobby del host."""
-        if not self.track_list:
-            return
-        entry = self.track_list[self.track_selected]
-
-        from networking.server import GameServer
-        self.net_server = GameServer()
-        self.net_server.host_name = "Host"
-        self.net_server.track_name = entry["name"]
-        try:
-            self.net_server.start()
-        except OSError as e:
-            self._net_error_msg = f"Cannot start server: {e}"
-            self.net_server = None
-            return
-
-        self.is_host = True
-        self.is_online = True
-        self.my_player_id = 0
-        self._lobby_bot_count = 1
-        self._lobby_players = [(0, "Host")]
-        self.state = STATE_HOST_LOBBY
-
-    def _update_host_lobby(self, dt):
-        """Actualiza lobby del host: broadcast estado cada 0.25s."""
-        if not self.net_server:
-            return
-
-        # Si estamos enviando track data, poll el resultado
-        if self._host_starting_race:
-            if self.net_server.is_track_send_done():
-                self._host_starting_race = False
-                if self.net_server.is_track_send_ok():
-                    self._finish_online_race_start()
-                else:
-                    self._net_error_msg = "Failed to send track data"
-            return
-
-        self.net_server.bot_count = self._lobby_bot_count
-        self._lobby_players = self.net_server.get_player_list()
-
-        # Rate-limit broadcast a ~4/segundo
-        self._lobby_broadcast_timer += dt
-        if self._lobby_broadcast_timer >= 0.25:
-            self._lobby_broadcast_timer = 0.0
-            self.net_server.broadcast_lobby_state()
-
-    def _render_host_lobby(self):
-        """Renderiza pantalla de lobby del host."""
-        self._render_gradient_bg()
-
-        draw_text_centered(self.screen, "HOST LOBBY",
-                           self.font_title, COLOR_YELLOW, 60)
-
-        # IP/puerto o Room Code
-        if self._relay_room_code:
-            draw_text_centered(self.screen, f"Room Code:  {self._relay_room_code}",
-                               self.font_subtitle, COLOR_WHITE, 130)
-            draw_text_centered(self.screen, "(share this code with players)",
-                               self.font_small, COLOR_GRAY, 160)
-        else:
-            ip = self.net_server.get_local_ip() if self.net_server else "..."
-            port = self.net_server.port if self.net_server else NET_DEFAULT_PORT
-            draw_text_centered(self.screen, f"IP: {ip}:{port}",
-                               self.font_subtitle, COLOR_WHITE, 140)
-
-        # Track
-        entry = self.track_list[self.track_selected] if self.track_list else {}
-        draw_text_centered(self.screen, f"Track: {entry.get('name', '?')}",
-                           self.font, COLOR_GRAY, 185)
-
-        # Players
-        y = 240
-        draw_text_centered(self.screen, "Players:", self.font_subtitle,
-                           COLOR_WHITE, y)
-        y += 40
-        for pid, name in self._lobby_players:
-            tag = " (You)" if pid == 0 else ""
-            color = PLAYER_COLORS[pid] if pid < len(PLAYER_COLORS) else COLOR_WHITE
-            draw_text_centered(self.screen, f"P{pid + 1}: {name}{tag}",
-                               self.font, color, y)
-            y += 30
-
-        # Bots
-        y += 10
-        max_bots = MAX_PLAYERS - len(self._lobby_players)
-        self._lobby_bot_count = min(self._lobby_bot_count, max_bots)
-        draw_text_centered(self.screen, f"Bots: < {self._lobby_bot_count} >",
-                           self.font_subtitle, COLOR_WHITE, y)
-        draw_text_centered(self.screen, "UP/DOWN to adjust bots",
-                           self.font_small, COLOR_GRAY, y + 30)
-
-        # Total
-        total = len(self._lobby_players) + self._lobby_bot_count
-        draw_text_centered(self.screen, f"Total racers: {total}/{MAX_PLAYERS}",
-                           self.font, COLOR_GRAY, y + 60)
-
-        # Status message (sending track data, etc.)
-        if self._host_starting_race:
-            draw_text_centered(self.screen, "Sending track data to clients...",
-                               self.font, COLOR_YELLOW, SCREEN_HEIGHT - 90)
-        elif self._net_error_msg:
-            draw_text_centered(self.screen, self._net_error_msg,
-                               self.font, COLOR_RED, SCREEN_HEIGHT - 90)
-
-        # Footer
-        draw_text_centered(self.screen, "ENTER: Start Race  |  ESC: Cancel",
-                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
-
-    def _start_online_race_as_host(self):
-        """Host inicia carrera: envía track data async, luego configura la carrera."""
-        if not self.net_server or not self.track_list:
-            return
-        if self._host_starting_race:
-            return  # Ya está en proceso
-
-        entry = self.track_list[self.track_selected]
-        self.net_server.racing = True
-
-        # Guardar datos del track para uso posterior
-        try:
-            self._pending_track_data = track_manager.load_track(entry["filename"])
-        except (OSError, KeyError):
-            return
-
-        # Enviar track data a clientes de forma async (no bloquea game loop)
-        import json as _json
-        track_json_str = _json.dumps(self._pending_track_data)
-
-        if self.net_server.get_connected_count() > 0:
-            self.net_server.send_track_data_async(track_json_str, timeout=10.0)
-            self._host_starting_race = True
-            self._net_error_msg = "Sending track data..."
-            print("[GAME] Sending track data to clients...")
-        else:
-            # Sin clientes remotos, iniciar directo
-            self._finish_online_race_start()
-
-    def _finish_online_race_start(self):
-        """Segunda fase del inicio: crea autos, envía RACE_START."""
-        data = self._pending_track_data
-        self._pending_track_data = None
-        self._net_error_msg = ""
-
-        # Crear el track localmente
-        if data.get("format") == "tiles":
-            self.track = TileTrack(data)
-        else:
-            self.track = Track(control_points=data["control_points"])
-
-        # Crear autos
-        self.cars = []
-        players = self.net_server.get_player_list()
-        sp = self.track.start_positions
-
-        for i, (pid, name) in enumerate(players):
-            pos_idx = min(i, len(sp) - 1)
-            car = Car(sp[pos_idx][0], sp[pos_idx][1], sp[pos_idx][2],
-                      PLAYER_COLORS[pid % len(PLAYER_COLORS)], pid)
-            car.name = name
-            if pid == 0:
-                self.player_car = car
-            else:
-                car.is_remote = True
-            self.cars.append(car)
-
-        # Bots
-        bot_start_idx = len(players)
-        for b in range(self._lobby_bot_count):
-            bot_pid_visual = bot_start_idx + b
-            pos_idx = min(bot_pid_visual, len(sp) - 1)
-            bot = Car(sp[pos_idx][0], sp[pos_idx][1], sp[pos_idx][2],
-                      PLAYER_COLORS[bot_pid_visual % len(PLAYER_COLORS)],
-                      100 + b)  # bot IDs: 100, 101, ...
-            bot.name = f"Bot {b + 1}"
-            bot.is_bot_car = True
-            bot.acceleration = BOT_ACCELERATION
-            bot.max_speed = BOT_MAX_SPEED
-            bot.turn_speed = BOT_TURN_SPEED
-            self.cars.append(bot)
-
-        # Sistemas
-        self.collision_system = CollisionSystem(self.track)
-        self.ai_system = AISystem(self.track)
-        for car in self.cars:
-            if car.is_bot_car:
-                self.ai_system.register_bot(car)
-
-        # Race progress
-        fl = self.track.finish_line
-        fl_center = ((fl[0][0] + fl[1][0]) / 2, (fl[0][1] + fl[1][1]) / 2)
-        self.race_progress = RaceProgressTracker(
-            self.track.checkpoints, fl_center)
-        for car in self.cars:
-            self.race_progress.register_car(car.player_id)
-
-        # Cámara
-        self.camera.snap_to(self.player_car.x, self.player_car.y,
-                            self.player_car.angle)
-
-        # Power-ups
-        self.powerup_items = [
-            PowerUpItem(p[0], p[1]) for p in self.track.powerup_spawn_points
-        ]
-        self.missiles = []
-        self.oil_slicks = []
-        self.mines = []
-        self.smart_missiles = []
-        self._use_cooldown = 0.0
-
-        # Partículas
-        self.dust_particles = DustParticleSystem()
-        self.skid_marks = SkidMarkSystem()
-
-        # Timer
-        self.race_timer = RaceTimer()
-        self.race_timer.reset()
-        self.winner = None
-        self.final_times = {}
-        self._snapshot_timer = 0.0
-        self._snapshot_seq = 0
-        self._host_last_input_seq = {}
-
-        # Enviar RACE_START a clientes
-        self.net_server.broadcast_race_start(3)
-        print("[GAME] Race starting!")
-
-        # Reset fixed timestep accumulator
-        self._physics_accumulator = 0.0
-
-        # Countdown
-        self._online_countdown_timer = 0.0
-        self._online_countdown_value = 3
-        self.countdown_timer = 0.0
-        self.countdown_value = 3
-        self.state = STATE_ONLINE_COUNTDOWN
 
     def _update_online_countdown(self, dt):
-        """Cuenta regresiva en modo online."""
-        self.countdown_timer += dt
+        """Cuenta regresiva para carrera online."""
+        self._online_countdown_timer += dt
         if self.player_car:
             self.camera.update(self.player_car.x, self.player_car.y,
                                self.player_car.angle, 0, dt)
-
-        if self.countdown_timer >= 1.0:
-            self.countdown_timer -= 1.0
-            self.countdown_value -= 1
-            if self.countdown_value < 0:
+        if self._online_countdown_timer >= 1.0:
+            self._online_countdown_timer -= 1.0
+            self._online_countdown_value -= 1
+            self.countdown_value = self._online_countdown_value
+            if self._online_countdown_value < 0:
                 self.state = STATE_ONLINE_RACING
                 self.race_timer.start()
 
     def _simulate_car_step(self, car, dt):
         """Un paso determinista de simulación de auto.
-        Usada por: host, predicción del cliente, replay.
+        Usada por: predicción del cliente, replay.
         Incluye: effects, física, drift, colisión con muros."""
         car.update_effects(dt)
         self.physics.update(car, dt, self.track)
@@ -2203,6 +1649,27 @@ class Game:
         else:
             self.physics.clear_wall_contact(car)
 
+    def _simulate_car_step_headless(self, car, dt):
+        """Simulation step sin modificar render state.
+        Usado para: predicción local online, replay de reconciliación."""
+        car.update_effects(dt)
+        self.physics.update(car, dt, self.track)
+        car.update_collision_mask()  # rect/mask para colisión, NO render
+        if self.collision_system.check_track_collision(car):
+            if car.is_shielded:
+                car.break_shield()
+                self.collision_system.resolve_track_collision(car)
+                car.speed *= 0.7
+            elif car.has_bounce:
+                normal = self.collision_system.resolve_track_collision(car)
+                self.physics.apply_collision_response(car, normal)
+                car.speed *= 1.3
+            else:
+                normal = self.collision_system.resolve_track_collision(car)
+                self.physics.apply_collision_response(car, normal)
+        else:
+            self.physics.clear_wall_contact(car)
+
     def _smooth_player_render(self, dt):
         """Suavizado visual del auto local. Solo cosmético, no afecta simulación."""
         if not self.player_car:
@@ -2213,218 +1680,6 @@ class Game:
         car.render_y += (car.y - car.render_y) * factor
         angle_diff = (car.angle - car.render_angle + 180) % 360 - 180
         car.render_angle += angle_diff * factor
-
-    def _update_online_racing_host(self, dt):
-        """Update principal del host: fixed timestep accumulator pattern."""
-        keys = pygame.key.get_pressed()
-        self._use_cooldown = max(0, self._use_cooldown - dt)
-
-        # ── Fixed timestep loop ──
-        self._physics_accumulator += dt
-
-        while self._physics_accumulator >= FIXED_DT:
-            # Obtener inputs remotos
-            remote_inputs = self.net_server.get_client_inputs() if self.net_server else {}
-
-            # Detectar slowmo
-            slowmo_owner = None
-            for car in self.cars:
-                if car.has_slowmo:
-                    slowmo_owner = car
-                    break
-
-            for car in self.cars:
-                if car.finished:
-                    continue
-
-                # Input según tipo de auto
-                if car.player_id == 0:
-                    self.input_handler.update(car, keys)
-                elif car.is_remote:
-                    inp = remote_inputs.get(car.player_id)
-                    if inp:
-                        car.reset_inputs()
-                        car.input_accelerate = inp.accel
-                        car.input_turn = inp.turn
-                        car.input_brake = inp.brake
-                        car.input_use_powerup = inp.use_powerup
-                        self._host_last_input_seq[car.player_id] = inp.seq
-                elif car.is_bot_car:
-                    self.ai_system.update(car, FIXED_DT, self.cars)
-
-                # Autopilot sobreescribe
-                if car.has_autopilot:
-                    self._autopilot_steer(car)
-
-                # SlowMo
-                car_dt = FIXED_DT
-                if (slowmo_owner is not None and
-                        car.player_id != slowmo_owner.player_id):
-                    car_dt = FIXED_DT * SLOWMO_FACTOR
-
-                # Simulación unificada (effects + física + colisión muros)
-                self._simulate_car_step(car, car_dt)
-
-                # Checkpoints y vueltas
-                old_laps = car.laps
-                self.collision_system.update_checkpoints(car)
-                if car.laps > old_laps:
-                    if car == self.player_car:
-                        self.race_timer.complete_lap()
-                    if car.laps >= TOTAL_LAPS:
-                        car.finished = True
-                        car.finish_time = self.race_timer.total_time
-                        self.final_times[car.name] = car.finish_time
-                        if self.winner is None:
-                            self.winner = car
-
-                # Progress
-                self.race_progress.update(car)
-
-                # Power-up usage
-                if car.input_use_powerup and car.held_powerup is not None:
-                    if car.player_id != 0 or self._use_cooldown <= 0:
-                        self._activate_powerup(car)
-                        if car.player_id == 0:
-                            self._use_cooldown = 0.3
-
-            # Car vs car (dentro del fixed loop)
-            for i in range(len(self.cars)):
-                for j in range(i + 1, len(self.cars)):
-                    if self.collision_system.check_car_vs_car(
-                            self.cars[i], self.cars[j]):
-                        a, b = self.cars[i], self.cars[j]
-                        if a.is_shielded:
-                            a.break_shield()
-                        elif b.is_shielded:
-                            b.break_shield()
-                        self.collision_system.resolve_car_vs_car(a, b)
-                        a.update_sprite()
-                        b.update_sprite()
-
-            # Recoger power-ups (dentro del fixed loop)
-            for car in self.cars:
-                if car.held_powerup is not None:
-                    continue
-                for idx, item in enumerate(self.powerup_items):
-                    if self.collision_system.check_car_vs_powerup(car, item):
-                        ptype = item.collect()
-                        car.held_powerup = ptype
-                        if self.net_server:
-                            from networking.protocol import pack_powerup_event, PW_EVENT_COLLECT
-                            evt = pack_powerup_event(PW_EVENT_COLLECT, car.player_id,
-                                                     ptype, idx, item.x, item.y)
-                            for _ in range(3):
-                                self.net_server.broadcast(evt)
-                        break
-
-            self._physics_accumulator -= FIXED_DT
-
-        # ── Fuera del fixed loop (usan dt de frame) ──
-
-        # Update power-up items (respawn timers)
-        for item in self.powerup_items:
-            item.update(dt)
-
-        # Missiles
-        for missile in self.missiles:
-            missile.update(dt)
-            if self.collision_system.check_missile_vs_wall(missile):
-                missile.alive = False
-            for car in self.cars:
-                if self.collision_system.check_car_vs_missile(car, missile):
-                    missile.alive = False
-                    if car.is_shielded:
-                        car.break_shield()
-                    else:
-                        car.apply_effect("missile_slow", MISSILE_SLOW_DURATION)
-                        car.speed *= 0.3
-        self.missiles = [m for m in self.missiles if m.alive]
-
-        # Oil slicks
-        for oil in self.oil_slicks:
-            oil.update(dt)
-            for car in self.cars:
-                if car.player_id == oil.owner_id:
-                    continue
-                if self.collision_system.check_car_vs_oil(car, oil):
-                    if "oil_slow" not in car.active_effects:
-                        car.apply_effect("oil_slow", OIL_EFFECT_DURATION)
-        self.oil_slicks = [o for o in self.oil_slicks if o.alive]
-
-        # Mines
-        for mine in self.mines:
-            mine.update(dt)
-            for car in self.cars:
-                if self.collision_system.check_car_vs_mine(car, mine):
-                    mine.alive = False
-                    if car.is_shielded:
-                        car.break_shield()
-                    else:
-                        car.apply_effect("mine_spin", MINE_SPIN_DURATION)
-                        car.speed *= 0.3
-        self.mines = [m for m in self.mines if m.alive]
-
-        # Smart missiles
-        for sm in self.smart_missiles:
-            sm.update(dt)
-            if self.collision_system.check_missile_vs_wall(sm):
-                sm.alive = False
-            for car in self.cars:
-                if self.collision_system.check_car_vs_smart_missile(car, sm):
-                    sm.alive = False
-                    if car.is_shielded:
-                        car.break_shield()
-                    else:
-                        car.apply_effect("missile_slow", MISSILE_SLOW_DURATION)
-                        car.speed *= 0.3
-        self.smart_missiles = [m for m in self.smart_missiles if m.alive]
-
-        # Partículas
-        if self.dust_particles:
-            for car in self.cars:
-                if not car.finished:
-                    self.dust_particles.emit_from_car(car)
-                    self.dust_particles.emit_drift_smoke(car)
-                    self.dust_particles.emit_drift_sparks(car)
-                    self.skid_marks.record_from_car(car)
-            self.dust_particles.update(dt)
-            self.skid_marks.update(dt)
-
-        # Cámara
-        self.camera.update(self.player_car.x, self.player_car.y,
-                           self.player_car.angle, self.player_car.speed, dt)
-
-        # Timer
-        self.race_timer.update(dt)
-
-        # Broadcast snapshot @NET_TICK_RATE
-        self._snapshot_timer += dt
-        if self._snapshot_timer >= 1.0 / NET_TICK_RATE:
-            self._snapshot_timer = 0.0
-            self._broadcast_state_snapshot()
-
-        # Victoria
-        all_finished = all(car.finished for car in self.cars)
-        if all_finished or (self.winner and
-                            self.race_timer.total_time > self.winner.finish_time + 15):
-            self.state = STATE_VICTORY
-
-    def _broadcast_state_snapshot(self):
-        """Empaqueta y envía snapshot de estado a todos los clientes."""
-        if not self.net_server:
-            return
-        from networking.protocol import pack_state_snapshot
-        self._snapshot_seq = (self._snapshot_seq + 1) % 65536
-        data = pack_state_snapshot(
-            self.cars, self.missiles, self.smart_missiles,
-            self.oil_slicks, self.mines, self.powerup_items,
-            self.race_timer.total_time, self._snapshot_seq,
-            last_input_seqs=self._host_last_input_seq,
-        )
-        self.net_server.broadcast(data)
-
-    # ── CLIENT JOIN ──
 
     def _start_join_screen(self):
         """Muestra la pantalla de input de IP."""
@@ -2444,7 +1699,6 @@ class Game:
         if self.net_client._connect_ok:
             self.my_player_id = self.net_client.player_id
             self.is_online = True
-            self.is_host = False
             self.state = STATE_JOIN_LOBBY
             self._net_error_msg = ""
             print(f"[GAME] Connected to host as Player {self.my_player_id + 1}")
@@ -2485,7 +1739,7 @@ class Game:
                            self.font_title, COLOR_YELLOW, 100)
 
         # IP input
-        draw_text_centered(self.screen, "Enter Host IP:",
+        draw_text_centered(self.screen, "Enter Server IP:",
                            self.font_subtitle, COLOR_WHITE, 240)
 
         # Input box
@@ -2522,7 +1776,7 @@ class Game:
             return
 
         if not self.net_client.connected:
-            self._net_error_msg = "Host disconnected"
+            self._net_error_msg = "Server disconnected"
             self._stop_online()
             self.state = STATE_MENU
             return
@@ -2671,6 +1925,8 @@ class Game:
 
         # Reset fixed timestep accumulator
         self._physics_accumulator = 0.0
+        self._client_slowmo_on_me = False
+        self._last_reconcile_seq = -1
 
         self.state = STATE_ONLINE_COUNTDOWN
 
@@ -2681,7 +1937,7 @@ class Game:
 
         # Verificar conexión
         if not self.net_client.connected:
-            self._net_error_msg = "Host disconnected"
+            self._net_error_msg = "Server disconnected"
             self._stop_online()
             self.state = STATE_MENU
             return
@@ -2722,46 +1978,67 @@ class Game:
                     self.player_car.input_accelerate,
                     self.player_car.input_turn,
                     self.player_car.input_brake,
+                    self.player_car.input_use_powerup,
                 )
                 # Limpiar flag de uso después de enviar (one-shot)
                 self.player_car.input_use_powerup = False
 
-                # 2. Predicción local con simulación unificada
-                self._simulate_car_step(self.player_car, FIXED_DT)
+                # 2. Predicción local con simulación headless (no toca render state)
+                predict_dt = FIXED_DT
+                if self._client_slowmo_on_me:
+                    predict_dt = FIXED_DT * SLOWMO_FACTOR
+                self._simulate_car_step_headless(self.player_car, predict_dt)
 
             self._physics_accumulator -= FIXED_DT
 
         # ── Fuera del fixed loop ──
 
-        # 3. Recibir y aplicar estado del servidor
-        prev, curr = self.net_client.get_interpolation_states()
-        if curr:
-            for car_state in curr.cars:
+        # 3A. LOCAL CAR: Reconciliar con snapshot más reciente (sin delay)
+        latest = self.net_client.get_latest_snapshot()
+        if latest:
+            # Solo reconciliar auto local con snapshots NUEVOS (evita jitter por snapshot stale)
+            if latest.seq != self._last_reconcile_seq:
+                self._last_reconcile_seq = latest.seq
+                self._snap_count += 1
+                for car_state in latest.cars:
+                    if car_state.player_id == self.my_player_id:
+                        self._reconcile_local_car(car_state, latest_snapshot=latest)
+                # Actualizar flag SlowMo para predicción local
+                self._client_slowmo_on_me = False
+                for cs in latest.cars:
+                    if cs.player_id != self.my_player_id and "slowmo" in (cs.effects or []):
+                        self._client_slowmo_on_me = True
+                        break
+            # Sincronizar objetos del mundo cada frame (no causan jitter)
+            self._sync_projectiles(latest)
+            self._sync_hazards(latest)
+            self._sync_powerup_items(latest)
+            self.race_timer.total_time = latest.race_time
+
+        # 3B. REMOTE CARS: Interpolar con delay buffer (server time)
+        render_time = self.net_client.get_server_time_now() - NET_INTERPOLATION_DELAY
+        prev_snap, next_snap, t = self.net_client.get_snapshots_for_time(render_time)
+
+        if prev_snap and next_snap:
+            for car_state in next_snap.cars:
                 if car_state.player_id == self.my_player_id:
-                    # Reconciliación del auto propio
-                    self._reconcile_local_car(car_state)
-                else:
-                    # Interpolar autos remotos
+                    continue  # skip local car
+                target_car = self._find_car_by_pid(car_state.player_id)
+                if target_car:
+                    prev_state = self._find_car_state_in_snapshot(
+                        prev_snap, car_state.player_id)
+                    if prev_state:
+                        self._interpolate_car_smooth(target_car, prev_state,
+                                                     car_state, t)
+                    else:
+                        target_car.apply_net_state(car_state)
+        elif next_snap:
+            # No hay par disponible (render_time fuera del buffer) → snap al último
+            for car_state in next_snap.cars:
+                if car_state.player_id != self.my_player_id:
                     target_car = self._find_car_by_pid(car_state.player_id)
                     if target_car:
-                        if prev:
-                            prev_state = self._find_car_state_in_snapshot(
-                                prev, car_state.player_id)
-                            if prev_state:
-                                self._interpolate_car(target_car, prev_state,
-                                                      car_state, prev, curr)
-                            else:
-                                target_car.apply_net_state(car_state)
-                        else:
-                            target_car.apply_net_state(car_state)
-
-            # Sincronizar proyectiles y hazards desde snapshot
-            self._sync_projectiles(curr)
-            self._sync_hazards(curr)
-            self._sync_powerup_items(curr)
-
-            # Update race time from server
-            self.race_timer.total_time = curr.race_time
+                        target_car.apply_net_state(car_state)
 
         # Procesar eventos de power-up
         for event in self.net_client.pop_powerup_events():
@@ -2769,6 +2046,17 @@ class Game:
 
         # Visual smoothing del auto local (cosmético, render → sim gradualmente)
         self._smooth_player_render(dt)
+
+        # Net stats tracking
+        if self._show_net_stats:
+            self._snap_rate_timer += dt
+            if self._snap_rate_timer >= 1.0:
+                self._snap_rate_value = self._snap_count / self._snap_rate_timer
+                self._snap_count = 0
+                self._snap_rate_timer = 0.0
+            self._net_stats['ping'] = self.net_client.get_ping()
+            self._net_stats['snap_rate'] = self._snap_rate_value
+            self._net_stats['input_seq'] = self.net_client._input_seq
 
         # Partículas
         if self.dust_particles:
@@ -2799,11 +2087,11 @@ class Game:
                             self.race_timer.total_time > self.winner.finish_time + 15):
             self.state = STATE_VICTORY
 
-    def _save_input_to_buffer(self, seq, accel, turn, brake):
+    def _save_input_to_buffer(self, seq, accel, turn, brake, use_powerup=False):
         """Guarda un input enviado en el buffer circular para replay."""
         buf = self._input_buffer
         idx = self._input_buffer_head
-        buf[idx] = InputRecord(seq, accel, turn, brake)
+        buf[idx] = InputRecord(seq, accel, turn, brake, use_powerup)
         self._input_buffer_head = (idx + 1) % len(buf)
         if self._input_buffer_count < len(buf):
             self._input_buffer_count += 1
@@ -2829,25 +2117,25 @@ class Game:
                 result.append(record)
         return result
 
-    def _reconcile_local_car(self, server_state):
-        """Reconciliación con input replay (modelo Quake/Source).
+    def _reconcile_local_car(self, server_state, latest_snapshot=None):
+        """Reconciliación autoritativa: overwrite + replay determinístico.
 
-        1. Guarda render position actual (para suavizado visual)
-        2. Sobreescribe estado del auto con estado del servidor
-        3. Re-ejecuta todos los inputs no confirmados con _simulate_car_step
-        4. Restaura render position (el smoothing la moverá gradualmente)
+        1. Guarda render state
+        2. Overwrite completo de sim state desde servidor
+        3. Teleport check (error extremo → snap render también)
+        4. Replay inputs no confirmados
+        5. Restaura render state (visual smoothing lo moverá gradualmente)
         """
         if not self.player_car:
             return
-
         car = self.player_car
 
-        # 0. Guardar render position actual (antes del snap)
-        old_render_x = car.render_x
-        old_render_y = car.render_y
-        old_render_angle = car.render_angle
+        # ── 1. GUARDAR render state ──
+        saved_rx = car.render_x
+        saved_ry = car.render_y
+        saved_ra = car.render_angle
 
-        # 1. Sobreescribir estado completo con el del servidor
+        # ── 2. OVERWRITE COMPLETO de estado sim desde servidor ──
         car.x = server_state.x
         car.y = server_state.y
         car.velocity.x = server_state.vx
@@ -2855,70 +2143,93 @@ class Game:
         car.angle = server_state.angle
         car._wall_normal = None
 
-        # Sincronizar datos discretos
+        # Drift completo
+        car.is_drifting = server_state.is_drifting
+        car.is_countersteer = server_state.is_countersteer
+        car.drift_charge = server_state.drift_charge
+        car.drift_level = server_state.drift_level
+        car.drift_time = server_state.drift_time
+        car.drift_direction = server_state.drift_direction
+        car.drift_mt_boost_timer = server_state.drift_mt_boost_timer
+
+        # Effects con duraciones exactas del servidor
+        if hasattr(server_state, 'effect_durations') and server_state.effect_durations:
+            car.active_effects = {}
+            for ename in server_state.effects:
+                car.active_effects[ename] = server_state.effect_durations.get(ename, 1.0)
+        else:
+            car.active_effects = {}
+            for ename in server_state.effects:
+                car.active_effects[ename] = 1.0
+        car.update_effects(0)  # recalc multipliers sin tickear
+
+        # Discretos
         car.laps = server_state.laps
         car.next_checkpoint_index = server_state.next_checkpoint_index
         car.held_powerup = server_state.held_powerup
         car.finished = server_state.finished
         car.finish_time = server_state.finish_time
 
-        # Sincronizar effects desde el servidor
-        for ename in server_state.effects:
-            if ename not in car.active_effects:
-                car.active_effects[ename] = 1.0  # placeholder duration
-        to_remove = [k for k in car.active_effects if k not in server_state.effects]
-        for k in to_remove:
-            del car.active_effects[k]
-
-        # Sincronizar drift state
-        car.is_drifting = server_state.is_drifting
-        car.is_countersteer = server_state.is_countersteer
-        car.drift_charge = server_state.drift_charge
-        car.drift_level = server_state.drift_level
-
         if car.finished and self.winner is None:
             self.winner = car
             self.final_times[car.name] = car.finish_time
 
-        # 2. Recalcular multipliers sin tickear timers
-        car.update_effects(0)
+        # ── 3. TELEPORT check (error extremo, skip replay) ──
+        dx = saved_rx - car.x
+        dy = saved_ry - car.y
+        pos_error = math.sqrt(dx * dx + dy * dy)
+        if pos_error > NET_TELEPORT_THRESHOLD:
+            car.render_x = car.x
+            car.render_y = car.y
+            car.render_angle = car.angle
+            car.update_collision_mask()
+            return
 
-        # 3. Replay inputs no confirmados con simulación unificada completa
+        # ── 4. REPLAY inputs no confirmados ──
         unacked = self._get_unacked_inputs(server_state.last_input_seq)
 
+        # Determinar dt de replay (SlowMo correction)
+        replay_dt = FIXED_DT
+        if latest_snapshot:
+            for cs in latest_snapshot.cars:
+                if cs.player_id != self.my_player_id and "slowmo" in (cs.effects or []):
+                    replay_dt = FIXED_DT * SLOWMO_FACTOR
+                    break
+
         for inp in unacked:
+            car.reset_inputs()
             car.input_accelerate = inp.accel
             car.input_turn = inp.turn
             car.input_brake = inp.brake
-            car.input_use_powerup = False  # NUNCA replay use_powerup
-            self._simulate_car_step(car, FIXED_DT)
+            car.input_use_powerup = False  # NUNCA replay powerup activation
+            self._simulate_car_step_headless(car, replay_dt)
 
-        # 4. Restaurar render position (no saltar visualmente)
-        # El smoothing en _smooth_player_render moverá render → sim gradualmente
-        car.render_x = old_render_x
-        car.render_y = old_render_y
-        car.render_angle = old_render_angle
+        # ── 5. RESTAURAR render state ──
+        car.render_x = saved_rx
+        car.render_y = saved_ry
+        car.render_angle = saved_ra
+        # Visual smoothing moverá render → sim gradualmente
 
-    def _interpolate_car(self, car, prev_state, curr_state, prev_snap, curr_snap):
-        """Interpola un auto remoto entre dos snapshots.
+        # ── Stats para debug overlay ──
+        if self._show_net_stats:
+            post_error = math.sqrt(
+                (car.x - saved_rx) ** 2 + (car.y - saved_ry) ** 2)
+            self._net_stats['unacked'] = len(unacked)
+            self._net_stats['reconcile_error'] = post_error
+            self._net_stats['last_server_seq'] = server_state.last_input_seq
+            if latest_snapshot:
+                self._net_stats['server_tick'] = latest_snapshot.server_tick
 
-        Usa hermite interpolation para transiciones más suaves que lerp lineal.
-        Si no hay snapshot nuevo, mantiene la última posición (no extrapola).
+    def _interpolate_car_smooth(self, car, prev_state, curr_state, t):
+        """Interpola un auto remoto entre dos estados usando t pre-computado.
+
+        t es la fracción de interpolación [0..1] calculada desde server race_time,
+        haciéndola inmune al jitter de recv_time.
         """
-        import time as _time
-        now = _time.time()
-        dt_snaps = curr_snap.recv_time - prev_snap.recv_time
-        if dt_snaps <= 0.001:
-            car.apply_net_state(curr_state)
-            return
-
-        t = (now - prev_snap.recv_time) / dt_snaps
-        t = max(0.0, min(1.0, t))
-
-        # Smoothstep para suavizar inicio y fin de la interpolación
+        # Smoothstep para ease-in/ease-out
         t_smooth = t * t * (3.0 - 2.0 * t)
 
-        # Lerp posición con smoothstep
+        # Lerp posición
         car.x = prev_state.x + (curr_state.x - prev_state.x) * t_smooth
         car.y = prev_state.y + (curr_state.y - prev_state.y) * t_smooth
         car.velocity.x = curr_state.vx

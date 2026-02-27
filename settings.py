@@ -289,7 +289,6 @@ STATE_TRACK_SELECT = "track_select"
 STATE_TRAINING = "training"
 
 # Online multiplayer states
-STATE_HOST_LOBBY = "host_lobby"
 STATE_JOIN_LOBBY = "join_lobby"
 STATE_CONNECTING = "connecting"
 STATE_ONLINE_RACING = "online_racing"
@@ -355,24 +354,20 @@ TILE_CAT_SPECIAL = "special"       # finish, checkpoints
 # NETWORKING (multiplayer online)
 # ──────────────────────────────────────────────
 NET_DEFAULT_PORT = 5555
-NET_TICK_RATE = 30              # snapshots/segundo del host a clientes
+NET_TICK_RATE = 60              # ticks de simulación por segundo (no snapshots)
+NET_SNAPSHOT_RATE = 30          # snapshots/segundo (broadcast cada 2do tick)
 NET_INPUT_RATE = 60             # inputs/segundo del cliente al host
 NET_TIMEOUT = 5.0               # segundos sin heartbeat → disconnect
 NET_HEARTBEAT_INTERVAL = 1.0    # segundos entre pings
-NET_INTERPOLATION_DELAY = 0.05  # 50ms de buffer para interpolación
-NET_MAX_SNAPSHOT_BUFFER = 10    # snapshots en buffer circular (más para relay)
-NET_RECONCILE_SNAP_DIST = 200.0 # distancia para snap teleport (más alto para relay)
+NET_INTERPOLATION_DELAY = 0.1   # 100ms delay buffer para autos remotos
+NET_MAX_SNAPSHOT_BUFFER = 60    # 2 segundos de snapshots a 30Hz
+NET_TELEPORT_THRESHOLD = 500.0  # distancia para snap teleport (error extremo)
 FIXED_DT = 1.0 / 60.0           # dt fijo para TODA la simulación (host, predicción, replay)
-VISUAL_SMOOTH_RATE = 18.0       # velocidad de suavizado visual residual (mayor = más rápido)
+VISUAL_SMOOTH_RATE = 25.0       # velocidad de suavizado visual residual (mayor = más rápido)
+SERVER_INPUT_QUEUE_SIZE = 32    # max inputs buffered por jugador en el servidor
 
 # ──────────────────────────────────────────────
-# RELAY SERVER (multiplayer por internet)
+# DEDICATED SERVER
 # ──────────────────────────────────────────────
-RELAY_DEFAULT_PORT = 7777
-RELAY_HEARTBEAT_INTERVAL = 3.0
-RELAY_TIMEOUT = 10.0
-ROOM_CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
-
-# Estados relay
-STATE_RELAY_HOST = "relay_host"
-STATE_RELAY_JOIN = "relay_join"
+DEDICATED_AUTO_START_DELAY = 10.0   # segundos antes de auto-start
+DEDICATED_MIN_PLAYERS = 1           # jugadores humanos minimos

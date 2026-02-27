@@ -38,9 +38,16 @@ def load_car_frames(filename: str, frame_size: int = 16,
     Returns:
         Lista de 8 superficies escaladas, una por dirección.
     """
+    scaled_size = frame_size * scale
+    path = os.path.join(ASSETS_DIR, "cars", filename)
+    if not os.path.exists(path):
+        # Headless/server mode: create placeholder surfaces for collision masks
+        placeholder = pygame.Surface((scaled_size, scaled_size), pygame.SRCALPHA)
+        placeholder.fill((255, 255, 255, 255))
+        return [placeholder] * 8
+
     sheet = load_image(os.path.join("cars", filename))
     frames = []
-    scaled_size = frame_size * scale
 
     for i in range(8):
         rect = pygame.Rect(i * frame_size, 0, frame_size, frame_size)

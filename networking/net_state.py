@@ -17,6 +17,7 @@ class NetCarState:
         'drift_charge', 'drift_level',
         'finished', 'finish_time',
         'last_input_seq',
+        'effect_durations', 'drift_time', 'drift_direction', 'drift_mt_boost_timer',
     )
 
     def __init__(self, data=None):
@@ -38,6 +39,10 @@ class NetCarState:
             self.finished = data["finished"]
             self.finish_time = data["finish_time"]
             self.last_input_seq = data.get("last_input_seq", 0)
+            self.effect_durations = data.get("effect_durations", {})
+            self.drift_time = data.get("drift_time", 0.0)
+            self.drift_direction = data.get("drift_direction", 0)
+            self.drift_mt_boost_timer = data.get("drift_mt_boost_timer", 0.0)
         else:
             self.player_id = 0
             self.x = self.y = self.vx = self.vy = self.angle = 0.0
@@ -50,6 +55,10 @@ class NetCarState:
             self.finished = False
             self.finish_time = 0.0
             self.last_input_seq = 0
+            self.effect_durations = {}
+            self.drift_time = 0.0
+            self.drift_direction = 0
+            self.drift_mt_boost_timer = 0.0
 
 
 class NetProjectileState:
@@ -105,12 +114,14 @@ class NetPowerUpItemState:
 
 class StateSnapshot:
     """Estado completo del juego en un instante."""
-    __slots__ = ('seq', 'race_time', 'cars', 'projectiles', 'hazards', 'items', 'recv_time')
+    __slots__ = ('seq', 'race_time', 'server_tick', 'cars', 'projectiles',
+                 'hazards', 'items', 'recv_time')
 
     def __init__(self, data=None):
         if data:
             self.seq = data["seq"]
             self.race_time = data["race_time"]
+            self.server_tick = data.get("server_tick", 0)
             self.cars = [NetCarState(c) for c in data["cars"]]
             self.projectiles = [NetProjectileState(p) for p in data["projectiles"]]
             self.hazards = [NetHazardState(h) for h in data["hazards"]]
@@ -118,6 +129,7 @@ class StateSnapshot:
         else:
             self.seq = 0
             self.race_time = 0.0
+            self.server_tick = 0
             self.cars = []
             self.projectiles = []
             self.hazards = []

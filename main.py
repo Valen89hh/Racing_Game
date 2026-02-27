@@ -20,6 +20,17 @@ if getattr(sys, "frozen", False):
 else:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Dedicated server mode: headless pygame, run server, exit
+if "--dedicated-server" in sys.argv:
+    os.environ['SDL_VIDEODRIVER'] = 'dummy'
+    import pygame
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    sys.argv.remove("--dedicated-server")
+    from server.dedicated_server import main as server_main
+    server_main()
+    sys.exit(0)
+
 # Training subprocess mode: headless pygame, run train_ai, exit
 if "--train-subprocess" in sys.argv:
     os.environ['SDL_VIDEODRIVER'] = 'dummy'

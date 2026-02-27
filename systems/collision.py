@@ -79,7 +79,7 @@ class CollisionSystem:
         for _ in range(self.MAX_SEPARATION_ITERS):
             car.x += nx * self.SEPARATION_STEP
             car.y += ny * self.SEPARATION_STEP
-            car.update_sprite()
+            car.update_collision_mask()
             if not self.track.check_car_collision(car.mask, car.rect):
                 break
 

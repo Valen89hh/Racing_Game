@@ -118,11 +118,13 @@ def unpack_input(data):
 
 
 # ── STATE_SNAPSHOT: H→C ──
-# Cada auto: 28 bytes
+# Cada auto: 41 bytes
 # [pid:1B][x:f][y:f][vx:f][vy:f][angle:f][laps:B][ncp:B]
 # [held_pw:b][effects_mask:H][drift_flags:B][drift_charge:B]
-# [drift_level:B][finished:B][finish_time:f]
-CAR_STATE_FMT = "!BfffffBBbHBBBBfH"
+# [drift_level:B][finished:B][finish_time:f][last_input_seq:H]
+# [drift_time:B][drift_dir:b][drift_mt_boost:B]
+# [10 x effect_duration:B]
+CAR_STATE_FMT = "!BfffffBBbHBBBBfHBbBBBBBBBBBBB"
 CAR_STATE_SIZE = struct.calcsize(CAR_STATE_FMT)
 
 # Effect mask bits
@@ -151,6 +153,12 @@ EFFECT_NAMES = {
 }
 
 EFFECT_TO_BIT = {v: k for k, v in EFFECT_NAMES.items()}
+
+# Orden fijo de efectos para serializar duraciones (10 efectos)
+EFFECT_BIT_ORDER = [
+    "boost", "shield", "oil_slow", "missile_slow", "mine_spin",
+    "emp_slow", "magnet", "slowmo", "bounce", "autopilot",
+]
 
 # Powerup type → byte ID
 POWERUP_TYPE_MAP = {
@@ -187,6 +195,17 @@ def pack_car_state(car, last_input_seq=0):
     drift_flags = (1 if car.is_drifting else 0) | (2 if car.is_countersteer else 0)
     drift_charge_byte = max(0, min(255, int(car.drift_charge * 255)))
 
+    # Drift state sync (resolución 0.01s, max 2.55s)
+    drift_time_byte = max(0, min(255, int(car.drift_time * 100)))
+    drift_dir = max(-1, min(1, car.drift_direction))
+    drift_mt_byte = max(0, min(255, int(car.drift_mt_boost_timer * 100)))
+
+    # Effect durations (resolución 0.1s, max 25.5s)
+    effect_dur_bytes = []
+    for ename in EFFECT_BIT_ORDER:
+        dur = car.active_effects.get(ename, 0.0)
+        effect_dur_bytes.append(max(0, min(255, int(dur * 10))))
+
     return struct.pack(
         CAR_STATE_FMT,
         car.player_id,
@@ -203,6 +222,10 @@ def pack_car_state(car, last_input_seq=0):
         1 if car.finished else 0,
         car.finish_time,
         last_input_seq & 0xFFFF,
+        drift_time_byte,
+        drift_dir,
+        drift_mt_byte,
+        *effect_dur_bytes,
     )
 
 
@@ -211,7 +234,15 @@ def unpack_car_state(data, offset=0):
     vals = struct.unpack_from(CAR_STATE_FMT, data, offset)
     (pid, x, y, vx, vy, angle, laps, ncp,
      held_pw_id, effects_mask, drift_flags, drift_charge_byte,
-     drift_level, finished_byte, finish_time, last_input_seq) = vals
+     drift_level, finished_byte, finish_time, last_input_seq,
+     drift_time_byte, drift_dir, drift_mt_byte,
+     *effect_dur_raw) = vals
+
+    # Decodificar duraciones de efectos
+    effect_durations = {}
+    for i, ename in enumerate(EFFECT_BIT_ORDER):
+        if i < len(effect_dur_raw) and effect_dur_raw[i] > 0:
+            effect_durations[ename] = effect_dur_raw[i] / 10.0
 
     return {
         "player_id": pid,
@@ -229,6 +260,10 @@ def unpack_car_state(data, offset=0):
         "finished": bool(finished_byte),
         "finish_time": finish_time,
         "last_input_seq": last_input_seq,
+        "drift_time": drift_time_byte / 100.0,
+        "drift_direction": drift_dir,
+        "drift_mt_boost_timer": drift_mt_byte / 100.0,
+        "effect_durations": effect_durations,
     }
 
 
@@ -249,13 +284,14 @@ ITEM_FMT = "!BBf"
 ITEM_SIZE = struct.calcsize(ITEM_FMT)
 
 
-def pack_state_snapshot(cars, missiles, smart_missiles, oil_slicks, mines, powerup_items, race_time, seq=0, last_input_seqs=None):
+def pack_state_snapshot(cars, missiles, smart_missiles, oil_slicks, mines, powerup_items, race_time, seq=0, last_input_seqs=None, server_tick=0):
     """Empaqueta snapshot completo del estado del juego."""
     header = _pack_header(PKT_STATE_SNAPSHOT, seq)
 
-    # Race time + counts
-    meta = struct.pack("!fBBBBB",
+    # Race time + server_tick + counts
+    meta = struct.pack("!fIBBBBB",
                        race_time,
+                       server_tick & 0xFFFFFFFF,
                        len(cars),
                        len(missiles) + len(smart_missiles),
                        len(oil_slicks) + len(mines),
@@ -308,9 +344,9 @@ def unpack_state_snapshot(data):
     """Desempaqueta snapshot completo."""
     _, seq, payload = _unpack_header(data)
 
-    meta_fmt = "!fBBBBB"
+    meta_fmt = "!fIBBBBB"
     meta_size = struct.calcsize(meta_fmt)
-    race_time, n_cars, n_proj, n_hazard, n_items, _ = struct.unpack_from(meta_fmt, payload, 0)
+    race_time, server_tick, n_cars, n_proj, n_hazard, n_items, _ = struct.unpack_from(meta_fmt, payload, 0)
     offset = meta_size
 
     cars = []
@@ -352,6 +388,7 @@ def unpack_state_snapshot(data):
     return {
         "seq": seq,
         "race_time": race_time,
+        "server_tick": server_tick,
         "cars": cars,
         "projectiles": projectiles,
         "hazards": hazards,

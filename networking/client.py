@@ -32,15 +32,13 @@ from settings import (
 class GameClient:
     """Cliente UDP para conectarse a un host."""
 
-    def __init__(self, host_ip, port=None, relay_socket=None):
+    def __init__(self, host_ip, port=None):
         self.host_ip = host_ip
         self.port = port or NET_DEFAULT_PORT
         self.host_addr = (host_ip, self.port)
         self.socket = None
         self._running = False
         self._thread = None
-        self._relay_socket = relay_socket  # RelaySocket pre-creado o None
-        self._use_relay = relay_socket is not None
 
         # Estado de conexión (thread-safe)
         self.connected = False
@@ -80,15 +78,15 @@ class GameClient:
         # Input sequence
         self._input_seq = 0
 
+        # Clock offset estimation (server_race_time ↔ client wall-clock)
+        self._clock_offsets = []       # list of (recv_time - race_time) samples
+        self._clock_offset = 0.0       # current estimated offset
+        self._clock_synced = False
+
     def connect_async(self, player_name):
         """Inicia conexión en un hilo separado (no bloquea game loop)."""
-        if self._use_relay:
-            self.socket = self._relay_socket
-            self.socket.start()
-            self.host_addr = ("relay_peer", 0)  # fake addr del host
-        else:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.socket.settimeout(0.1)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.settimeout(0.1)
         self._connect_done = False
         self._connect_ok = False
         self._connect_thread = threading.Thread(
@@ -216,8 +214,18 @@ class GameClient:
         snapshot = StateSnapshot(raw)
         with self._snapshot_lock:
             self._snapshots.append(snapshot)
-            if len(self._snapshots) > NET_MAX_SNAPSHOT_BUFFER:
+            while len(self._snapshots) > NET_MAX_SNAPSHOT_BUFFER:
                 self._snapshots.pop(0)
+
+        # Clock offset estimation (median filter for jitter resistance)
+        if snapshot.race_time > 0:
+            offset = snapshot.recv_time - snapshot.race_time
+            self._clock_offsets.append(offset)
+            if len(self._clock_offsets) > 20:
+                self._clock_offsets.pop(0)
+            sorted_offsets = sorted(self._clock_offsets)
+            self._clock_offset = sorted_offsets[len(sorted_offsets) // 2]
+            self._clock_synced = True
 
     def _handle_lobby_state(self, data):
         lobby = unpack_lobby_state(data)
@@ -298,6 +306,38 @@ class GameClient:
             elif self._snapshots:
                 return None, self._snapshots[-1]
         return None, None
+
+    def get_server_time_now(self):
+        """Estima el race_time actual del servidor basándose en clock offset."""
+        if not self._clock_synced:
+            return 0.0
+        return time.time() - self._clock_offset
+
+    def get_snapshots_for_time(self, render_time):
+        """Busca (prev, next, t) snapshots que encuadran render_time por race_time.
+
+        Returns (prev_snap, next_snap, t) donde t es la fracción de interpolación [0..1].
+        Returns (None, latest, 1.0) si render_time está más allá de todos los snapshots.
+        Returns (None, None, 0.0) si no hay snapshots disponibles.
+        """
+        with self._snapshot_lock:
+            if not self._snapshots:
+                return None, None, 0.0
+
+            # Buscar el par donde a.race_time <= render_time <= b.race_time
+            for i in range(len(self._snapshots) - 1):
+                a = self._snapshots[i]
+                b = self._snapshots[i + 1]
+                if a.race_time <= render_time <= b.race_time:
+                    dt = b.race_time - a.race_time
+                    if dt < 0.001:
+                        return a, b, 1.0
+                    t = (render_time - a.race_time) / dt
+                    return a, b, max(0.0, min(1.0, t))
+
+            # render_time más allá del snapshot más reciente → usar el último
+            latest = self._snapshots[-1]
+            return None, latest, 1.0
 
     def get_ping(self):
         """Retorna ping en ms."""
