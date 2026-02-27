@@ -122,7 +122,7 @@ def unpack_input(data):
 # [pid:1B][x:f][y:f][vx:f][vy:f][angle:f][laps:B][ncp:B]
 # [held_pw:b][effects_mask:H][drift_flags:B][drift_charge:B]
 # [drift_level:B][finished:B][finish_time:f]
-CAR_STATE_FMT = "!BfffffBBbHBBBBf"
+CAR_STATE_FMT = "!BfffffBBbHBBBBfH"
 CAR_STATE_SIZE = struct.calcsize(CAR_STATE_FMT)
 
 # Effect mask bits
@@ -178,7 +178,7 @@ def _decode_effects_mask(mask):
     return effects
 
 
-def pack_car_state(car):
+def pack_car_state(car, last_input_seq=0):
     """Empaqueta estado de un Car para snapshot."""
     held_pw_id = POWERUP_TYPE_MAP.get(car.held_powerup, 0)
     if held_pw_id == 0 and car.held_powerup is not None:
@@ -202,6 +202,7 @@ def pack_car_state(car):
         min(car.drift_level, 255),
         1 if car.finished else 0,
         car.finish_time,
+        last_input_seq & 0xFFFF,
     )
 
 
@@ -210,7 +211,7 @@ def unpack_car_state(data, offset=0):
     vals = struct.unpack_from(CAR_STATE_FMT, data, offset)
     (pid, x, y, vx, vy, angle, laps, ncp,
      held_pw_id, effects_mask, drift_flags, drift_charge_byte,
-     drift_level, finished_byte, finish_time) = vals
+     drift_level, finished_byte, finish_time, last_input_seq) = vals
 
     return {
         "player_id": pid,
@@ -227,6 +228,7 @@ def unpack_car_state(data, offset=0):
         "drift_level": drift_level,
         "finished": bool(finished_byte),
         "finish_time": finish_time,
+        "last_input_seq": last_input_seq,
     }
 
 
@@ -247,7 +249,7 @@ ITEM_FMT = "!BBf"
 ITEM_SIZE = struct.calcsize(ITEM_FMT)
 
 
-def pack_state_snapshot(cars, missiles, smart_missiles, oil_slicks, mines, powerup_items, race_time, seq=0):
+def pack_state_snapshot(cars, missiles, smart_missiles, oil_slicks, mines, powerup_items, race_time, seq=0, last_input_seqs=None):
     """Empaqueta snapshot completo del estado del juego."""
     header = _pack_header(PKT_STATE_SNAPSHOT, seq)
 
@@ -263,7 +265,10 @@ def pack_state_snapshot(cars, missiles, smart_missiles, oil_slicks, mines, power
     # Cars
     car_data = b""
     for car in cars:
-        car_data += pack_car_state(car)
+        lis = 0
+        if last_input_seqs:
+            lis = last_input_seqs.get(car.player_id, 0)
+        car_data += pack_car_state(car, last_input_seq=lis)
 
     # Projectiles
     proj_data = b""

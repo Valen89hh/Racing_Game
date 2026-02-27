@@ -16,6 +16,7 @@ class NetCarState:
         'effects', 'is_drifting', 'is_countersteer',
         'drift_charge', 'drift_level',
         'finished', 'finish_time',
+        'last_input_seq',
     )
 
     def __init__(self, data=None):
@@ -36,6 +37,7 @@ class NetCarState:
             self.drift_level = data["drift_level"]
             self.finished = data["finished"]
             self.finish_time = data["finish_time"]
+            self.last_input_seq = data.get("last_input_seq", 0)
         else:
             self.player_id = 0
             self.x = self.y = self.vx = self.vy = self.angle = 0.0
@@ -47,6 +49,7 @@ class NetCarState:
             self.drift_level = 0
             self.finished = False
             self.finish_time = 0.0
+            self.last_input_seq = 0
 
 
 class NetProjectileState:

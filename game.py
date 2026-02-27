@@ -49,7 +49,8 @@ from settings import (
     AUTOPILOT_DURATION, TELEPORT_DISTANCE,
     SMART_MISSILE_LIFETIME,
     NET_DEFAULT_PORT, NET_TICK_RATE,
-    NET_RECONCILE_SNAP_DIST, NET_RECONCILE_BLEND,
+    NET_RECONCILE_SNAP_DIST, FIXED_DT, VISUAL_SMOOTH_RATE,
+    SLOWMO_FACTOR,
 )
 from entities.car import Car
 from entities.track import Track
@@ -66,6 +67,17 @@ from editor import TileEditor
 from tile_track import TileTrack
 from race_progress import RaceProgressTracker
 import track_manager
+
+
+class InputRecord:
+    """Record de un input enviado al servidor, para replay en reconciliación."""
+    __slots__ = ('seq', 'accel', 'turn', 'brake')
+
+    def __init__(self, seq, accel, turn, brake):
+        self.seq = seq
+        self.accel = accel
+        self.turn = turn
+        self.brake = brake
 
 
 class Game:
@@ -169,6 +181,17 @@ class Game:
         self._relay_status = ""          # estado del relay ("creating", "ready", etc.)
         self._relay_sock = None          # socket UDP temporal para create/join
         self._relay_addr = None          # (ip, port) parsed
+
+        # Fixed timestep accumulator
+        self._physics_accumulator = 0.0
+
+        # Input replay buffer (client-side prediction + reconciliation)
+        self._input_buffer = [None] * 128  # circular buffer of InputRecord
+        self._input_buffer_head = 0
+        self._input_buffer_count = 0
+
+        # Host: track last processed input seq per player
+        self._host_last_input_seq = {}
 
         # Exportar circuito por defecto si no existe
         track_manager.export_default_track()
@@ -956,7 +979,7 @@ class Game:
 
         # Autos
         for car in self.cars:
-            if cam.is_visible(car.x, car.y, 60):
+            if cam.is_visible(car.render_x, car.render_y, 60):
                 car.draw(self.screen, cam)
                 car.draw_powerup_indicator(self.screen, cam)
 
@@ -1161,7 +1184,7 @@ class Game:
 
         # Dibujar puntos de los autos
         for car in self.cars:
-            mx, my = self.track.get_minimap_pos(car.x, car.y)
+            mx, my = self.track.get_minimap_pos(car.render_x, car.render_y)
             pygame.draw.circle(mm, car.color, (mx, my), MINIMAP_CAR_DOT)
             pygame.draw.circle(mm, COLOR_WHITE, (mx, my), MINIMAP_CAR_DOT, 1)
 
@@ -2125,10 +2148,14 @@ class Game:
         self.final_times = {}
         self._snapshot_timer = 0.0
         self._snapshot_seq = 0
+        self._host_last_input_seq = {}
 
         # Enviar RACE_START a clientes
         self.net_server.broadcast_race_start(3)
         print("[GAME] Race starting!")
+
+        # Reset fixed timestep accumulator
+        self._physics_accumulator = 0.0
 
         # Countdown
         self._online_countdown_timer = 0.0
@@ -2151,134 +2178,151 @@ class Game:
                 self.state = STATE_ONLINE_RACING
                 self.race_timer.start()
 
+    def _simulate_car_step(self, car, dt):
+        """Un paso determinista de simulación de auto.
+        Usada por: host, predicción del cliente, replay.
+        Incluye: effects, física, drift, colisión con muros."""
+        car.update_effects(dt)
+        self.physics.update(car, dt, self.track)
+        car.update_sprite()
+        if self.collision_system.check_track_collision(car):
+            if car.is_shielded:
+                car.break_shield()
+                normal = self.collision_system.resolve_track_collision(car)
+                car.speed *= 0.7
+                car.update_sprite()
+            elif car.has_bounce:
+                normal = self.collision_system.resolve_track_collision(car)
+                self.physics.apply_collision_response(car, normal)
+                car.speed *= 1.3
+                car.update_sprite()
+            else:
+                normal = self.collision_system.resolve_track_collision(car)
+                self.physics.apply_collision_response(car, normal)
+                car.update_sprite()
+        else:
+            self.physics.clear_wall_contact(car)
+
+    def _smooth_player_render(self, dt):
+        """Suavizado visual del auto local. Solo cosmético, no afecta simulación."""
+        if not self.player_car:
+            return
+        car = self.player_car
+        factor = 1.0 - math.exp(-VISUAL_SMOOTH_RATE * dt)
+        car.render_x += (car.x - car.render_x) * factor
+        car.render_y += (car.y - car.render_y) * factor
+        angle_diff = (car.angle - car.render_angle + 180) % 360 - 180
+        car.render_angle += angle_diff * factor
+
     def _update_online_racing_host(self, dt):
-        """Update principal del host: lee inputs remotos, simula, broadcast."""
+        """Update principal del host: fixed timestep accumulator pattern."""
         keys = pygame.key.get_pressed()
         self._use_cooldown = max(0, self._use_cooldown - dt)
 
-        # Obtener inputs remotos
-        remote_inputs = self.net_server.get_client_inputs() if self.net_server else {}
+        # ── Fixed timestep loop ──
+        self._physics_accumulator += dt
 
-        # Detectar slowmo
-        slowmo_owner = None
-        for car in self.cars:
-            if car.has_slowmo:
-                slowmo_owner = car
-                break
+        while self._physics_accumulator >= FIXED_DT:
+            # Obtener inputs remotos
+            remote_inputs = self.net_server.get_client_inputs() if self.net_server else {}
 
-        for car in self.cars:
-            if car.finished:
-                continue
-
-            # Input según tipo de auto
-            if car.player_id == 0:
-                # Host: teclado local
-                self.input_handler.update(car, keys)
-            elif car.is_remote:
-                # Cliente remoto: inputs de red
-                inp = remote_inputs.get(car.player_id)
-                if inp:
-                    car.reset_inputs()
-                    car.input_accelerate = inp.accel
-                    car.input_turn = inp.turn
-                    car.input_brake = inp.brake
-                    car.input_use_powerup = inp.use_powerup
-            elif car.is_bot_car:
-                # Bot: IA
-                self.ai_system.update(car, dt, self.cars)
-
-            # Autopilot sobreescribe
-            if car.has_autopilot:
-                self._autopilot_steer(car)
-
-            # Efectos
-            car.update_effects(dt)
-
-            # SlowMo
-            car_dt = dt
-            if (slowmo_owner is not None and
-                    car.player_id != slowmo_owner.player_id):
-                from settings import SLOWMO_FACTOR
-                car_dt = dt * SLOWMO_FACTOR
-
-            # Física
-            self.physics.update(car, car_dt, self.track)
-            car.update_sprite()
-
-            # Colisiones con bordes
-            if self.collision_system.check_track_collision(car):
-                if car.is_shielded:
-                    car.break_shield()
-                    normal = self.collision_system.resolve_track_collision(car)
-                    car.speed *= 0.7
-                    car.update_sprite()
-                elif car.has_bounce:
-                    normal = self.collision_system.resolve_track_collision(car)
-                    self.physics.apply_collision_response(car, normal)
-                    car.speed *= 1.3
-                    car.update_sprite()
-                else:
-                    normal = self.collision_system.resolve_track_collision(car)
-                    self.physics.apply_collision_response(car, normal)
-                    car.update_sprite()
-            else:
-                self.physics.clear_wall_contact(car)
-
-            # Checkpoints y vueltas
-            old_laps = car.laps
-            self.collision_system.update_checkpoints(car)
-            if car.laps > old_laps:
-                if car == self.player_car:
-                    self.race_timer.complete_lap()
-                if car.laps >= TOTAL_LAPS:
-                    car.finished = True
-                    car.finish_time = self.race_timer.total_time
-                    self.final_times[car.name] = car.finish_time
-                    if self.winner is None:
-                        self.winner = car
-
-            # Progress
-            self.race_progress.update(car)
-
-            # Power-up usage
-            if car.input_use_powerup and car.held_powerup is not None:
-                if car.player_id != 0 or self._use_cooldown <= 0:
-                    self._activate_powerup(car)
-                    if car.player_id == 0:
-                        self._use_cooldown = 0.3
-
-        # Car vs car
-        for i in range(len(self.cars)):
-            for j in range(i + 1, len(self.cars)):
-                if self.collision_system.check_car_vs_car(
-                        self.cars[i], self.cars[j]):
-                    a, b = self.cars[i], self.cars[j]
-                    if a.is_shielded:
-                        a.break_shield()
-                    elif b.is_shielded:
-                        b.break_shield()
-                    self.collision_system.resolve_car_vs_car(a, b)
-                    a.update_sprite()
-                    b.update_sprite()
-
-        # Recoger power-ups
-        for car in self.cars:
-            if car.held_powerup is not None:
-                continue
-            for idx, item in enumerate(self.powerup_items):
-                if self.collision_system.check_car_vs_powerup(car, item):
-                    ptype = item.collect()
-                    car.held_powerup = ptype
-                    # Broadcast evento de power-up a clientes
-                    if self.net_server:
-                        from networking.protocol import pack_powerup_event, PW_EVENT_COLLECT
-                        evt = pack_powerup_event(PW_EVENT_COLLECT, car.player_id,
-                                                 ptype, idx, item.x, item.y)
-                        for _ in range(3):
-                            self.net_server.broadcast(evt)
+            # Detectar slowmo
+            slowmo_owner = None
+            for car in self.cars:
+                if car.has_slowmo:
+                    slowmo_owner = car
                     break
 
-        # Update power-up items
+            for car in self.cars:
+                if car.finished:
+                    continue
+
+                # Input según tipo de auto
+                if car.player_id == 0:
+                    self.input_handler.update(car, keys)
+                elif car.is_remote:
+                    inp = remote_inputs.get(car.player_id)
+                    if inp:
+                        car.reset_inputs()
+                        car.input_accelerate = inp.accel
+                        car.input_turn = inp.turn
+                        car.input_brake = inp.brake
+                        car.input_use_powerup = inp.use_powerup
+                        self._host_last_input_seq[car.player_id] = inp.seq
+                elif car.is_bot_car:
+                    self.ai_system.update(car, FIXED_DT, self.cars)
+
+                # Autopilot sobreescribe
+                if car.has_autopilot:
+                    self._autopilot_steer(car)
+
+                # SlowMo
+                car_dt = FIXED_DT
+                if (slowmo_owner is not None and
+                        car.player_id != slowmo_owner.player_id):
+                    car_dt = FIXED_DT * SLOWMO_FACTOR
+
+                # Simulación unificada (effects + física + colisión muros)
+                self._simulate_car_step(car, car_dt)
+
+                # Checkpoints y vueltas
+                old_laps = car.laps
+                self.collision_system.update_checkpoints(car)
+                if car.laps > old_laps:
+                    if car == self.player_car:
+                        self.race_timer.complete_lap()
+                    if car.laps >= TOTAL_LAPS:
+                        car.finished = True
+                        car.finish_time = self.race_timer.total_time
+                        self.final_times[car.name] = car.finish_time
+                        if self.winner is None:
+                            self.winner = car
+
+                # Progress
+                self.race_progress.update(car)
+
+                # Power-up usage
+                if car.input_use_powerup and car.held_powerup is not None:
+                    if car.player_id != 0 or self._use_cooldown <= 0:
+                        self._activate_powerup(car)
+                        if car.player_id == 0:
+                            self._use_cooldown = 0.3
+
+            # Car vs car (dentro del fixed loop)
+            for i in range(len(self.cars)):
+                for j in range(i + 1, len(self.cars)):
+                    if self.collision_system.check_car_vs_car(
+                            self.cars[i], self.cars[j]):
+                        a, b = self.cars[i], self.cars[j]
+                        if a.is_shielded:
+                            a.break_shield()
+                        elif b.is_shielded:
+                            b.break_shield()
+                        self.collision_system.resolve_car_vs_car(a, b)
+                        a.update_sprite()
+                        b.update_sprite()
+
+            # Recoger power-ups (dentro del fixed loop)
+            for car in self.cars:
+                if car.held_powerup is not None:
+                    continue
+                for idx, item in enumerate(self.powerup_items):
+                    if self.collision_system.check_car_vs_powerup(car, item):
+                        ptype = item.collect()
+                        car.held_powerup = ptype
+                        if self.net_server:
+                            from networking.protocol import pack_powerup_event, PW_EVENT_COLLECT
+                            evt = pack_powerup_event(PW_EVENT_COLLECT, car.player_id,
+                                                     ptype, idx, item.x, item.y)
+                            for _ in range(3):
+                                self.net_server.broadcast(evt)
+                        break
+
+            self._physics_accumulator -= FIXED_DT
+
+        # ── Fuera del fixed loop (usan dt de frame) ──
+
+        # Update power-up items (respawn timers)
         for item in self.powerup_items:
             item.update(dt)
 
@@ -2375,7 +2419,8 @@ class Game:
         data = pack_state_snapshot(
             self.cars, self.missiles, self.smart_missiles,
             self.oil_slicks, self.mines, self.powerup_items,
-            self.race_timer.total_time, self._snapshot_seq
+            self.race_timer.total_time, self._snapshot_seq,
+            last_input_seqs=self._host_last_input_seq,
         )
         self.net_server.broadcast(data)
 
@@ -2618,10 +2663,19 @@ class Game:
         # Countdown
         self.countdown_timer = 0.0
         self.countdown_value = self.net_client.countdown
+
+        # Resetear input replay buffer
+        self._input_buffer = [None] * 128
+        self._input_buffer_head = 0
+        self._input_buffer_count = 0
+
+        # Reset fixed timestep accumulator
+        self._physics_accumulator = 0.0
+
         self.state = STATE_ONLINE_COUNTDOWN
 
     def _update_online_racing_client(self, dt):
-        """Update del cliente: envía inputs, predicción local, interpolación."""
+        """Update del cliente: fixed timestep + predicción + render smoothing."""
         if not self.net_client:
             return
 
@@ -2635,56 +2689,49 @@ class Game:
         keys = pygame.key.get_pressed()
         self._use_cooldown = max(0, self._use_cooldown - dt)
 
-        # 1. Input local (siempre WASD+Space para el jugador local)
-        if self.player_car and not self.player_car.finished:
-            # Preservar use_powerup del click (se setea en _handle_events)
-            pending_use_pw = self.player_car.input_use_powerup
-            self.player_car.reset_inputs()
-            self.player_car.input_use_powerup = pending_use_pw
-            if keys[pygame.K_w]:
-                self.player_car.input_accelerate = 1.0
-            elif keys[pygame.K_s]:
-                self.player_car.input_accelerate = -1.0
-            if keys[pygame.K_a]:
-                self.player_car.input_turn -= 1.0
-            if keys[pygame.K_d]:
-                self.player_car.input_turn += 1.0
-            if keys[pygame.K_SPACE]:
-                self.player_car.input_brake = True
+        # ── Fixed timestep loop para predicción local ──
+        self._physics_accumulator += dt
 
-            # Enviar input al servidor
-            self.net_client.send_input(
-                self.player_car.input_accelerate,
-                self.player_car.input_turn,
-                self.player_car.input_brake,
-                self.player_car.input_use_powerup,
-            )
-            # Limpiar flag de uso después de enviar (one-shot)
-            self.player_car.input_use_powerup = False
+        while self._physics_accumulator >= FIXED_DT:
+            # 1. Input local
+            if self.player_car and not self.player_car.finished:
+                pending_use_pw = self.player_car.input_use_powerup
+                self.player_car.reset_inputs()
+                self.player_car.input_use_powerup = pending_use_pw
+                if keys[pygame.K_w]:
+                    self.player_car.input_accelerate = 1.0
+                elif keys[pygame.K_s]:
+                    self.player_car.input_accelerate = -1.0
+                if keys[pygame.K_a]:
+                    self.player_car.input_turn -= 1.0
+                if keys[pygame.K_d]:
+                    self.player_car.input_turn += 1.0
+                if keys[pygame.K_SPACE]:
+                    self.player_car.input_brake = True
 
-            # 2. Predicción local del auto propio (física completa)
-            self.player_car.update_effects(dt)
-            self.physics.update(self.player_car, dt, self.track)
-            self.player_car.update_sprite()
+                # Enviar input al servidor
+                self.net_client.send_input(
+                    self.player_car.input_accelerate,
+                    self.player_car.input_turn,
+                    self.player_car.input_brake,
+                    self.player_car.input_use_powerup,
+                )
+                # Guardar input en buffer para replay en reconciliación
+                self._save_input_to_buffer(
+                    self.net_client._input_seq,
+                    self.player_car.input_accelerate,
+                    self.player_car.input_turn,
+                    self.player_car.input_brake,
+                )
+                # Limpiar flag de uso después de enviar (one-shot)
+                self.player_car.input_use_powerup = False
 
-            # Colisiones locales
-            if self.collision_system.check_track_collision(self.player_car):
-                if self.player_car.is_shielded:
-                    self.player_car.break_shield()
-                    normal = self.collision_system.resolve_track_collision(self.player_car)
-                    self.player_car.speed *= 0.7
-                    self.player_car.update_sprite()
-                elif self.player_car.has_bounce:
-                    normal = self.collision_system.resolve_track_collision(self.player_car)
-                    self.physics.apply_collision_response(self.player_car, normal)
-                    self.player_car.speed *= 1.3
-                    self.player_car.update_sprite()
-                else:
-                    normal = self.collision_system.resolve_track_collision(self.player_car)
-                    self.physics.apply_collision_response(self.player_car, normal)
-                    self.player_car.update_sprite()
-            else:
-                self.physics.clear_wall_contact(self.player_car)
+                # 2. Predicción local con simulación unificada
+                self._simulate_car_step(self.player_car, FIXED_DT)
+
+            self._physics_accumulator -= FIXED_DT
+
+        # ── Fuera del fixed loop ──
 
         # 3. Recibir y aplicar estado del servidor
         prev, curr = self.net_client.get_interpolation_states()
@@ -2698,7 +2745,6 @@ class Game:
                     target_car = self._find_car_by_pid(car_state.player_id)
                     if target_car:
                         if prev:
-                            # Interpolar entre prev y curr
                             prev_state = self._find_car_state_in_snapshot(
                                 prev, car_state.player_id)
                             if prev_state:
@@ -2721,6 +2767,9 @@ class Game:
         for event in self.net_client.pop_powerup_events():
             self._handle_remote_powerup_event(event)
 
+        # Visual smoothing del auto local (cosmético, render → sim gradualmente)
+        self._smooth_player_render(dt)
+
         # Partículas
         if self.dust_particles:
             for car in self.cars:
@@ -2732,10 +2781,10 @@ class Game:
             self.dust_particles.update(dt)
             self.skid_marks.update(dt)
 
-        # Cámara
+        # Cámara (sigue render position para suavidad visual)
         if self.player_car:
-            self.camera.update(self.player_car.x, self.player_car.y,
-                               self.player_car.angle, self.player_car.speed, dt)
+            self.camera.update(self.player_car.render_x, self.player_car.render_y,
+                               self.player_car.render_angle, self.player_car.speed, dt)
 
         # Timer
         self.race_timer.update(dt)
@@ -2750,70 +2799,128 @@ class Game:
                             self.race_timer.total_time > self.winner.finish_time + 15):
             self.state = STATE_VICTORY
 
+    def _save_input_to_buffer(self, seq, accel, turn, brake):
+        """Guarda un input enviado en el buffer circular para replay."""
+        buf = self._input_buffer
+        idx = self._input_buffer_head
+        buf[idx] = InputRecord(seq, accel, turn, brake)
+        self._input_buffer_head = (idx + 1) % len(buf)
+        if self._input_buffer_count < len(buf):
+            self._input_buffer_count += 1
+
+    def _get_unacked_inputs(self, server_seq):
+        """Retorna inputs no confirmados (seq > server_seq) en orden cronológico.
+
+        Usa half-space technique para uint16 wrapping:
+        diff = (record.seq - server_seq) & 0xFFFF; si 0 < diff < 32768 → posterior.
+        """
+        result = []
+        buf = self._input_buffer
+        buf_len = len(buf)
+        count = self._input_buffer_count
+        # Start from oldest entry in the circular buffer
+        start = (self._input_buffer_head - count) % buf_len
+        for i in range(count):
+            record = buf[(start + i) % buf_len]
+            if record is None:
+                continue
+            diff = (record.seq - server_seq) & 0xFFFF
+            if 0 < diff < 32768:
+                result.append(record)
+        return result
+
     def _reconcile_local_car(self, server_state):
-        """Corrección suave del auto local basándose en estado del servidor."""
+        """Reconciliación con input replay (modelo Quake/Source).
+
+        1. Guarda render position actual (para suavizado visual)
+        2. Sobreescribe estado del auto con estado del servidor
+        3. Re-ejecuta todos los inputs no confirmados con _simulate_car_step
+        4. Restaura render position (el smoothing la moverá gradualmente)
+        """
         if not self.player_car:
             return
 
-        dx = server_state.x - self.player_car.x
-        dy = server_state.y - self.player_car.y
-        dist = math.hypot(dx, dy)
+        car = self.player_car
 
-        if dist > NET_RECONCILE_SNAP_DIST:
-            # Teleport
-            self.player_car.x = server_state.x
-            self.player_car.y = server_state.y
-            self.player_car.velocity.x = server_state.vx
-            self.player_car.velocity.y = server_state.vy
-            self.player_car.angle = server_state.angle
-            # Limpiar estado de colisión local para evitar bloqueo
-            self.player_car._wall_normal = None
-        elif dist > 2.0:
-            # Blend suave
-            self.player_car.x += dx * NET_RECONCILE_BLEND
-            self.player_car.y += dy * NET_RECONCILE_BLEND
+        # 0. Guardar render position actual (antes del snap)
+        old_render_x = car.render_x
+        old_render_y = car.render_y
+        old_render_angle = car.render_angle
 
-        # Siempre sincronizar velocidad y ángulo del servidor
-        # Esto evita que colisiones locales divergentes bloqueen al auto
-        self.player_car.velocity.x += (server_state.vx - self.player_car.velocity.x) * NET_RECONCILE_BLEND
-        self.player_car.velocity.y += (server_state.vy - self.player_car.velocity.y) * NET_RECONCILE_BLEND
-        angle_diff = (server_state.angle - self.player_car.angle + 180) % 360 - 180
-        self.player_car.angle = (self.player_car.angle + angle_diff * NET_RECONCILE_BLEND) % 360
+        # 1. Sobreescribir estado completo con el del servidor
+        car.x = server_state.x
+        car.y = server_state.y
+        car.velocity.x = server_state.vx
+        car.velocity.y = server_state.vy
+        car.angle = server_state.angle
+        car._wall_normal = None
 
-        # Si el servidor dice que no hay colisión (el auto se mueve normalmente),
-        # limpiar wall_normal local para no bloquear aceleración
-        server_speed = math.hypot(server_state.vx, server_state.vy)
-        if server_speed > 30.0:
-            self.player_car._wall_normal = None
+        # Sincronizar datos discretos
+        car.laps = server_state.laps
+        car.next_checkpoint_index = server_state.next_checkpoint_index
+        car.held_powerup = server_state.held_powerup
+        car.finished = server_state.finished
+        car.finish_time = server_state.finish_time
 
-        # Siempre sincronizar datos discretos
-        self.player_car.laps = server_state.laps
-        self.player_car.next_checkpoint_index = server_state.next_checkpoint_index
-        self.player_car.held_powerup = server_state.held_powerup
-        self.player_car.finished = server_state.finished
-        self.player_car.finish_time = server_state.finish_time
+        # Sincronizar effects desde el servidor
+        for ename in server_state.effects:
+            if ename not in car.active_effects:
+                car.active_effects[ename] = 1.0  # placeholder duration
+        to_remove = [k for k in car.active_effects if k not in server_state.effects]
+        for k in to_remove:
+            del car.active_effects[k]
 
-        if self.player_car.finished and self.winner is None:
-            self.winner = self.player_car
-            self.final_times[self.player_car.name] = self.player_car.finish_time
+        # Sincronizar drift state
+        car.is_drifting = server_state.is_drifting
+        car.is_countersteer = server_state.is_countersteer
+        car.drift_charge = server_state.drift_charge
+        car.drift_level = server_state.drift_level
 
-        self.player_car.update_sprite()
+        if car.finished and self.winner is None:
+            self.winner = car
+            self.final_times[car.name] = car.finish_time
+
+        # 2. Recalcular multipliers sin tickear timers
+        car.update_effects(0)
+
+        # 3. Replay inputs no confirmados con simulación unificada completa
+        unacked = self._get_unacked_inputs(server_state.last_input_seq)
+
+        for inp in unacked:
+            car.input_accelerate = inp.accel
+            car.input_turn = inp.turn
+            car.input_brake = inp.brake
+            car.input_use_powerup = False  # NUNCA replay use_powerup
+            self._simulate_car_step(car, FIXED_DT)
+
+        # 4. Restaurar render position (no saltar visualmente)
+        # El smoothing en _smooth_player_render moverá render → sim gradualmente
+        car.render_x = old_render_x
+        car.render_y = old_render_y
+        car.render_angle = old_render_angle
 
     def _interpolate_car(self, car, prev_state, curr_state, prev_snap, curr_snap):
-        """Interpola un auto remoto entre dos snapshots."""
+        """Interpola un auto remoto entre dos snapshots.
+
+        Usa hermite interpolation para transiciones más suaves que lerp lineal.
+        Si no hay snapshot nuevo, mantiene la última posición (no extrapola).
+        """
         import time as _time
         now = _time.time()
         dt_snaps = curr_snap.recv_time - prev_snap.recv_time
-        if dt_snaps <= 0:
+        if dt_snaps <= 0.001:
             car.apply_net_state(curr_state)
             return
 
-        t = min(1.0, (now - curr_snap.recv_time) / dt_snaps + 1.0)
+        t = (now - prev_snap.recv_time) / dt_snaps
         t = max(0.0, min(1.0, t))
 
-        # Lerp posición
-        car.x = prev_state.x + (curr_state.x - prev_state.x) * t
-        car.y = prev_state.y + (curr_state.y - prev_state.y) * t
+        # Smoothstep para suavizar inicio y fin de la interpolación
+        t_smooth = t * t * (3.0 - 2.0 * t)
+
+        # Lerp posición con smoothstep
+        car.x = prev_state.x + (curr_state.x - prev_state.x) * t_smooth
+        car.y = prev_state.y + (curr_state.y - prev_state.y) * t_smooth
         car.velocity.x = curr_state.vx
         car.velocity.y = curr_state.vy
 
@@ -2821,7 +2928,7 @@ class Game:
         a1 = prev_state.angle % 360
         a2 = curr_state.angle % 360
         diff = (a2 - a1 + 180) % 360 - 180
-        car.angle = (a1 + diff * t) % 360
+        car.angle = (a1 + diff * t_smooth) % 360
 
         # Datos discretos: snap al más reciente
         car.laps = curr_state.laps

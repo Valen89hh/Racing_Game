@@ -54,6 +54,11 @@ class Car:
         self.angle = angle
         self.velocity = pygame.math.Vector2(0.0, 0.0)
 
+        # Render state (separado de sim para suavizado visual en online)
+        self.render_x = x
+        self.render_y = y
+        self.render_angle = angle
+
         # Identificador
         self.player_id = player_id
         self.color = color
@@ -269,6 +274,10 @@ class Car:
         )
         self.rect = self.surface.get_rect(center=(self.x, self.y))
         self.mask = pygame.mask.from_surface(self.surface)
+        # Sync render state (offline y autos remotos: render = sim)
+        self.render_x = self.x
+        self.render_y = self.y
+        self.render_angle = self.angle
 
     def get_forward_vector(self) -> tuple[float, float]:
         """Retorna el vector de dirección frontal del auto."""
@@ -323,10 +332,10 @@ class Car:
 
     def draw(self, surface: pygame.Surface, camera):
         """Dibuja el auto en pantalla usando el sprite pixel art rotado."""
-        sx, sy = camera.world_to_screen(self.x, self.y)
+        sx, sy = camera.world_to_screen(self.render_x, self.render_y)
 
         # Rotar sprite según ángulo relativo a la cámara
-        screen_ang = camera.screen_angle(self.angle)
+        screen_ang = camera.screen_angle(self.render_angle)
         rotated = pygame.transform.rotate(self.original_surface, -screen_ang)
         rect = rotated.get_rect(center=(int(sx), int(sy)))
         surface.blit(rotated, rect)
@@ -404,7 +413,7 @@ class Car:
         if self.held_powerup is None:
             return
 
-        sx, sy = camera.world_to_screen(self.x, self.y)
+        sx, sy = camera.world_to_screen(self.render_x, self.render_y)
         ix = int(sx)
         iy = int(sy) - 28
 

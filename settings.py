@@ -360,9 +360,10 @@ NET_INPUT_RATE = 60             # inputs/segundo del cliente al host
 NET_TIMEOUT = 5.0               # segundos sin heartbeat → disconnect
 NET_HEARTBEAT_INTERVAL = 1.0    # segundos entre pings
 NET_INTERPOLATION_DELAY = 0.05  # 50ms de buffer para interpolación
-NET_MAX_SNAPSHOT_BUFFER = 5     # snapshots en buffer circular
-NET_RECONCILE_SNAP_DIST = 100.0 # distancia para snap teleport
-NET_RECONCILE_BLEND = 0.2      # factor de blend hacia servidor
+NET_MAX_SNAPSHOT_BUFFER = 10    # snapshots en buffer circular (más para relay)
+NET_RECONCILE_SNAP_DIST = 200.0 # distancia para snap teleport (más alto para relay)
+FIXED_DT = 1.0 / 60.0           # dt fijo para TODA la simulación (host, predicción, replay)
+VISUAL_SMOOTH_RATE = 18.0       # velocidad de suavizado visual residual (mayor = más rápido)
 
 # ──────────────────────────────────────────────
 # RELAY SERVER (multiplayer por internet)
