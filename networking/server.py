@@ -46,11 +46,13 @@ class ClientInfo:
 class GameServer:
     """Servidor UDP para partida multijugador."""
 
-    def __init__(self, port=None):
+    def __init__(self, port=None, relay_socket=None):
         self.port = port or NET_DEFAULT_PORT
         self.socket = None
         self._running = False
         self._thread = None
+        self._relay_socket = relay_socket  # RelaySocket pre-creado o None
+        self._use_relay = relay_socket is not None
 
         # Clientes conectados: addr → ClientInfo
         self._clients = {}
@@ -80,26 +82,40 @@ class GameServer:
 
     def start(self):
         """Inicia el servidor en un hilo daemon."""
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.socket.bind(("0.0.0.0", self.port))
-        self.socket.settimeout(0.1)
+        if self._use_relay:
+            self.socket = self._relay_socket
+            self.socket.start()
+            print(f"[SERVER] Started via relay room={self.socket.room_code}")
+        else:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.socket.bind(("0.0.0.0", self.port))
+            self.socket.settimeout(0.1)
+            print(f"[SERVER] Started on port {self.port}")
 
         self._running = True
         self._thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._thread.start()
-        print(f"[SERVER] Started on port {self.port}")
 
     def stop(self):
         """Para el servidor y cierra el socket."""
         self._running = False
         # Notificar a todos los clientes
-        with self._clients_lock:
-            for client in self._clients.values():
+        if self.socket:
+            if self._use_relay:
+                # En relay, broadcast disconnect y luego cerrar
                 try:
-                    self.socket.sendto(pack_disconnect(), client.addr)
-                except OSError:
+                    self.socket.sendto_broadcast(pack_disconnect())
+                except (OSError, AttributeError):
                     pass
+            else:
+                with self._clients_lock:
+                    for client in self._clients.values():
+                        try:
+                            self.socket.sendto(pack_disconnect(), client.addr)
+                        except OSError:
+                            pass
+        with self._clients_lock:
             self._clients.clear()
         if self._thread:
             self._thread.join(timeout=2)
@@ -261,13 +277,23 @@ class GameServer:
 
     def broadcast(self, data):
         """Envía datos a todos los clientes conectados."""
-        with self._clients_lock:
-            addrs = [c.addr for c in self._clients.values() if c.connected]
-        for addr in addrs:
+        if self._use_relay:
+            # Relay broadcast: un solo paquete con target=0xFF
+            with self._clients_lock:
+                if not self._clients:
+                    return
             try:
-                self.socket.sendto(data, addr)
+                self.socket.sendto_broadcast(data)
             except OSError:
                 pass
+        else:
+            with self._clients_lock:
+                addrs = [c.addr for c in self._clients.values() if c.connected]
+            for addr in addrs:
+                try:
+                    self.socket.sendto(data, addr)
+                except OSError:
+                    pass
 
     def broadcast_lobby_state(self):
         """Broadcast estado actual del lobby."""

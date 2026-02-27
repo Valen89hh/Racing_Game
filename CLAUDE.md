@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-**2D top-down arcade racing game** built with **Pygame** (Python 3.12+). Features a tile-based track editor, AI opponents, power-ups, dust particles, and a rotating camera system. The game supports two track formats: classic (control points + Chaikin smoothing) and tile-based (painted grid).
+**2D top-down arcade racing game** built with **Pygame** (Python 3.12+). Features a tile-based track editor, AI opponents, power-ups, dust particles, a rotating camera system, and multiplayer via LAN or internet relay. The game supports two track formats: classic (control points + Chaikin smoothing) and tile-based (painted grid).
 
-**Current version:** 1.1.0
+**Current version:** 1.2.0
 **Entry point:** `python main.py`
 
 ## Directory Structure
@@ -12,13 +12,26 @@
 ```
 racing_game/
 ├── main.py              (~40 lines)  - Entry point + --train-subprocess routing
-├── game.py              (~1100 lines) - Game loop, state machine, orchestration
-├── settings.py          (~235 lines) - All configuration constants
+├── game.py              (~1300 lines) - Game loop, state machine, orchestration
+├── settings.py          (~250 lines) - All configuration constants
 ├── track_manager.py     (~170 lines) - Track file I/O (JSON save/load)
 ├── tile_track.py        (~350 lines) - Tile-based track (TileTrack class)
 ├── tile_defs.py         (312 lines) - Tile definitions, classification, sprites
 ├── editor.py           (~1200 lines) - Tile editor (TileEditor class)
 ├── version.txt                      - Current version number (e.g. "1.0.1")
+│
+├── networking/
+│   ├── __init__.py                  - Package marker
+│   ├── protocol.py      (~475 lines) - Binary UDP protocol (pack/unpack all packet types)
+│   ├── net_state.py     (~100 lines) - Data classes (NetCarState, StateSnapshot, InputState)
+│   ├── server.py        (~400 lines) - GameServer (host-side UDP, supports LAN + relay)
+│   ├── client.py        (~330 lines) - GameClient (client-side UDP, supports LAN + relay)
+│   ├── relay_protocol.py (~120 lines) - Relay binary protocol (room commands + forwarding)
+│   └── relay_socket.py  (~210 lines) - RelaySocket drop-in adapter for transparent relay
+│
+├── relay_server/
+│   ├── relay_server.py  (~250 lines) - Standalone relay server (stdlib only, Python 3.8+)
+│   └── README.md                    - VPS deploy instructions
 │
 ├── entities/
 │   ├── car.py           (264 lines) - Car entity (physics, sprites, effects)
@@ -83,11 +96,19 @@ racing_game/
 STATE_MENU → STATE_TRACK_SELECT → STATE_COUNTDOWN → STATE_RACING → STATE_VICTORY
                   ↓ (T key)
               STATE_TRAINING → (subprocess trains RL model) → back to track select
-                                                                         ↓
+
 STATE_MENU → STATE_EDITOR → (test race) → STATE_COUNTDOWN → ... → back to editor
+
+Multiplayer LAN:
+  Track Select → H → STATE_HOST_LOBBY → ENTER → STATE_ONLINE_COUNTDOWN → STATE_ONLINE_RACING
+  Menu → J → STATE_CONNECTING → STATE_JOIN_LOBBY → STATE_ONLINE_COUNTDOWN → STATE_ONLINE_RACING
+
+Multiplayer Relay (internet):
+  Track Select → R → STATE_RELAY_HOST → create room → STATE_HOST_LOBBY → (same as LAN)
+  Menu → R → STATE_RELAY_JOIN → enter code → STATE_CONNECTING → (same as LAN)
 ```
 
-States defined in `settings.py`: `STATE_MENU`, `STATE_COUNTDOWN`, `STATE_RACING`, `STATE_VICTORY`, `STATE_EDITOR`, `STATE_TRACK_SELECT`, `STATE_TRAINING`.
+States defined in `settings.py`: `STATE_MENU`, `STATE_COUNTDOWN`, `STATE_RACING`, `STATE_VICTORY`, `STATE_EDITOR`, `STATE_TRACK_SELECT`, `STATE_TRAINING`, `STATE_HOST_LOBBY`, `STATE_JOIN_LOBBY`, `STATE_CONNECTING`, `STATE_ONLINE_RACING`, `STATE_ONLINE_COUNTDOWN`, `STATE_RELAY_HOST`, `STATE_RELAY_JOIN`.
 
 ### Entity-System Pattern
 
@@ -129,6 +150,8 @@ METHODS:    draw(surface, camera), check_car_collision(mask, rect),
 - **Laps:** 3 per race
 - **Power-ups:** Boost (3s), Shield (12s), Missile (700px/s), Oil (8s on ground)
 - **Dust particles:** pool=120, threshold=80px/s, lifetime=0.3-0.8s, alpha fade+shrink
+- **Networking:** port=5555 (LAN), tick_rate=30Hz, input_rate=60Hz, timeout=5s
+- **Relay:** port=7777, heartbeat=3s, peer_timeout=10s, room_code=4 chars
 
 ## Tile System (tile_defs.py)
 
@@ -348,6 +371,78 @@ path = os.path.join(TRACKS_DIR, filename)
 - UI shows last 3 lines of the traceback + path to the full log file
 - `train_ai.main()` wraps all logic in a global try/except that writes errors to both stderr and the JSON progress file
 
+## Relay System (Multiplayer por Internet)
+
+### Architecture
+```
+HOST ──UDP──► RELAY SERVER (VPS:7777) ◄──UDP── CLIENT
+              reenvía paquetes
+              salas con código 4 chars
+```
+Both host and client connect **outbound** to the relay → works with any NAT/firewall. The relay does NOT process game logic, only forwards packets. LAN mode (H/J keys) still works without relay.
+
+### Relay Protocol (`networking/relay_protocol.py`)
+Wraps existing game packets with a 6-byte header:
+```
+Game packet:   [pkt_type:1B][seq:2B][game_data...]
+Relay packet:  [RELAY_CMD:1B][ROOM:4B][TARGET:1B][game_data...]
+```
+
+| Byte | Command | Description |
+|------|---------|-------------|
+| 0xA0 | CREATE_ROOM | Host creates room |
+| 0xA1 | ROOM_CREATED | Returns room code |
+| 0xA2 | JOIN_ROOM | Client joins with code |
+| 0xA3 | JOIN_OK | Accepted, returns slot |
+| 0xA4 | JOIN_FAIL | Room not found/full |
+| 0xA5 | LEAVE_ROOM | Exit room |
+| 0xA6 | PEER_LEFT | Notification of disconnect |
+| 0xA7 | HEARTBEAT | Keepalive (every 3s) |
+| 0xA8 | FORWARD | Game packet forwarding |
+
+Room codes: 4 alphanumeric chars (A-Z+2-9, no confusables 0/O/1/I/L). 31^4 = 923K combos.
+
+### RelaySocket (`networking/relay_socket.py`)
+Drop-in replacement for `socket.socket`. Key design: **the same UDP socket** handles both the room handshake AND game traffic (critical — using different sockets causes the relay to lose track of the peer).
+
+```python
+rs = RelaySocket(relay_addr)
+rs.create_room()   # or rs.join_room(code) — uses internal socket
+rs.start()         # starts heartbeat + recv threads
+# Now pass rs to GameServer/GameClient as relay_socket= parameter
+```
+
+- `sendto(data, addr)` → wraps in RELAY_FORWARD, sends to relay
+- `recvfrom(bufsize)` → receives from relay, unwraps, returns (payload, fake_addr)
+- `sendto_broadcast(data)` → single packet with target=0xFF
+- Fake addrs: `("relay_peer", slot)` so GameServer._clients dict works unchanged
+- On RELAY_PEER_LEFT → synthesizes PKT_DISCONNECT for the game layer
+
+### Relay Server (`relay_server/relay_server.py`)
+Standalone script (stdlib only, Python 3.8+):
+- Single-threaded `select()` event loop
+- Room lifecycle: create → peers join → destroy on host disconnect or 10s timeout
+- Deploy: `python relay_server.py --port 7777`
+
+### Integration with GameServer/GameClient
+Both accept an optional `relay_socket=` parameter:
+- `GameServer(relay_socket=rs)` — uses RelaySocket instead of binding a port
+- `GameClient(host_ip="relay", relay_socket=rs)` — uses RelaySocket, `host_addr = ("relay_peer", 0)`
+- `broadcast()` uses `sendto_broadcast()` (one packet) instead of per-client sendto
+
+### Client Reconciliation (CRITICAL for relay)
+Higher latency (50-200ms) causes local prediction to diverge more from server state. Key fixes in `_reconcile_local_car()`:
+- **Always blend velocity + angle** toward server (not just position)
+- **Clear `_wall_normal`** when server shows car moving (speed > 30px/s) — prevents local-only collisions from blocking acceleration
+- **Snap teleport** clears wall contact state completely
+
+### Client Power-up Activation
+Online clients do NOT call `_activate_powerup()` locally on click. Instead:
+1. Click sets `input_use_powerup = True`
+2. `send_input()` sends the flag to the server
+3. Flag is cleared after send (one-shot)
+4. Server activates the powerup authoritatively
+
 ## Important Patterns
 
 1. **Lazy loading:** `tile_defs.py` loads tileset on first API call (`_ensure_loaded()`)
@@ -410,24 +505,31 @@ cd racing_game
 pip install pygame
 pip install gymnasium stable-baselines3  # for RL training feature
 python main.py
+
+# To run the relay server (for internet multiplayer):
+python relay_server/relay_server.py --port 7777
 ```
 
 ### Menu Controls
 - **ENTER** — Open track selection
 - **E** — Open track editor
+- **J** — Join online game (LAN, enter IP)
+- **R** — Join online game (Relay, enter server + room code)
 - **ESC** — Quit
 
 ### Race Controls
 - **W/S** — Accelerate/Reverse
 - **A/D** — Turn
 - **SPACE** — Handbrake
-- **L-SHIFT** — Use power-up
+- **L-CLICK** — Use power-up
 - **ESC** — Back to menu (or editor if test race)
 
 ### Track Select
 - **UP/DOWN** — Navigate
 - **ENTER** — Start race
 - **E** — Edit selected track (tile-based only)
+- **H** — Host online game (LAN)
+- **R** — Host online game (Relay, creates room with code)
 - **T** — Train AI model (tile-based only)
 - **ESC** — Back to menu
 
@@ -457,3 +559,9 @@ Documented here for context if similar issues arise:
 6. **Trained model not loaded in frozen exe** — Same path issue as #5 but for `models/`. Fixed by using `get_writable_dir()` from `utils/base_path.py`.
 
 7. **Errors invisible in training UI** — Subprocess crashes showed generic "exited unexpectedly". Fixed with: global try/except in `train_ai.main()`, stderr capture, `training_error.log` file, multi-line error display in UI.
+
+8. **Relay "room not found" after joining** — The initial design used a temporary socket for room handshake then created a new RelaySocket (different local port). The relay server tracked peers by `(ip, port)`, so the new socket was unrecognized. Fixed by making `RelaySocket` perform the handshake (`create_room()`/`join_room()`) on its own internal socket, then passing the same `RelaySocket` to `GameServer`/`GameClient` via the `relay_socket=` parameter.
+
+9. **Client stuck on walls via relay** — Higher latency caused local prediction to collide with walls while the server saw no collision. `car._wall_normal` blocked acceleration locally, creating a stuck loop. Fixed by blending velocity/angle during reconciliation and clearing `_wall_normal` when server state shows the car moving normally.
+
+10. **Client couldn't use power-ups online** — Mouse click called `_activate_powerup()` locally, which consumed `held_powerup` without informing the server. The `input_use_powerup` flag was never set. Fixed by setting the flag on click (instead of activating locally) so `send_input()` notifies the server, which activates authoritatively.

@@ -32,13 +32,15 @@ from settings import (
 class GameClient:
     """Cliente UDP para conectarse a un host."""
 
-    def __init__(self, host_ip, port=None):
+    def __init__(self, host_ip, port=None, relay_socket=None):
         self.host_ip = host_ip
         self.port = port or NET_DEFAULT_PORT
         self.host_addr = (host_ip, self.port)
         self.socket = None
         self._running = False
         self._thread = None
+        self._relay_socket = relay_socket  # RelaySocket pre-creado o None
+        self._use_relay = relay_socket is not None
 
         # Estado de conexión (thread-safe)
         self.connected = False
@@ -80,8 +82,13 @@ class GameClient:
 
     def connect_async(self, player_name):
         """Inicia conexión en un hilo separado (no bloquea game loop)."""
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.settimeout(0.1)
+        if self._use_relay:
+            self.socket = self._relay_socket
+            self.socket.start()
+            self.host_addr = ("relay_peer", 0)  # fake addr del host
+        else:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket.settimeout(0.1)
         self._connect_done = False
         self._connect_ok = False
         self._connect_thread = threading.Thread(
@@ -158,7 +165,7 @@ class GameClient:
         if self.socket:
             try:
                 self.socket.close()
-            except OSError:
+            except (OSError, Exception):
                 pass
             self.socket = None
 

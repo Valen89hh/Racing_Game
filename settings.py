@@ -363,3 +363,15 @@ NET_INTERPOLATION_DELAY = 0.05  # 50ms de buffer para interpolación
 NET_MAX_SNAPSHOT_BUFFER = 5     # snapshots en buffer circular
 NET_RECONCILE_SNAP_DIST = 100.0 # distancia para snap teleport
 NET_RECONCILE_BLEND = 0.2      # factor de blend hacia servidor
+
+# ──────────────────────────────────────────────
+# RELAY SERVER (multiplayer por internet)
+# ──────────────────────────────────────────────
+RELAY_DEFAULT_PORT = 7777
+RELAY_HEARTBEAT_INTERVAL = 3.0
+RELAY_TIMEOUT = 10.0
+ROOM_CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+# Estados relay
+STATE_RELAY_HOST = "relay_host"
+STATE_RELAY_JOIN = "relay_join"

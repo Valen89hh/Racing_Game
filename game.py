@@ -30,6 +30,8 @@ from settings import (
     STATE_EDITOR, STATE_TRACK_SELECT, STATE_TRAINING,
     STATE_HOST_LOBBY, STATE_JOIN_LOBBY, STATE_CONNECTING,
     STATE_ONLINE_RACING, STATE_ONLINE_COUNTDOWN,
+    STATE_RELAY_HOST, STATE_RELAY_JOIN,
+    RELAY_DEFAULT_PORT,
     COLOR_PROGRESS_BAR, COLOR_PROGRESS_BG,
     PLAYER_COLORS, MAX_PLAYERS, TOTAL_LAPS, DEBUG_CHECKPOINTS,
     HUD_FONT_SIZE, HUD_TITLE_FONT_SIZE,
@@ -160,6 +162,14 @@ class Game:
         self._host_starting_race = False  # True mientras envía track data
         self._pending_track_data = None
 
+        # Relay server
+        self._relay_addr_input = ""      # IP:port del relay
+        self._relay_room_code = ""       # código de sala (4 chars)
+        self._relay_room_input = ""      # input del usuario para room code
+        self._relay_status = ""          # estado del relay ("creating", "ready", etc.)
+        self._relay_sock = None          # socket UDP temporal para create/join
+        self._relay_addr = None          # (ip, port) parsed
+
         # Exportar circuito por defecto si no existe
         track_manager.export_default_track()
 
@@ -228,6 +238,12 @@ class Game:
                     elif self.state in (STATE_JOIN_LOBBY, STATE_CONNECTING):
                         self._stop_online()
                         self.state = STATE_MENU
+                    elif self.state == STATE_RELAY_HOST:
+                        self._cancel_relay()
+                        self.state = STATE_TRACK_SELECT
+                    elif self.state == STATE_RELAY_JOIN:
+                        self._cancel_relay()
+                        self.state = STATE_MENU
                     else:
                         self.running = False
 
@@ -244,6 +260,12 @@ class Game:
                 elif event.key == pygame.K_j:
                     if self.state == STATE_MENU:
                         self._start_join_screen()
+
+                elif event.key == pygame.K_r:
+                    if self.state == STATE_TRACK_SELECT:
+                        self._start_relay_host()
+                    elif self.state == STATE_MENU:
+                        self._start_relay_join()
 
                 elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER,
                                    pygame.K_SPACE):
@@ -268,6 +290,10 @@ class Game:
                         self._start_online_race_as_host()
                     elif self.state == STATE_CONNECTING:
                         self._attempt_connect()
+                    elif self.state == STATE_RELAY_HOST:
+                        self._relay_host_enter()
+                    elif self.state == STATE_RELAY_JOIN:
+                        self._relay_join_enter()
 
                 elif self.state == STATE_TRACK_SELECT:
                     if event.key == pygame.K_UP:
@@ -293,6 +319,17 @@ class Game:
                     if event.key == pygame.K_BACKSPACE:
                         self._lobby_ip_input = self._lobby_ip_input[:-1]
 
+                elif self.state == STATE_RELAY_HOST:
+                    if event.key == pygame.K_BACKSPACE:
+                        self._relay_addr_input = self._relay_addr_input[:-1]
+
+                elif self.state == STATE_RELAY_JOIN:
+                    if event.key == pygame.K_BACKSPACE:
+                        if self._relay_status == "input_code":
+                            self._relay_room_input = self._relay_room_input[:-1]
+                        else:
+                            self._relay_addr_input = self._relay_addr_input[:-1]
+
                 elif self.state == STATE_TRAINING:
                     if event.key == pygame.K_UP and self._train_status == "idle":
                         self._train_timesteps = min(self._train_timesteps + 50000, 1000000)
@@ -305,12 +342,32 @@ class Game:
                 if char in "0123456789.":
                     self._lobby_ip_input += char
 
+            # Text input for relay address
+            if event.type == pygame.TEXTINPUT and self.state == STATE_RELAY_HOST:
+                char = event.text
+                if char in "0123456789.:":
+                    self._relay_addr_input += char
+
+            # Text input for relay join (address or room code)
+            if event.type == pygame.TEXTINPUT and self.state == STATE_RELAY_JOIN:
+                char = event.text
+                if self._relay_status == "input_code":
+                    if char.upper() in "ABCDEFGHJKMNPQRSTUVWXYZ23456789":
+                        self._relay_room_input += char.upper()
+                else:
+                    if char in "0123456789.:":
+                        self._relay_addr_input += char
+
             # Click izquierdo del mouse para activar power-up
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if self.state in (STATE_RACING, STATE_ONLINE_RACING):
                     if (self.player_car and self.player_car.held_powerup is not None
                             and self._use_cooldown <= 0):
-                        self._activate_powerup(self.player_car)
+                        if self.is_online and not self.is_host:
+                            # Cliente online: señalar al servidor, no activar localmente
+                            self.player_car.input_use_powerup = True
+                        else:
+                            self._activate_powerup(self.player_car)
                         self._use_cooldown = 0.3
 
     # ──────────────────────────────────────────────
@@ -421,6 +478,12 @@ class Game:
         elif self.state == STATE_CONNECTING:
             self._ip_cursor_blink += dt
             self._update_connecting(dt)
+        elif self.state == STATE_RELAY_HOST:
+            self._ip_cursor_blink += dt
+            self._update_relay_host(dt)
+        elif self.state == STATE_RELAY_JOIN:
+            self._ip_cursor_blink += dt
+            self._update_relay_join(dt)
 
     def _update_countdown(self, dt: float):
         """Actualiza la cuenta regresiva."""
@@ -787,6 +850,10 @@ class Game:
             self._render_connecting()
         elif self.state == STATE_JOIN_LOBBY:
             self._render_join_lobby()
+        elif self.state == STATE_RELAY_HOST:
+            self._render_relay_host()
+        elif self.state == STATE_RELAY_JOIN:
+            self._render_relay_join()
         elif self.state == STATE_ONLINE_COUNTDOWN:
             self._render_race()
             self._render_hud()
@@ -817,7 +884,8 @@ class Game:
             "SPACE   -  Handbrake",
             "L-CLICK -  Use Power-Up",
             "E       -  Track Editor",
-            "J       -  Join Online Game",
+            "J       -  Join Online Game (LAN)",
+            "R       -  Join Online Game (Relay)",
             "ESC     -  Back to Menu",
         ]
         for i, text in enumerate(instructions):
@@ -1509,8 +1577,8 @@ class Game:
                 draw_text_centered(self.screen, f"({fname})",
                                    self.font_small, COLOR_GRAY, yy + 22)
 
-        draw_text_centered(self.screen, "UP/DOWN select | ENTER race | E edit | H host | T train | ESC back",
-                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
+        draw_text_centered(self.screen, "UP/DOWN select | ENTER race | E edit | H host(LAN) | R host(Relay) | T train | ESC",
+                           self.font_small, COLOR_GRAY, SCREEN_HEIGHT - 50)
 
     # ──────────────────────────────────────────────
     # MULTIPLAYER ONLINE
@@ -1537,6 +1605,301 @@ class Game:
         self.is_online = False
         self.my_player_id = 0
         self._net_error_msg = ""
+        self._cancel_relay()
+
+    def _cancel_relay(self):
+        """Limpia estado del relay."""
+        if self._relay_sock:
+            try:
+                self._relay_sock.close()
+            except OSError:
+                pass
+            self._relay_sock = None
+        self._relay_addr = None
+        self._relay_room_code = ""
+        self._relay_status = ""
+
+    def _parse_relay_addr(self, text):
+        """Parsea 'ip:port' o 'ip' → (ip, port). Retorna None si inválido."""
+        text = text.strip()
+        if not text:
+            return None
+        if ":" in text:
+            parts = text.rsplit(":", 1)
+            try:
+                port = int(parts[1])
+            except ValueError:
+                return None
+            return (parts[0], port)
+        return (text, RELAY_DEFAULT_PORT)
+
+    # ── RELAY HOST ──
+
+    def _start_relay_host(self):
+        """Muestra pantalla para ingresar dirección del relay server."""
+        if not self.track_list:
+            return
+        self._relay_addr_input = ""
+        self._relay_status = "input_addr"
+        self._relay_room_code = ""
+        self._net_error_msg = ""
+        self._ip_cursor_blink = 0.0
+        self.state = STATE_RELAY_HOST
+
+    def _relay_host_enter(self):
+        """Procesa ENTER en la pantalla de relay host."""
+        if self._relay_status == "input_addr":
+            # Parsear dirección y crear sala
+            addr = self._parse_relay_addr(self._relay_addr_input)
+            if not addr:
+                self._net_error_msg = "Enter relay address (ip or ip:port)"
+                return
+            self._relay_addr = addr
+            self._relay_status = "creating"
+            self._net_error_msg = "Creating room..."
+            # Crear sala en un hilo para no bloquear
+            import threading
+            threading.Thread(
+                target=self._relay_create_worker, daemon=True).start()
+
+        elif self._relay_status == "ready":
+            # Sala creada, pasar a HOST_LOBBY con relay
+            self._start_host_lobby_relay()
+
+    def _relay_create_worker(self):
+        """Worker thread: crea sala en el relay usando RelaySocket."""
+        from networking.relay_socket import RelaySocket
+        rs = RelaySocket(self._relay_addr)
+        code = rs.create_room(timeout=5.0)
+        if code:
+            self._relay_sock = rs  # guardar RelaySocket para pasar al GameServer
+            self._relay_room_code = code
+            self._relay_status = "ready"
+            self._net_error_msg = ""
+        else:
+            rs.close()
+            self._relay_status = "input_addr"
+            self._net_error_msg = "Could not connect to relay server"
+
+    def _start_host_lobby_relay(self):
+        """Crea GameServer usando el RelaySocket ya conectado al relay."""
+        if not self.track_list:
+            return
+        entry = self.track_list[self.track_selected]
+
+        from networking.server import GameServer
+        # Pasar el RelaySocket que ya hizo el handshake (mismo socket UDP)
+        self.net_server = GameServer(relay_socket=self._relay_sock)
+        self._relay_sock = None  # GameServer es dueño ahora
+        self.net_server.host_name = "Host"
+        self.net_server.track_name = entry["name"]
+        try:
+            self.net_server.start()
+        except OSError as e:
+            self._net_error_msg = f"Cannot start server: {e}"
+            self.net_server = None
+            return
+
+        self.is_host = True
+        self.is_online = True
+        self.my_player_id = 0
+        self._lobby_bot_count = 1
+        self._lobby_players = [(0, "Host")]
+        self.state = STATE_HOST_LOBBY
+
+    def _update_relay_host(self, dt):
+        """Actualiza pantalla de relay host (poll de creación de sala)."""
+        pass  # El worker thread actualiza _relay_status directamente
+
+    def _render_relay_host(self):
+        """Renderiza pantalla de relay host."""
+        self._render_gradient_bg()
+
+        draw_text_centered(self.screen, "HOST (RELAY)",
+                           self.font_title, COLOR_YELLOW, 80)
+
+        entry = self.track_list[self.track_selected] if self.track_list else {}
+        draw_text_centered(self.screen, f"Track: {entry.get('name', '?')}",
+                           self.font, COLOR_GRAY, 150)
+
+        if self._relay_status in ("input_addr", ""):
+            draw_text_centered(self.screen, "Enter Relay Server Address:",
+                               self.font_subtitle, COLOR_WHITE, 240)
+
+            # Input box
+            box_w = 400
+            box_h = 40
+            box_x = SCREEN_WIDTH // 2 - box_w // 2
+            box_y = 290
+            pygame.draw.rect(self.screen, (40, 40, 60),
+                             (box_x, box_y, box_w, box_h), border_radius=4)
+            pygame.draw.rect(self.screen, COLOR_WHITE,
+                             (box_x, box_y, box_w, box_h), 2, border_radius=4)
+
+            cursor = "|" if int(self._ip_cursor_blink * 2) % 2 == 0 else ""
+            ip_text = self._relay_addr_input + cursor
+            ip_surf = self.font_subtitle.render(ip_text, True, COLOR_WHITE)
+            self.screen.blit(ip_surf, (box_x + 10, box_y + 6))
+
+            draw_text_centered(self.screen, "(ip:port  or  ip  for default port 7777)",
+                               self.font_small, COLOR_GRAY, 345)
+
+        elif self._relay_status == "creating":
+            draw_text_centered(self.screen, "Creating room...",
+                               self.font_subtitle, COLOR_YELLOW, 300)
+
+        elif self._relay_status == "ready":
+            draw_text_centered(self.screen, "Room Created!",
+                               self.font_subtitle, COLOR_GREEN, 240)
+            draw_text_centered(self.screen, f"Room Code:  {self._relay_room_code}",
+                               self.font_title, COLOR_WHITE, 310)
+            draw_text_centered(self.screen, "Share this code with other players",
+                               self.font, COLOR_GRAY, 400)
+            draw_text_centered(self.screen, "Press ENTER to open lobby",
+                               self.font, COLOR_YELLOW, 450)
+
+        # Error
+        if self._net_error_msg:
+            color = COLOR_YELLOW if "Creating" in self._net_error_msg else COLOR_RED
+            draw_text_centered(self.screen, self._net_error_msg,
+                               self.font, color, SCREEN_HEIGHT - 90)
+
+        draw_text_centered(self.screen, "ENTER: Confirm  |  ESC: Cancel",
+                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
+
+    # ── RELAY JOIN ──
+
+    def _start_relay_join(self):
+        """Muestra pantalla para ingresar relay addr + room code."""
+        self._relay_addr_input = ""
+        self._relay_room_input = ""
+        self._relay_status = "input_addr"
+        self._relay_room_code = ""
+        self._net_error_msg = ""
+        self._ip_cursor_blink = 0.0
+        self.state = STATE_RELAY_JOIN
+
+    def _relay_join_enter(self):
+        """Procesa ENTER en la pantalla de relay join."""
+        if self._relay_status == "input_addr":
+            addr = self._parse_relay_addr(self._relay_addr_input)
+            if not addr:
+                self._net_error_msg = "Enter relay address (ip or ip:port)"
+                return
+            self._relay_addr = addr
+            self._relay_status = "input_code"
+            self._net_error_msg = ""
+
+        elif self._relay_status == "input_code":
+            code = self._relay_room_input.strip().upper()
+            if len(code) != 4:
+                self._net_error_msg = "Room code must be 4 characters"
+                return
+            self._relay_room_code = code
+            self._relay_status = "joining"
+            self._net_error_msg = "Joining room..."
+            import threading
+            threading.Thread(
+                target=self._relay_join_worker, daemon=True).start()
+
+    def _relay_join_worker(self):
+        """Worker thread: se une a la sala del relay usando RelaySocket."""
+        from networking.relay_socket import RelaySocket
+        rs = RelaySocket(self._relay_addr)
+        slot = rs.join_room(self._relay_room_code, timeout=5.0)
+        if slot is not None:
+            self._relay_sock = rs  # guardar para pasar al GameClient
+            self._relay_status = "joined"
+            # Crear GameClient con el RelaySocket ya conectado
+            self._start_client_relay()
+        else:
+            rs.close()
+            self._relay_status = "input_code"
+            self._net_error_msg = "Room not found or full"
+
+    def _start_client_relay(self):
+        """Crea GameClient usando el RelaySocket ya conectado al relay."""
+        from networking.client import GameClient
+        # Pasar el RelaySocket que ya hizo el handshake (mismo socket UDP)
+        self.net_client = GameClient(
+            host_ip="relay",
+            relay_socket=self._relay_sock)
+        self._relay_sock = None  # GameClient es dueño ahora
+        self._net_error_msg = "Connecting..."
+
+        name = self._lobby_name_input or "Player"
+        self.net_client.connect_async(name)
+        self.state = STATE_CONNECTING
+
+    def _update_relay_join(self, dt):
+        """Actualiza pantalla de relay join (poll de join)."""
+        pass  # Worker thread actualiza _relay_status directamente
+
+    def _render_relay_join(self):
+        """Renderiza pantalla de relay join."""
+        self._render_gradient_bg()
+
+        draw_text_centered(self.screen, "JOIN (RELAY)",
+                           self.font_title, COLOR_YELLOW, 80)
+
+        if self._relay_status in ("input_addr", ""):
+            draw_text_centered(self.screen, "Enter Relay Server Address:",
+                               self.font_subtitle, COLOR_WHITE, 220)
+
+            box_w = 400
+            box_h = 40
+            box_x = SCREEN_WIDTH // 2 - box_w // 2
+            box_y = 270
+            pygame.draw.rect(self.screen, (40, 40, 60),
+                             (box_x, box_y, box_w, box_h), border_radius=4)
+            pygame.draw.rect(self.screen, COLOR_WHITE,
+                             (box_x, box_y, box_w, box_h), 2, border_radius=4)
+
+            cursor = "|" if int(self._ip_cursor_blink * 2) % 2 == 0 else ""
+            ip_text = self._relay_addr_input + cursor
+            ip_surf = self.font_subtitle.render(ip_text, True, COLOR_WHITE)
+            self.screen.blit(ip_surf, (box_x + 10, box_y + 6))
+
+            draw_text_centered(self.screen, "(ip:port  or  ip  for default port 7777)",
+                               self.font_small, COLOR_GRAY, 325)
+
+        elif self._relay_status == "input_code":
+            draw_text_centered(self.screen, f"Relay: {self._relay_addr_input}",
+                               self.font, COLOR_GRAY, 180)
+
+            draw_text_centered(self.screen, "Enter Room Code:",
+                               self.font_subtitle, COLOR_WHITE, 250)
+
+            box_w = 200
+            box_h = 50
+            box_x = SCREEN_WIDTH // 2 - box_w // 2
+            box_y = 300
+            pygame.draw.rect(self.screen, (40, 40, 60),
+                             (box_x, box_y, box_w, box_h), border_radius=4)
+            pygame.draw.rect(self.screen, COLOR_WHITE,
+                             (box_x, box_y, box_w, box_h), 2, border_radius=4)
+
+            cursor = "|" if int(self._ip_cursor_blink * 2) % 2 == 0 else ""
+            code_text = self._relay_room_input + cursor
+            code_surf = self.font_title.render(code_text, True, COLOR_WHITE)
+            text_x = box_x + (box_w - code_surf.get_width()) // 2
+            self.screen.blit(code_surf, (text_x, box_y + 2))
+
+            draw_text_centered(self.screen, "(4 characters, e.g. A3K9)",
+                               self.font_small, COLOR_GRAY, 365)
+
+        elif self._relay_status == "joining":
+            draw_text_centered(self.screen, f"Joining room {self._relay_room_code}...",
+                               self.font_subtitle, COLOR_YELLOW, 300)
+
+        # Error
+        if self._net_error_msg:
+            color = COLOR_YELLOW if "Connecting" in self._net_error_msg or "Joining" in self._net_error_msg else COLOR_RED
+            draw_text_centered(self.screen, self._net_error_msg,
+                               self.font, color, SCREEN_HEIGHT - 90)
+
+        draw_text_centered(self.screen, "ENTER: Confirm  |  ESC: Cancel",
+                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
 
     # ── HOST LOBBY ──
 
@@ -1595,11 +1958,17 @@ class Game:
         draw_text_centered(self.screen, "HOST LOBBY",
                            self.font_title, COLOR_YELLOW, 60)
 
-        # IP y puerto
-        ip = self.net_server.get_local_ip() if self.net_server else "..."
-        port = self.net_server.port if self.net_server else NET_DEFAULT_PORT
-        draw_text_centered(self.screen, f"IP: {ip}:{port}",
-                           self.font_subtitle, COLOR_WHITE, 140)
+        # IP/puerto o Room Code
+        if self._relay_room_code:
+            draw_text_centered(self.screen, f"Room Code:  {self._relay_room_code}",
+                               self.font_subtitle, COLOR_WHITE, 130)
+            draw_text_centered(self.screen, "(share this code with players)",
+                               self.font_small, COLOR_GRAY, 160)
+        else:
+            ip = self.net_server.get_local_ip() if self.net_server else "..."
+            port = self.net_server.port if self.net_server else NET_DEFAULT_PORT
+            draw_text_centered(self.screen, f"IP: {ip}:{port}",
+                               self.font_subtitle, COLOR_WHITE, 140)
 
         # Track
         entry = self.track_list[self.track_selected] if self.track_list else {}
@@ -2268,7 +2637,10 @@ class Game:
 
         # 1. Input local (siempre WASD+Space para el jugador local)
         if self.player_car and not self.player_car.finished:
+            # Preservar use_powerup del click (se setea en _handle_events)
+            pending_use_pw = self.player_car.input_use_powerup
             self.player_car.reset_inputs()
+            self.player_car.input_use_powerup = pending_use_pw
             if keys[pygame.K_w]:
                 self.player_car.input_accelerate = 1.0
             elif keys[pygame.K_s]:
@@ -2287,6 +2659,8 @@ class Game:
                 self.player_car.input_brake,
                 self.player_car.input_use_powerup,
             )
+            # Limpiar flag de uso después de enviar (one-shot)
+            self.player_car.input_use_powerup = False
 
             # 2. Predicción local del auto propio (física completa)
             self.player_car.update_effects(dt)
@@ -2392,10 +2766,25 @@ class Game:
             self.player_car.velocity.x = server_state.vx
             self.player_car.velocity.y = server_state.vy
             self.player_car.angle = server_state.angle
+            # Limpiar estado de colisión local para evitar bloqueo
+            self.player_car._wall_normal = None
         elif dist > 2.0:
             # Blend suave
             self.player_car.x += dx * NET_RECONCILE_BLEND
             self.player_car.y += dy * NET_RECONCILE_BLEND
+
+        # Siempre sincronizar velocidad y ángulo del servidor
+        # Esto evita que colisiones locales divergentes bloqueen al auto
+        self.player_car.velocity.x += (server_state.vx - self.player_car.velocity.x) * NET_RECONCILE_BLEND
+        self.player_car.velocity.y += (server_state.vy - self.player_car.velocity.y) * NET_RECONCILE_BLEND
+        angle_diff = (server_state.angle - self.player_car.angle + 180) % 360 - 180
+        self.player_car.angle = (self.player_car.angle + angle_diff * NET_RECONCILE_BLEND) % 360
+
+        # Si el servidor dice que no hay colisión (el auto se mueve normalmente),
+        # limpiar wall_normal local para no bloquear aceleración
+        server_speed = math.hypot(server_state.vx, server_state.vy)
+        if server_speed > 30.0:
+            self.player_car._wall_normal = None
 
         # Siempre sincronizar datos discretos
         self.player_car.laps = server_state.laps
