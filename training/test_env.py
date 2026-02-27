@@ -45,7 +45,7 @@ def test_acceleration(track_path: str):
     # Test: colisión inmediata al inicio
     initial_collision = env.collision_system.check_track_collision(env.car)
     print(f"Collision at start: {initial_collision}")
-    print(f"_wall_normal at start: {env.car._wall_normal}")
+    print(f"Collision radius: {env.car.collision_radius}")
     print()
 
     print(f"{'Frame':>5} {'Action':>6} {'Speed':>8} {'X':>8} {'Y':>8} "

@@ -122,16 +122,6 @@ class PhysicsSystem:
                         car.velocity.scale_to_length(speed_mag - brake_amount)
                 return
 
-        # Bloquear aceleración si el auto empuja contra un muro
-        if car._wall_normal is not None:
-            nx, ny = car._wall_normal
-            if car.input_accelerate > 0:
-                if fx * nx + fy * ny < -0.3:
-                    return
-            elif car.input_accelerate < 0:
-                if -fx * nx + -fy * ny < -0.3:
-                    return
-
         accel = car.effective_acceleration
         max_spd = car.effective_max_speed
 
@@ -190,16 +180,12 @@ class PhysicsSystem:
         if car.input_turn == 0:
             return
 
-        wall_contact = car._wall_normal is not None
         speed_mag = car.velocity.length()
-        if speed_mag < 1.0 and not wall_contact:
+        if speed_mag < 1.0:
             return
 
         speed_ratio = clamp(speed_mag / car.effective_max_speed, 0.0, 1.0)
         base_turn = lerp(car.turn_speed_min, car.effective_turn_speed, speed_ratio)
-
-        if speed_mag < 1.0 and wall_contact:
-            base_turn = car.turn_speed_min
 
         # Giro durante drift
         if car.is_drifting:
@@ -306,7 +292,6 @@ class PhysicsSystem:
         dot = vx * nx + vy * ny
 
         if dot >= 0:
-            car._wall_normal = None
             return
 
         # Componente tangencial
@@ -320,7 +305,6 @@ class PhysicsSystem:
 
         car.velocity.x = vt_x * penalty
         car.velocity.y = vt_y * penalty
-        car._wall_normal = (nx, ny)
 
         # Resetear drift al impactar un muro
         car.is_drifting = False
@@ -331,5 +315,5 @@ class PhysicsSystem:
         car.is_countersteer = False
 
     def clear_wall_contact(self, car: Car):
-        """Limpia el estado de contacto con pared."""
-        car._wall_normal = None
+        """No-op. Mantenido por compatibilidad de interfaz."""
+        pass

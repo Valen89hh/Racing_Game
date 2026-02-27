@@ -126,6 +126,9 @@ DRIFT_BAR_OFFSET_Y = 22            # offset debajo del auto
 
 CAR_WIDTH = 22
 CAR_HEIGHT = 40
+CAR_COLLISION_RADIUS = 12.0        # radio circle collider (diameter 24 ~ car width)
+CAR_COLLISION_SAMPLES = 16         # puntos perímetro (cada 22.5 grados)
+CAR_VS_CAR_SPEED_PENALTY = 0.7     # penalización velocidad car-vs-car
 
 # ──────────────────────────────────────────────
 # IA (BOT)

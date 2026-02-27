@@ -270,25 +270,24 @@ class WorldSimulation:
         """Un paso determinista de simulacion de auto.
         Incluye: effects, fisica, drift, colision con muros."""
         car.update_effects(dt)
+        old_x, old_y = car.x, car.y
         self.physics.update(car, dt, self.track)
-        car.update_sprite()
+        car.update_collision_mask()
         if self.collision_system.check_track_collision(car):
             if car.is_shielded:
                 car.break_shield()
-                normal = self.collision_system.resolve_track_collision(car)
+                self.collision_system.resolve_track_collision(car, old_x, old_y)
                 car.speed *= 0.7
-                car.update_sprite()
             elif car.has_bounce:
-                normal = self.collision_system.resolve_track_collision(car)
+                normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                 self.physics.apply_collision_response(car, normal)
                 car.speed *= 1.3
-                car.update_sprite()
             else:
-                normal = self.collision_system.resolve_track_collision(car)
+                normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                 self.physics.apply_collision_response(car, normal)
-                car.update_sprite()
-        else:
-            self.physics.clear_wall_contact(car)
+            car.x += car.velocity.x * dt
+            car.y += car.velocity.y * dt
+        car.update_sprite()
 
     def _activate_powerup(self, car):
         """Activa el power-up que lleva el auto."""

@@ -499,28 +499,28 @@ class Game:
                 car_dt = dt * SLOWMO_FACTOR
 
             # Física (con per-tile friction si el track lo soporta)
+            old_x, old_y = car.x, car.y
             self.physics.update(car, car_dt, self.track)
-            car.update_sprite()
+            car.update_collision_mask()
 
-            # Colisiones con bordes
+            # Colisiones con bordes (rollback + slide)
             if self.collision_system.check_track_collision(car):
                 if car.is_shielded:
                     car.break_shield()
-                    normal = self.collision_system.resolve_track_collision(car)
+                    self.collision_system.resolve_track_collision(car, old_x, old_y)
                     car.speed *= 0.7
-                    car.update_sprite()
                 elif car.has_bounce:
-                    # Rebote mejorado: conserva más velocidad
-                    normal = self.collision_system.resolve_track_collision(car)
+                    normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                     self.physics.apply_collision_response(car, normal)
-                    car.speed *= 1.3  # recuperar velocidad tras el rebote
-                    car.update_sprite()
+                    car.speed *= 1.3
                 else:
-                    normal = self.collision_system.resolve_track_collision(car)
+                    normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                     self.physics.apply_collision_response(car, normal)
-                    car.update_sprite()
-            else:
-                self.physics.clear_wall_contact(car)
+                # Sliding movement post-rollback
+                car.x += car.velocity.x * car_dt
+                car.y += car.velocity.y * car_dt
+
+            car.update_sprite()
 
             # Checkpoints y vueltas
             old_laps = car.laps
@@ -1629,46 +1629,46 @@ class Game:
         Usada por: predicción del cliente, replay.
         Incluye: effects, física, drift, colisión con muros."""
         car.update_effects(dt)
+        old_x, old_y = car.x, car.y
         self.physics.update(car, dt, self.track)
-        car.update_sprite()
+        car.update_collision_mask()
         if self.collision_system.check_track_collision(car):
             if car.is_shielded:
                 car.break_shield()
-                normal = self.collision_system.resolve_track_collision(car)
+                self.collision_system.resolve_track_collision(car, old_x, old_y)
                 car.speed *= 0.7
-                car.update_sprite()
             elif car.has_bounce:
-                normal = self.collision_system.resolve_track_collision(car)
+                normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                 self.physics.apply_collision_response(car, normal)
                 car.speed *= 1.3
-                car.update_sprite()
             else:
-                normal = self.collision_system.resolve_track_collision(car)
+                normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                 self.physics.apply_collision_response(car, normal)
-                car.update_sprite()
-        else:
-            self.physics.clear_wall_contact(car)
+            car.x += car.velocity.x * dt
+            car.y += car.velocity.y * dt
+        car.update_sprite()
 
     def _simulate_car_step_headless(self, car, dt):
         """Simulation step sin modificar render state.
         Usado para: predicción local online, replay de reconciliación."""
         car.update_effects(dt)
+        old_x, old_y = car.x, car.y
         self.physics.update(car, dt, self.track)
         car.update_collision_mask()  # rect/mask para colisión, NO render
         if self.collision_system.check_track_collision(car):
             if car.is_shielded:
                 car.break_shield()
-                self.collision_system.resolve_track_collision(car)
+                self.collision_system.resolve_track_collision(car, old_x, old_y)
                 car.speed *= 0.7
             elif car.has_bounce:
-                normal = self.collision_system.resolve_track_collision(car)
+                normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                 self.physics.apply_collision_response(car, normal)
                 car.speed *= 1.3
             else:
-                normal = self.collision_system.resolve_track_collision(car)
+                normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                 self.physics.apply_collision_response(car, normal)
-        else:
-            self.physics.clear_wall_contact(car)
+            car.x += car.velocity.x * dt
+            car.y += car.velocity.y * dt
 
     def _smooth_player_render(self, dt):
         """Suavizado visual del auto local. Solo cosmético, no afecta simulación."""
@@ -2141,7 +2141,6 @@ class Game:
         car.velocity.x = server_state.vx
         car.velocity.y = server_state.vy
         car.angle = server_state.angle
-        car._wall_normal = None
 
         # Drift completo
         car.is_drifting = server_state.is_drifting

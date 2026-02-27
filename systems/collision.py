@@ -1,9 +1,10 @@
 """
 collision.py - Sistema de detección y resolución de colisiones.
 
-Maneja colisiones entre autos y bordes de la pista (con vector normal),
-detección de cruce de línea de meta, checkpoints, y colisiones con
-power-ups (pickups, misiles, manchas de aceite).
+Usa circle collider + rollback para colisiones auto-pista.
+Sin push-out iterativo, sin binary search. Determinista al 100%.
+
+Colisiones auto-auto usan distancia simple entre centros.
 """
 
 import math
@@ -15,53 +16,70 @@ from utils.helpers import distance
 from settings import (
     WORLD_WIDTH, WORLD_HEIGHT,
     MISSILE_SLOW_DURATION, OIL_EFFECT_DURATION,
+    CAR_COLLISION_RADIUS, CAR_COLLISION_SAMPLES, CAR_VS_CAR_SPEED_PENALTY,
 )
 
 
 class CollisionSystem:
     """
-    Sistema de colisiones con resolución basada en vector normal
-    y detección de power-ups.
+    Sistema de colisiones con circle collider + rollback.
     """
-
-    NORMAL_SAMPLE_RAYS = 16
-    NORMAL_SAMPLE_DIST = 28.0
-    SEPARATION_STEP = 2.0
-    MAX_SEPARATION_ITERS = 20
 
     def __init__(self, track: Track):
         self.track = track
+        # Pre-calcular ángulos del perímetro
+        self._sample_angles = [
+            (2.0 * math.pi * i) / CAR_COLLISION_SAMPLES
+            for i in range(CAR_COLLISION_SAMPLES)
+        ]
+        self._cos_angles = [math.cos(a) for a in self._sample_angles]
+        self._sin_angles = [math.sin(a) for a in self._sample_angles]
 
-    # ── AUTO vs PISTA ──
+    # ── AUTO vs PISTA (circle collider) ──
 
     def check_track_collision(self, car: Car) -> bool:
-        """Verifica si el auto colisiona con los bordes de la pista."""
-        return self.track.check_car_collision(car.mask, car.rect)
+        """Verifica si algún punto del perímetro del circle collider toca boundary."""
+        mask = self.track.boundary_mask
+        r = car.collision_radius
+
+        for i in range(CAR_COLLISION_SAMPLES):
+            sx = int(car.x + self._cos_angles[i] * r)
+            sy = int(car.y + self._sin_angles[i] * r)
+
+            if 0 <= sx < WORLD_WIDTH and 0 <= sy < WORLD_HEIGHT:
+                if mask.get_at((sx, sy)):
+                    return True
+            else:
+                return True  # fuera del mundo = colisión
+
+        return False
 
     def compute_wall_normal(self, car: Car) -> tuple[float, float]:
         """
-        Calcula la normal de la pared muestreando 16 rayos alrededor del auto.
-        La normal apunta desde la pared hacia la pista.
+        Calcula la normal de la pared desde los puntos penetrantes del perímetro.
+        La normal apunta desde la pared hacia la pista (dirección de escape).
         """
         wall_dx = 0.0
         wall_dy = 0.0
         mask = self.track.boundary_mask
+        r = car.collision_radius
 
-        for i in range(self.NORMAL_SAMPLE_RAYS):
-            angle = (2.0 * math.pi * i) / self.NORMAL_SAMPLE_RAYS
-            ray_cos = math.cos(angle)
-            ray_sin = math.sin(angle)
+        for i in range(CAR_COLLISION_SAMPLES):
+            cos_a = self._cos_angles[i]
+            sin_a = self._sin_angles[i]
+            sx = int(car.x + cos_a * r)
+            sy = int(car.y + sin_a * r)
 
-            for dist_factor in (0.5, 0.75, 1.0):
-                sample_dist = self.NORMAL_SAMPLE_DIST * dist_factor
-                sx = int(car.x + ray_cos * sample_dist)
-                sy = int(car.y + ray_sin * sample_dist)
+            hit = False
+            if 0 <= sx < WORLD_WIDTH and 0 <= sy < WORLD_HEIGHT:
+                if mask.get_at((sx, sy)):
+                    hit = True
+            else:
+                hit = True
 
-                if 0 <= sx < WORLD_WIDTH and 0 <= sy < WORLD_HEIGHT:
-                    if mask.get_at((sx, sy)):
-                        weight = 1.0 / dist_factor
-                        wall_dx += ray_cos * weight
-                        wall_dy += ray_sin * weight
+            if hit:
+                wall_dx += cos_a
+                wall_dy += sin_a
 
         length = math.hypot(wall_dx, wall_dy)
         if length < 0.01:
@@ -70,19 +88,16 @@ class CollisionSystem:
 
         return -wall_dx / length, -wall_dy / length
 
-    def resolve_track_collision(self, car: Car) -> tuple[float, float]:
+    def resolve_track_collision(self, car: Car,
+                                old_x: float, old_y: float
+                                ) -> tuple[float, float]:
         """
-        Calcula la normal, empuja el auto fuera del muro, y retorna la normal.
+        Rollback: mueve el auto a la posición anterior y retorna la normal.
+        Sin push-out, sin iteraciones. 100% determinista.
         """
         nx, ny = self.compute_wall_normal(car)
-
-        for _ in range(self.MAX_SEPARATION_ITERS):
-            car.x += nx * self.SEPARATION_STEP
-            car.y += ny * self.SEPARATION_STEP
-            car.update_collision_mask()
-            if not self.track.check_car_collision(car.mask, car.rect):
-                break
-
+        car.x = old_x
+        car.y = old_y
         return nx, ny
 
     # ── VUELTAS Y CHECKPOINTS ──
@@ -101,7 +116,6 @@ class CollisionSystem:
         zone = zones[car.next_checkpoint_index]
 
         if car.has_magnet:
-            # Zona inflada por el multiplicador del imán
             from settings import MAGNET_RADIUS_MULT
             expanded = zone.inflate(
                 int(zone.width * (MAGNET_RADIUS_MULT - 1)),
@@ -116,15 +130,18 @@ class CollisionSystem:
                 car.laps += 1
                 car.next_checkpoint_index = 0
 
-    # ── AUTO vs AUTO ──
+    # ── AUTO vs AUTO (distancia simple) ──
 
     def check_car_vs_car(self, car_a: Car, car_b: Car) -> bool:
-        """Verifica colisión entre dos autos."""
-        offset = (car_b.rect.x - car_a.rect.x, car_b.rect.y - car_a.rect.y)
-        return car_a.mask.overlap(car_b.mask, offset) is not None
+        """Verifica colisión entre dos autos por distancia de centros."""
+        dx = car_b.x - car_a.x
+        dy = car_b.y - car_a.y
+        dist = math.hypot(dx, dy)
+        min_dist = car_a.collision_radius + car_b.collision_radius
+        return dist < min_dist
 
     def resolve_car_vs_car(self, car_a: Car, car_b: Car):
-        """Resuelve colisión entre dos autos empujándolos en direcciones opuestas."""
+        """Resuelve colisión entre dos autos: push por overlap exacto."""
         dx = car_b.x - car_a.x
         dy = car_b.y - car_a.y
         dist = math.hypot(dx, dy)
@@ -132,13 +149,16 @@ class CollisionSystem:
             dx, dy, dist = 1.0, 0.0, 1.0
 
         nx, ny = dx / dist, dy / dist
-        push = 3.0
-        car_a.x -= nx * push
-        car_a.y -= ny * push
-        car_b.x += nx * push
-        car_b.y += ny * push
-        car_a.speed *= 0.7
-        car_b.speed *= 0.7
+        min_dist = car_a.collision_radius + car_b.collision_radius
+        overlap = min_dist - dist
+        if overlap > 0:
+            half = overlap * 0.5
+            car_a.x -= nx * half
+            car_a.y -= ny * half
+            car_b.x += nx * half
+            car_b.y += ny * half
+        car_a.speed *= CAR_VS_CAR_SPEED_PENALTY
+        car_b.speed *= CAR_VS_CAR_SPEED_PENALTY
 
     # ── POWER-UPS ──
 

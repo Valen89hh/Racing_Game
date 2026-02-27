@@ -106,18 +106,21 @@ class RacingEnv(gym.Env):
         self.car.update_effects(self.FIXED_DT)
 
         # 3. Physics
+        old_x, old_y = self.car.x, self.car.y
         self.physics.update(self.car, self.FIXED_DT, self.track)
-        self.car.update_sprite()
+        self.car.update_collision_mask()
 
-        # 4. Track collision
+        # 4. Track collision (rollback + slide)
         hit_wall = False
         if self.collision_system.check_track_collision(self.car):
-            normal = self.collision_system.resolve_track_collision(self.car)
+            normal = self.collision_system.resolve_track_collision(
+                self.car, old_x, old_y)
             self.physics.apply_collision_response(self.car, normal)
-            self.car.update_sprite()
+            self.car.x += self.car.velocity.x * self.FIXED_DT
+            self.car.y += self.car.velocity.y * self.FIXED_DT
             hit_wall = True
-        else:
-            self.physics.clear_wall_contact(self.car)
+
+        self.car.update_sprite()
 
         # 5. Checkpoints and laps
         old_laps = self.car.laps

@@ -18,7 +18,7 @@ import math
 from settings import (
     CAR_WIDTH, CAR_HEIGHT, CAR_MAX_SPEED, CAR_ACCELERATION,
     CAR_BRAKE_FORCE, CAR_FRICTION, CAR_TURN_SPEED, CAR_TURN_SPEED_MIN,
-    CAR_DRIFT_FACTOR, CAR_REVERSE_MAX_SPEED, TOTAL_LAPS,
+    CAR_DRIFT_FACTOR, CAR_REVERSE_MAX_SPEED, CAR_COLLISION_RADIUS, TOTAL_LAPS,
     BOOST_SPEED_MULT, BOOST_ACCEL_MULT,
     OIL_FRICTION_MULT, OIL_TURN_MULT,
     MISSILE_SLOW_FACTOR,
@@ -101,8 +101,8 @@ class Car:
         self.drift_direction = 0  # dirección del drift: -1 izq, +1 der, 0 sin asignar
         self.is_countersteer = False  # True cuando contra-gira durante drift
 
-        # Colisión con pared (usado por physics.py)
-        self._wall_normal = None
+        # Circle collider para colisión con pista
+        self.collision_radius = CAR_COLLISION_RADIUS
 
         # Networking flags
         self.is_remote = False       # True si es controlado por un cliente remoto
