@@ -109,6 +109,4 @@ game_backup/
 training/logs/
 models/checkpoints/
 models/*.zip
-project3.tar.gz
-project2.tar.gz
-project.tar.gz
+project*.tar.gz

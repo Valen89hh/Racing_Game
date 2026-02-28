@@ -1,0 +1,49 @@
+# Auto-deploy dedicated server when server-relevant files change on main.
+#
+# SETUP REQUIRED — This workflow is disabled until you add these GitHub secrets:
+#   SERVER_SSH_KEY  — Private SSH key for the droplet
+#   SERVER_IP       — Droplet IP address
+#   SERVER_USER     — SSH user (e.g. "racing")
+#
+# To enable: remove the `if: false` line below, or replace with a condition.
+
+name: Deploy Dedicated Server
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'main.py'
+      - 'settings.py'
+      - 'track_manager.py'
+      - 'race_progress.py'
+      - 'tile_track.py'
+      - 'tile_defs.py'
+      - 'tile_meta.py'
+      - 'tile_collision.py'
+      - 'server/**'
+      - 'networking/**'
+      - 'entities/**'
+      - 'systems/**'
+      - 'utils/**'
+      - 'tracks/**'
+      - 'assets/levels/tileset_meta.json'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Remove this line to enable the workflow:
+    if: false
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            cd /home/${{ secrets.SERVER_USER }}/racing_server
+            git pull origin main
+            sudo systemctl restart racing-server
+            sleep 2
+            systemctl is-active racing-server
