@@ -50,6 +50,7 @@ from settings import (
     NET_TELEPORT_THRESHOLD,
     FIXED_DT, VISUAL_SMOOTH_RATE,
     SLOWMO_FACTOR,
+    CAR_VS_CAR_SPEED_PENALTY,
 )
 from entities.car import Car
 from entities.track import Track
@@ -1669,6 +1670,27 @@ class Game:
             if remaining > 0:
                 self.collision_system.move_with_substeps(car, remaining)
 
+    def _predict_car_vs_car_local(self, local_car, remote_car):
+        """Predicción local de colisión car-vs-car (solo empuja auto local)."""
+        dx = remote_car.x - local_car.x
+        dy = remote_car.y - local_car.y
+        dist = math.hypot(dx, dy)
+        if dist < 1.0:
+            dx, dy, dist = 1.0, 0.0, 1.0
+        nx, ny = dx / dist, dy / dist
+        min_dist = local_car.collision_radius + remote_car.collision_radius
+        overlap = min_dist - dist
+        if overlap > 0:
+            half = (overlap + 1.0) * 0.5
+            local_car.x -= nx * half
+            local_car.y -= ny * half
+        dot_a = local_car.velocity.x * nx + local_car.velocity.y * ny
+        dot_b = remote_car.velocity.x * nx + remote_car.velocity.y * ny
+        if dot_a - dot_b > 0:
+            local_car.velocity.x += (dot_b - dot_a) * nx
+            local_car.velocity.y += (dot_b - dot_a) * ny
+        local_car.speed *= CAR_VS_CAR_SPEED_PENALTY
+
     def _smooth_player_render(self, dt):
         """Suavizado visual del auto local. Solo cosmético, no afecta simulación."""
         if not self.player_car:
@@ -2006,6 +2028,13 @@ class Game:
                     predict_dt = FIXED_DT * SLOWMO_FACTOR
                 self._simulate_car_step_headless(self.player_car, predict_dt)
 
+                # Colisión car-vs-car predictiva (evita traspaso visual)
+                for other_car in self.cars:
+                    if other_car is self.player_car:
+                        continue
+                    if self.collision_system.check_car_vs_car(self.player_car, other_car):
+                        self._predict_car_vs_car_local(self.player_car, other_car)
+
             self._physics_accumulator -= FIXED_DT
             ticks_this_frame += 1
 
@@ -2237,6 +2266,13 @@ class Game:
             car.input_brake = inp.brake
             car.input_use_powerup = False  # NUNCA replay powerup activation
             self._simulate_car_step_headless(car, replay_dt)
+
+            # Car-vs-car durante replay para que predicción coincida con servidor
+            for other_car in self.cars:
+                if other_car is car:
+                    continue
+                if self.collision_system.check_car_vs_car(car, other_car):
+                    self._predict_car_vs_car_local(car, other_car)
 
         # ── 5. RESTAURAR render state ──
         car.render_x = saved_rx
