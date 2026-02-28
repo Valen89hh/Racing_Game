@@ -85,6 +85,7 @@ class RacingEnv(gym.Env):
         # Create car at start position
         sp = self.track.start_positions[0]
         self.car = Car(sp[0], sp[1], sp[2], PLAYER_COLORS[0], 0)
+        self.collision_system.ensure_valid_spawn(self.car)
 
         self.steps = 0
         self.stall_frames = 0
@@ -105,20 +106,16 @@ class RacingEnv(gym.Env):
         # 2. Update effects
         self.car.update_effects(self.FIXED_DT)
 
-        # 3. Physics
-        old_x, old_y = self.car.x, self.car.y
+        # 3. Physics (velocidad sin movimiento)
         self.physics.update(self.car, self.FIXED_DT, self.track)
-        self.car.update_collision_mask()
 
-        # 4. Track collision (rollback + slide)
-        hit_wall = False
-        if self.collision_system.check_track_collision(self.car):
-            normal = self.collision_system.resolve_track_collision(
-                self.car, old_x, old_y)
+        # 4. Movimiento sub-stepped con colisión (anti-tunneling)
+        hit_wall, normal, remaining = self.collision_system.move_with_substeps(
+            self.car, self.FIXED_DT)
+        if hit_wall:
             self.physics.apply_collision_response(self.car, normal)
-            self.car.x += self.car.velocity.x * self.FIXED_DT
-            self.car.y += self.car.velocity.y * self.FIXED_DT
-            hit_wall = True
+            if remaining > 0:
+                self.collision_system.move_with_substeps(self.car, remaining)
 
         self.car.update_sprite()
 

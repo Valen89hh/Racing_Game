@@ -87,6 +87,10 @@ class WorldSimulation:
             self.cars.append(bot)
             self.ai_system.register_bot(bot)
 
+        # Asegurar que ningún auto spawneó dentro de un muro
+        for car in self.cars:
+            self.collision_system.ensure_valid_spawn(car)
+
         # Power-ups
         self.powerup_items = [
             PowerUpItem(p[0], p[1]) for p in self.track.powerup_spawn_points
@@ -121,6 +125,16 @@ class WorldSimulation:
             remote_inputs: dict {player_id: InputState} — ya popped (1 por jugador).
         """
         self.server_tick += 1
+
+        # DEBUG: primeros 5 ticks, imprimir posicion de todos los autos
+        if self.server_tick <= 5:
+            for car in self.cars:
+                has_input = car.player_id in remote_inputs
+                print(f"[DEBUG-SERVER] tick={self.server_tick} "
+                      f"car={car.name}(pid={car.player_id}) "
+                      f"x={car.x:.1f} y={car.y:.1f} "
+                      f"spd={car.speed:.1f} "
+                      f"has_input={has_input}")
 
         # Detectar slowmo owner
         slowmo_owner = None
@@ -270,23 +284,19 @@ class WorldSimulation:
         """Un paso determinista de simulacion de auto.
         Incluye: effects, fisica, drift, colision con muros."""
         car.update_effects(dt)
-        old_x, old_y = car.x, car.y
         self.physics.update(car, dt, self.track)
-        car.update_collision_mask()
-        if self.collision_system.check_track_collision(car):
+        hit, normal, remaining = self.collision_system.move_with_substeps(car, dt)
+        if hit:
             if car.is_shielded:
                 car.break_shield()
-                self.collision_system.resolve_track_collision(car, old_x, old_y)
                 car.speed *= 0.7
             elif car.has_bounce:
-                normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                 self.physics.apply_collision_response(car, normal)
                 car.speed *= 1.3
             else:
-                normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                 self.physics.apply_collision_response(car, normal)
-            car.x += car.velocity.x * dt
-            car.y += car.velocity.y * dt
+            if remaining > 0:
+                self.collision_system.move_with_substeps(car, remaining)
         car.update_sprite()
 
     def _activate_powerup(self, car):

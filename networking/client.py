@@ -298,6 +298,14 @@ class GameClient:
                 return self._snapshots[-1]
         return None
 
+    def clear_snapshots(self):
+        """Limpia el buffer de snapshots. Llamar al iniciar countdown para
+        evitar que snapshots acumulados causen saltos al entrar en racing."""
+        with self._snapshot_lock:
+            self._snapshots.clear()
+        self._clock_offsets.clear()
+        self._clock_synced = False
+
     def get_interpolation_states(self):
         """Retorna (prev, curr) snapshots para interpolación."""
         with self._snapshot_lock:

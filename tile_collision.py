@@ -80,7 +80,8 @@ def rotate_polygon(polygon, rotation):
 
 def build_boundary_mask(terrain: list[list[int]],
                         meta_manager=None,
-                        rotations=None) -> tuple[pygame.mask.Mask, pygame.Surface]:
+                        rotations=None,
+                        driveable_set=None) -> tuple[pygame.mask.Mask, pygame.Surface]:
     """Build the world-sized collision mask and debug surface.
 
     - collision_type "none"    -> tile is free (painted black / removed from mask)
@@ -88,6 +89,8 @@ def build_boundary_mask(terrain: list[list[int]],
     - collision_type "polygon" -> polygon shape is a wall within the tile
 
     Tiles not in metadata default to: driveable=free, non-driveable=full.
+    If driveable_set is provided, it overrides metadata for tiles not in the
+    meta_manager (used on dedicated servers without tileset.png).
 
     Returns (mask, surface) identical in interface to TileTrack's original.
     """
@@ -109,7 +112,12 @@ def build_boundary_mask(terrain: list[list[int]],
                 continue
 
             meta = meta_manager.get(tid)
-            coll_type = meta.collision_type
+            # If meta_manager doesn't know the tile and we have a driveable_set,
+            # determine collision type from it (server-safe fallback)
+            if tid not in meta_manager._data and driveable_set is not None:
+                coll_type = COLL_NONE if tid in driveable_set else COLL_FULL
+            else:
+                coll_type = meta.collision_type
 
             if coll_type == COLL_NONE:
                 # Free — clear the tile rect

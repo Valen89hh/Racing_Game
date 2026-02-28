@@ -50,14 +50,19 @@ class DedicatedServer:
         self.running = True
         self._main_loop()
 
+    # Máximo de ticks de simulación por iteración del loop externo.
+    # Evita ráfagas de física acumulada que rompen colisiones.
+    MAX_TICKS_PER_FRAME = 2
+
     def _main_loop(self):
-        """Loop principal con accumulator para timing preciso."""
+        """Loop principal con timing fijo y cap de ticks por frame."""
         next_tick_time = time.perf_counter()
 
         while self.running:
             now = time.perf_counter()
+            ticks_this_frame = 0
 
-            while now >= next_tick_time:
+            while now >= next_tick_time and ticks_this_frame < self.MAX_TICKS_PER_FRAME:
                 try:
                     self.room.tick(FIXED_DT)
                 except KeyboardInterrupt:
@@ -69,12 +74,14 @@ class DedicatedServer:
                     traceback.print_exc()
 
                 next_tick_time += FIXED_DT
+                ticks_this_frame += 1
 
-                # Safety: si caemos >10 ticks atrás, skip ahead
-                if time.perf_counter() - next_tick_time > FIXED_DT * 10:
-                    print("[DEDICATED] WARNING: Fell behind, skipping ahead")
-                    next_tick_time = time.perf_counter()
-                    break
+            # Si aún estamos atrasados, saltar tiempo en vez de acumular deuda
+            if now >= next_tick_time:
+                skipped = int((now - next_tick_time) / FIXED_DT)
+                if skipped > 0:
+                    print(f"[DEDICATED] Skipped {skipped} ticks (server behind)")
+                next_tick_time = now
 
             # Sleep corto para no consumir 100% CPU
             remaining = next_tick_time - time.perf_counter()

@@ -56,7 +56,10 @@ class PhysicsSystem:
     """
 
     def update(self, car: Car, dt: float, track=None):
-        """Actualiza la física de un auto para el frame actual.
+        """Actualiza la velocidad de un auto para el frame actual.
+
+        NO mueve la posición. El movimiento se delega a
+        CollisionSystem.move_with_substeps() para evitar tunneling.
 
         Args:
             car: the car entity
@@ -69,7 +72,6 @@ class PhysicsSystem:
         self._apply_turning(car, dt, track)
         self._apply_grip(car, dt)
         self._update_drift_charge(car, dt)
-        self._apply_movement(car, dt)
 
         # Mini-turbo boost timer (post-drift boost activo)
         if car.drift_mt_boost_timer > 0:

@@ -363,6 +363,10 @@ class Game:
         # Sistemas
         self.collision_system = CollisionSystem(self.track)
 
+        # Asegurar que ningún auto spawneó dentro de un muro
+        for car in self.cars:
+            self.collision_system.ensure_valid_spawn(car)
+
         # Intentar cargar modelo RL para esta pista
         self.rl_system = None
         if hasattr(self, 'track_list') and self.track_list and self.track_selected < len(self.track_list):
@@ -473,8 +477,6 @@ class Game:
             if car.finished:
                 continue
 
-            old_x, old_y = car.x, car.y
-
             # Input
             if car.player_id == 0:
                 self.input_handler.update(car, keys)
@@ -498,27 +500,23 @@ class Game:
                 from settings import SLOWMO_FACTOR
                 car_dt = dt * SLOWMO_FACTOR
 
-            # Física (con per-tile friction si el track lo soporta)
-            old_x, old_y = car.x, car.y
+            # Física: velocidad (sin movimiento)
             self.physics.update(car, car_dt, self.track)
-            car.update_collision_mask()
 
-            # Colisiones con bordes (rollback + slide)
-            if self.collision_system.check_track_collision(car):
+            # Movimiento sub-stepped con colisión integrada (anti-tunneling)
+            hit, normal, remaining = self.collision_system.move_with_substeps(car, car_dt)
+            if hit:
                 if car.is_shielded:
                     car.break_shield()
-                    self.collision_system.resolve_track_collision(car, old_x, old_y)
                     car.speed *= 0.7
                 elif car.has_bounce:
-                    normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                     self.physics.apply_collision_response(car, normal)
                     car.speed *= 1.3
                 else:
-                    normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                     self.physics.apply_collision_response(car, normal)
-                # Sliding movement post-rollback
-                car.x += car.velocity.x * car_dt
-                car.y += car.velocity.y * car_dt
+                # Slide con tiempo restante (también sub-stepped)
+                if remaining > 0:
+                    self.collision_system.move_with_substeps(car, remaining)
 
             car.update_sprite()
 
@@ -1621,6 +1619,15 @@ class Game:
             self._online_countdown_value -= 1
             self.countdown_value = self._online_countdown_value
             if self._online_countdown_value < 0:
+                if self.player_car:
+                    print(f"[DEBUG-GO] countdown→racing: "
+                          f"x={self.player_car.x:.1f} y={self.player_car.y:.1f} "
+                          f"rx={self.player_car.render_x:.1f} ry={self.player_car.render_y:.1f} "
+                          f"spd={self.player_car.speed:.1f}")
+                # Limpiar snapshots acumulados durante countdown para evitar
+                # salto de posición al reconciliar con datos pre-racing
+                if self.net_client:
+                    self.net_client.clear_snapshots()
                 self.state = STATE_ONLINE_RACING
                 self.race_timer.start()
 
@@ -1629,46 +1636,38 @@ class Game:
         Usada por: predicción del cliente, replay.
         Incluye: effects, física, drift, colisión con muros."""
         car.update_effects(dt)
-        old_x, old_y = car.x, car.y
         self.physics.update(car, dt, self.track)
-        car.update_collision_mask()
-        if self.collision_system.check_track_collision(car):
+        hit, normal, remaining = self.collision_system.move_with_substeps(car, dt)
+        if hit:
             if car.is_shielded:
                 car.break_shield()
-                self.collision_system.resolve_track_collision(car, old_x, old_y)
                 car.speed *= 0.7
             elif car.has_bounce:
-                normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                 self.physics.apply_collision_response(car, normal)
                 car.speed *= 1.3
             else:
-                normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                 self.physics.apply_collision_response(car, normal)
-            car.x += car.velocity.x * dt
-            car.y += car.velocity.y * dt
+            if remaining > 0:
+                self.collision_system.move_with_substeps(car, remaining)
         car.update_sprite()
 
     def _simulate_car_step_headless(self, car, dt):
         """Simulation step sin modificar render state.
         Usado para: predicción local online, replay de reconciliación."""
         car.update_effects(dt)
-        old_x, old_y = car.x, car.y
         self.physics.update(car, dt, self.track)
-        car.update_collision_mask()  # rect/mask para colisión, NO render
-        if self.collision_system.check_track_collision(car):
+        hit, normal, remaining = self.collision_system.move_with_substeps(car, dt)
+        if hit:
             if car.is_shielded:
                 car.break_shield()
-                self.collision_system.resolve_track_collision(car, old_x, old_y)
                 car.speed *= 0.7
             elif car.has_bounce:
-                normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                 self.physics.apply_collision_response(car, normal)
                 car.speed *= 1.3
             else:
-                normal = self.collision_system.resolve_track_collision(car, old_x, old_y)
                 self.physics.apply_collision_response(car, normal)
-            car.x += car.velocity.x * dt
-            car.y += car.velocity.y * dt
+            if remaining > 0:
+                self.collision_system.move_with_substeps(car, remaining)
 
     def _smooth_player_render(self, dt):
         """Suavizado visual del auto local. Solo cosmético, no afecta simulación."""
@@ -1882,6 +1881,10 @@ class Game:
         # Sistemas
         self.collision_system = CollisionSystem(self.track)
 
+        # Asegurar que ningún auto spawneó dentro de un muro
+        for car in self.cars:
+            self.collision_system.ensure_valid_spawn(car)
+
         # Race progress
         fl = self.track.finish_line
         fl_center = ((fl[0][0] + fl[1][0]) / 2, (fl[0][1] + fl[1][1]) / 2)
@@ -1914,9 +1917,11 @@ class Game:
         self.winner = None
         self.final_times = {}
 
-        # Countdown
+        # Countdown — resetear ambos timers (display + lógica online)
         self.countdown_timer = 0.0
         self.countdown_value = self.net_client.countdown
+        self._online_countdown_timer = 0.0
+        self._online_countdown_value = self.net_client.countdown
 
         # Resetear input replay buffer
         self._input_buffer = [None] * 128
@@ -1928,7 +1933,17 @@ class Game:
         self._client_slowmo_on_me = False
         self._last_reconcile_seq = -1
 
+        # Limpiar snapshots acumulados durante lobby/connecting
+        # para que el primer reconcile use datos frescos de la fase RACING
+        self.net_client.clear_snapshots()
+        self.net_client._input_seq = 0  # Reset input sequence
+
         self.state = STATE_ONLINE_COUNTDOWN
+        self._debug_first_reconcile = True  # DEBUG: flag para primer reconcile
+        if self.player_car:
+            print(f"[DEBUG-SPAWN] player_car created: "
+                  f"x={self.player_car.x:.1f} y={self.player_car.y:.1f} "
+                  f"rx={self.player_car.render_x:.1f} ry={self.player_car.render_y:.1f}")
 
     def _update_online_racing_client(self, dt):
         """Update del cliente: fixed timestep + predicción + render smoothing."""
@@ -1946,9 +1961,11 @@ class Game:
         self._use_cooldown = max(0, self._use_cooldown - dt)
 
         # ── Fixed timestep loop para predicción local ──
+        # Cap: máximo 2 ticks por frame para evitar ráfagas de física acumulada
         self._physics_accumulator += dt
+        ticks_this_frame = 0
 
-        while self._physics_accumulator >= FIXED_DT:
+        while self._physics_accumulator >= FIXED_DT and ticks_this_frame < 2:
             # 1. Input local
             if self.player_car and not self.player_car.finished:
                 pending_use_pw = self.player_car.input_use_powerup
@@ -1990,6 +2007,11 @@ class Game:
                 self._simulate_car_step_headless(self.player_car, predict_dt)
 
             self._physics_accumulator -= FIXED_DT
+            ticks_this_frame += 1
+
+        # Si quedó deuda acumulada, descartar en vez de acumular
+        if self._physics_accumulator >= FIXED_DT:
+            self._physics_accumulator = 0.0
 
         # ── Fuera del fixed loop ──
 
@@ -2129,6 +2151,19 @@ class Game:
         if not self.player_car:
             return
         car = self.player_car
+
+        # ── DEBUG: primer reconcile ──
+        if getattr(self, '_debug_first_reconcile', False):
+            self._debug_first_reconcile = False
+            print(f"[DEBUG-RECONCILE-1st] ANTES: "
+                  f"local x={car.x:.1f} y={car.y:.1f} "
+                  f"rx={car.render_x:.1f} ry={car.render_y:.1f} "
+                  f"spd={car.speed:.1f}")
+            print(f"[DEBUG-RECONCILE-1st] SERVER: "
+                  f"x={server_state.x:.1f} y={server_state.y:.1f} "
+                  f"vx={server_state.vx:.1f} vy={server_state.vy:.1f} "
+                  f"angle={server_state.angle:.1f} "
+                  f"last_input_seq={server_state.last_input_seq}")
 
         # ── 1. GUARDAR render state ──
         saved_rx = car.render_x

@@ -43,6 +43,14 @@ class TileTrack:
         if self.rotations is None:
             self.rotations = [[0] * GRID_COLS for _ in range(GRID_ROWS)]
 
+        # ── Driveable set (embedded in track JSON for server-safety) ──
+        embedded = tile_data.get("driveable_tiles")
+        if embedded is not None:
+            self._driveable_set = set(embedded)
+            self._driveable_set.add(T_FINISH)  # always driveable
+        else:
+            self._driveable_set = None  # fallback to tile_defs
+
         # ── Pre-render ──
         self.track_surface = self._render_track()
         self.boundary_mask, self.boundary_surface = self._create_boundary_mask()
@@ -120,7 +128,8 @@ class TileTrack:
         Crea mascara de colision usando el nuevo builder con soporte
         para collision_type none/full/polygon por tile.
         """
-        return build_boundary_mask(self.terrain, rotations=self.rotations)
+        return build_boundary_mask(self.terrain, rotations=self.rotations,
+                                   driveable_set=self._driveable_set)
 
     # ────────────────────────────────────────────
     # FINISH LINE
@@ -170,9 +179,17 @@ class TileTrack:
                 return (1, 0)
         return (1, 0)
 
+    def _is_tid_driveable(self, tid):
+        """Check if a tile ID is driveable using embedded set or fallback."""
+        if tid == T_EMPTY:
+            return False
+        if self._driveable_set is not None:
+            return tid in self._driveable_set
+        return is_driveable(tid)
+
     def _is_driveable_at(self, row, col):
         if 0 <= row < GRID_ROWS and 0 <= col < GRID_COLS:
-            return is_driveable(self.terrain[row][col])
+            return self._is_tid_driveable(self.terrain[row][col])
         return False
 
     # ────────────────────────────────────────────
@@ -192,7 +209,7 @@ class TileTrack:
         if start is None:
             for row in range(GRID_ROWS):
                 for col in range(GRID_COLS):
-                    if is_driveable(self.terrain[row][col]):
+                    if self._is_tid_driveable(self.terrain[row][col]):
                         start = (row, col)
                         break
                 if start:
@@ -221,7 +238,7 @@ class TileTrack:
                     continue
                 if not (0 <= nr < GRID_ROWS and 0 <= nc < GRID_COLS):
                     continue
-                if not is_driveable(self.terrain[nr][nc]):
+                if not self._is_tid_driveable(self.terrain[nr][nc]):
                     continue
 
                 if prev_dir is not None:
@@ -369,7 +386,7 @@ class TileTrack:
         col = int(wx // TILE_SIZE)
         row = int(wy // TILE_SIZE)
         if 0 <= row < GRID_ROWS and 0 <= col < GRID_COLS:
-            return is_driveable(self.terrain[row][col])
+            return self._is_tid_driveable(self.terrain[row][col])
         return False
 
     # ────────────────────────────────────────────
@@ -389,7 +406,7 @@ class TileTrack:
         for row in range(GRID_ROWS):
             for col in range(GRID_COLS):
                 tid = self.terrain[row][col]
-                if is_driveable(tid):
+                if self._is_tid_driveable(tid):
                     color = (90, 90, 90)
                 elif tid != T_EMPTY:
                     color = (60, 80, 60)

@@ -39,9 +39,10 @@ class Room:
         self._auto_start_timer = 0.0
         self._auto_start_triggered = False
 
-        # Countdown
+        # Countdown (4 segundos: "3" 1s + "2" 1s + "1" 1s + "GO!" 1s)
+        # Debe coincidir con el countdown del cliente para evitar gap
         self._countdown_timer = 0.0
-        self._countdown_secs = 3
+        self._countdown_secs = 4
 
         # Racing
         self._snapshot_seq = 0
@@ -117,9 +118,10 @@ class Room:
         self.world = WorldSimulation(
             self._track_data, player_list, self.bot_count)
 
-        # Broadcast race start con countdown
-        self.net_server.broadcast_race_start(self._countdown_secs)
-        print(f"[ROOM] Race starting! Countdown: {self._countdown_secs}s")
+        # Broadcast race start con countdown (enviar valor de display, no timer total)
+        display_countdown = self._countdown_secs - 1  # 4-1=3 → "3, 2, 1, GO!"
+        self.net_server.broadcast_race_start(display_countdown)
+        print(f"[ROOM] Race starting! Countdown: {display_countdown}s + GO!")
 
         self._countdown_timer = 0.0
         self.state = ROOM_COUNTDOWN
@@ -168,6 +170,15 @@ class Room:
         """Empaqueta y envia snapshot de estado a todos los clientes."""
         self._snapshot_seq = (self._snapshot_seq + 1) % 65536
         w = self.world
+
+        # DEBUG: primeros 3 snapshots
+        if self._snapshot_seq <= 3:
+            for car in w.cars:
+                lis = last_seqs.get(car.player_id, 0) if last_seqs else 0
+                print(f"[DEBUG-SNAP] seq={self._snapshot_seq} "
+                      f"car={car.name}(pid={car.player_id}) "
+                      f"x={car.x:.1f} y={car.y:.1f} "
+                      f"last_input_seq={lis}")
         data = pack_state_snapshot(
             w.cars, w.missiles, w.smart_missiles,
             w.oil_slicks, w.mines, w.powerup_items,

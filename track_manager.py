@@ -105,6 +105,15 @@ def save_tile_track(filename, name, terrain, tile_overrides=None,
     if powerup_zones:
         data["powerup_zones"] = powerup_zones
 
+    # Embed driveable tile IDs so dedicated servers don't need tileset.png
+    from tile_defs import is_driveable as _td_is_driveable, T_EMPTY
+    driveable_ids = set()
+    for row in terrain:
+        for tid in row:
+            if tid != T_EMPTY and _td_is_driveable(tid):
+                driveable_ids.add(tid)
+    data["driveable_tiles"] = sorted(driveable_ids)
+
     filepath = os.path.join(TRACKS_DIR, filename)
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=None)

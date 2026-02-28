@@ -11,14 +11,16 @@
 
 ```
 racing_game/
-├── main.py              (~40 lines)  - Entry point + --train-subprocess routing
-├── game.py              (~1300 lines) - Game loop, state machine, orchestration
-├── settings.py          (~250 lines) - All configuration constants
-├── track_manager.py     (~170 lines) - Track file I/O (JSON save/load)
-├── tile_track.py        (~350 lines) - Tile-based track (TileTrack class)
-├── tile_defs.py         (312 lines) - Tile definitions, classification, sprites
+├── main.py              (~40 lines)  - Entry point + --train/--dedicated routing
+├── game.py              (~2200 lines) - Game loop, state machine, orchestration
+├── settings.py          (~270 lines) - All configuration constants
+├── track_manager.py     (~200 lines) - Track file I/O (JSON save/load)
+├── tile_track.py        (~500 lines) - Tile-based track (TileTrack class)
+├── tile_defs.py         (~360 lines) - Tile definitions, classification, sprites
+├── tile_meta.py         (~240 lines) - Per-tile metadata (friction, collision shapes)
+├── tile_collision.py    (~180 lines) - Collision shapes + boundary mask builder
 ├── editor.py           (~1200 lines) - Tile editor (TileEditor class)
-├── version.txt                      - Current version number (e.g. "1.0.1")
+├── version.txt                      - Current version number (e.g. "1.2.0")
 │
 ├── networking/
 │   ├── __init__.py                  - Package marker
@@ -28,6 +30,12 @@ racing_game/
 │   ├── client.py        (~330 lines) - GameClient (client-side UDP, supports LAN + relay)
 │   ├── relay_protocol.py (~120 lines) - Relay binary protocol (room commands + forwarding)
 │   └── relay_socket.py  (~210 lines) - RelaySocket drop-in adapter for transparent relay
+│
+├── server/
+│   ├── __init__.py                  - Package marker
+│   ├── dedicated_server.py (~120 lines) - Headless dedicated server (fixed timestep loop)
+│   ├── room.py          (~190 lines) - Room state machine (LOBBY→COUNTDOWN→RACING→DONE)
+│   └── world_simulation.py (~410 lines) - Authoritative world simulation (physics, AI, powerups)
 │
 ├── relay_server/
 │   ├── relay_server.py  (~250 lines) - Standalone relay server (stdlib only, Python 3.8+)
@@ -41,8 +49,8 @@ racing_game/
 │
 ├── systems/
 │   ├── input_handler.py  (81 lines) - Keyboard → car inputs
-│   ├── physics.py       (161 lines) - Acceleration, friction, turning, wall bounce
-│   ├── collision.py     (168 lines) - All collision detection & resolution
+│   ├── physics.py       (~170 lines) - Acceleration, friction, turning, wall bounce
+│   ├── collision.py     (~470 lines) - Circle-vs-Tile-AABB + sub-stepped CCD collisions
 │   ├── camera.py        (159 lines) - Smooth camera with look-ahead + rotation
 │   └── ai.py            (~300 lines) - Bot waypoint following + power-up tactics + RLSystem
 │
@@ -106,6 +114,9 @@ Multiplayer LAN:
 Multiplayer Relay (internet):
   Track Select → R → STATE_RELAY_HOST → create room → STATE_HOST_LOBBY → (same as LAN)
   Menu → R → STATE_RELAY_JOIN → enter code → STATE_CONNECTING → (same as LAN)
+
+Dedicated Server (headless):
+  main.py --dedicated-server → DedicatedServer → Room(LOBBY→COUNTDOWN→RACING→DONE)
 ```
 
 States defined in `settings.py`: `STATE_MENU`, `STATE_COUNTDOWN`, `STATE_RACING`, `STATE_VICTORY`, `STATE_EDITOR`, `STATE_TRACK_SELECT`, `STATE_TRAINING`, `STATE_HOST_LOBBY`, `STATE_JOIN_LOBBY`, `STATE_CONNECTING`, `STATE_ONLINE_RACING`, `STATE_ONLINE_COUNTDOWN`, `STATE_RELAY_HOST`, `STATE_RELAY_JOIN`.
@@ -171,9 +182,9 @@ METHODS:    draw(surface, camera), check_car_collision(mask, rect),
 - ~1982 non-empty tiles loaded, ~796 classified as road
 - Sprites cached at 64x64 in `_sprites` dict
 
-### Key API
+### Key API (tile_defs.py)
 ```python
-is_driveable(tile_id) → bool
+is_driveable(tile_id) → bool      # WARNING: returns False for all tiles on headless server (no tileset.png)
 get_tile_sprite(tile_id) → Surface(64x64) | None
 get_tiles_by_category(cat) → [tile_id, ...]
 get_tileset_sheet() → Surface (original image)
@@ -182,6 +193,17 @@ get_tile_at_position(src_row, src_col) → tile_id | None
 get_tile_info(tile_id) → dict | None
 empty_terrain() → [[T_EMPTY]*56 for _ in range(37)]
 ```
+
+### Tile Metadata (tile_meta.py)
+Per-tile metadata stored in `assets/levels/tileset_meta.json`. Auto-generated from pixel classification on first run.
+- Categories: `terrain` (driveable), `props` (decorative blockers), `obstacles` (walls), `special` (finish)
+- Collision types: `none` (free), `full` (solid wall), `polygon` (custom shape with normalized 0-1 vertices)
+- `TileMetadataManager` singleton: `get_manager()` → `.get(tid)`, `.is_driveable(tid)`, `.get_friction(tid)`
+
+### Boundary Mask (tile_collision.py)
+- `build_boundary_mask(terrain, rotations, driveable_set)` — world-sized `pygame.mask.Mask` for ray/missile collision
+- Uses `tile_meta` collision_type per tile. Accepts `driveable_set` for server-safe fallback.
+- `build_friction_map(terrain, overrides)` — per-tile friction grid for variable surface friction
 
 ## Editor (editor.py — TileEditor)
 
@@ -258,16 +280,18 @@ empty_terrain() → [[T_EMPTY]*56 for _ in range(37)]
   "terrain": [[0,0,0,...], [0,1,1,...], ...],
   "rotations": [[0,0,1,...], ...],
   "checkpoint_zones": [[x, y, w, h], ...],
-  "circuit_direction": [x1, y1, x2, y2]
+  "circuit_direction": [x1, y1, x2, y2],
+  "driveable_tiles": [1, 206, 207, 271]
 }
 ```
 - `rotations` (v4): per-tile rotation 0-3 (0/90/180/270 deg). Bumps version to 4.
 - `checkpoint_zones`: manual checkpoint rectangles from editor (0-indexed, C0 = finish area).
 - `circuit_direction`: optional arrow [start_x, start_y, end_x, end_y] in world coords.
+- `driveable_tiles`: sorted list of unique tile IDs that are driveable (auto-computed on save). **Critical for dedicated servers** that don't have `tileset.png` — without this field, the server cannot determine which tiles are road vs wall.
 
 Tracks stored in `tracks/` directory. `list_tracks()` returns both formats with `type` field.
 
-`save_tile_track(filename, name, terrain, tile_overrides=None, rotations=None, checkpoint_zones=None, circuit_direction=None)`
+`save_tile_track(filename, name, terrain, tile_overrides=None, rotations=None, checkpoint_zones=None, circuit_direction=None, powerup_zones=None)`
 
 ## Camera System (systems/camera.py)
 
@@ -293,11 +317,23 @@ Tracks stored in `tracks/` directory. `list_tracks()` returns both formats with 
 
 ## Collision (systems/collision.py)
 
-- **Car vs wall:** 16 rays around car, compute normal, iterative push-out
-- **Car vs car:** Mask overlap, push apart
-- **Car vs finish line:** Segment intersection (lap detection)
-- **Car vs checkpoints:** Zone rect collision (manual zones from editor, sequential order)
-- **Car vs power-ups/missiles/oil:** Distance checks
+Two collision backends depending on track type:
+
+### Tile tracks: Circle-vs-Tile-AABB (geometric)
+- Car has `collision_radius` (default 12px). Each frame, the circle is tested against solid tile AABBs.
+- `_circle_vs_tiles(cx, cy, r)` → finds closest point on each nearby solid tile's AABB to the circle center, returns (hit, normal, penetration).
+- `_solid` grid pre-computed in `__init__` from track's `_driveable_set` (or `tile_defs.is_driveable()` fallback).
+- `move_with_substeps(car, dt)` — CCD anti-tunneling: splits movement into sub-steps of max `COLLISION_MAX_STEP` (8px). On collision: geometric push-out by penetration depth. Falls back to rollback if push-out creates new collision (corners/narrow corridors).
+- `ensure_valid_spawn(car)` — iterative push-out (max 10 steps) to ensure car doesn't spawn inside a wall.
+
+### Classic tracks: 16-point mask sampling (fallback)
+- 16 points sampled around circle perimeter tested against `boundary_mask`.
+- On collision: rollback to previous position.
+
+### Other collisions
+- **Car vs car:** Distance between centers < sum of radii. Push apart by overlap, reflect velocities.
+- **Car vs checkpoints:** Zone rect collision (manual zones from editor, sequential order).
+- **Car vs power-ups/missiles/oil/mines:** Distance checks.
 
 ## RL Training System
 
@@ -443,6 +479,42 @@ Online clients do NOT call `_activate_powerup()` locally on click. Instead:
 3. Flag is cleared after send (one-shot)
 4. Server activates the powerup authoritatively
 
+## Dedicated Server (server/)
+
+### Architecture
+Headless authoritative server that runs the full game simulation without a display. Clients connect via LAN or relay and receive state snapshots.
+
+```
+main.py --dedicated-server track_file [--bots N] [--port P]
+  → SDL_VIDEODRIVER=dummy + pygame.display.set_mode((1,1))
+  → DedicatedServer(track, bots, port).run()
+```
+
+### Components
+
+| File | Role |
+|------|------|
+| `dedicated_server.py` | Fixed-timestep main loop (60Hz physics, MAX_TICKS_PER_FRAME=2 catch-up) |
+| `room.py` | State machine: LOBBY → COUNTDOWN → RACING → DONE |
+| `world_simulation.py` | Authoritative simulation: physics, collisions, AI, power-ups, checkpoints |
+
+### Room State Machine
+- **LOBBY**: Broadcasts lobby state every 250ms. Auto-starts race when `DEDICATED_MIN_PLAYERS` connected for `DEDICATED_AUTO_START_DELAY` seconds.
+- **COUNTDOWN**: 4 seconds total (`_countdown_secs=4`). Sends `display_countdown=3` to clients (shows "3, 2, 1, GO!"). Must match client countdown duration to avoid position jumps.
+- **RACING**: Pops 1 input per player per tick. Runs `WorldSimulation.step()`. Broadcasts snapshots at 30Hz (every 2nd tick). Broadcasts power-up events (3x redundancy).
+- **DONE**: Race finished (all cars done or 15s after winner).
+
+### Server-Safe Tile Classification (CRITICAL)
+The dedicated server typically runs on a VPS **without `tileset.png`**. Without the tileset image, `tile_defs._do_load()` fails and ALL road tiles are treated as walls. This causes wrong start positions, wrong collision grid, and wrong DFS path.
+
+**Solution:** Track JSON includes `driveable_tiles` (list of driveable tile IDs, auto-computed when saving from the editor). At runtime:
+- `TileTrack` builds `_driveable_set` from the embedded list
+- `CollisionSystem._solid` grid uses `track._driveable_set` instead of `tile_defs.is_driveable()`
+- `tile_collision.build_boundary_mask()` uses `driveable_set` for tiles not in `tile_meta`
+- All internal `_trace_circuit()`, `_is_driveable_at()`, `_is_world_pos_driveable()` use the embedded set
+
+**Tracks must be re-saved from the editor** after this change to embed `driveable_tiles`. Old tracks without this field fall back to `tile_defs.is_driveable()`.
+
 ## Important Patterns
 
 1. **Lazy loading:** `tile_defs.py` loads tileset on first API call (`_ensure_loaded()`)
@@ -455,6 +527,7 @@ Online clients do NOT call `_activate_powerup()` locally on click. Instead:
 5. **Track interface compatibility:** Any new track type must provide the same attributes/methods as Track
 6. **Particle pool:** `DustParticleSystem` pre-allocates 120 `Particle` objects (with `__slots__`) to avoid per-frame allocations. Circular index reuses dead particles.
 7. **Path resolution:** Always use `utils/base_path.py` (`TRACKS_DIR`, `ASSETS_DIR`, `get_writable_dir()`) for file paths. Never use `os.path.dirname(__file__)` for data files — it breaks in PyInstaller frozen builds.
+8. **Server-safe tile checks:** Never call `tile_defs.is_driveable()` directly in code that runs on the dedicated server. Use `track._driveable_set` (from embedded `driveable_tiles` in the track JSON) or `track._is_tid_driveable()` instead. The server has no `tileset.png` and `is_driveable()` returns `False` for all tileset tiles.
 
 ## Render Order (_render_race)
 
@@ -505,6 +578,9 @@ cd racing_game
 pip install pygame
 pip install gymnasium stable-baselines3  # for RL training feature
 python main.py
+
+# To run the dedicated server (headless, for multiplayer):
+python main.py --dedicated-server tracks/leve_4.json --bots 1 --port 5555
 
 # To run the relay server (for internet multiplayer):
 python relay_server/relay_server.py --port 7777
@@ -565,3 +641,11 @@ Documented here for context if similar issues arise:
 9. **Client stuck on walls via relay** — Higher latency caused local prediction to collide with walls while the server saw no collision. `car._wall_normal` blocked acceleration locally, creating a stuck loop. Fixed by blending velocity/angle during reconciliation and clearing `_wall_normal` when server state shows the car moving normally.
 
 10. **Client couldn't use power-ups online** — Mouse click called `_activate_powerup()` locally, which consumed `held_powerup` without informing the server. The `input_use_powerup` flag was never set. Fixed by setting the flag on click (instead of activating locally) so `send_input()` notifies the server, which activates authoritatively.
+
+### Resolved Issues (v1.2.0 — Dedicated Server + Collision Rewrite)
+
+11. **Countdown timing mismatch (server vs client)** — Server had `_countdown_secs=3` while client expected 4 seconds (3,2,1,GO!). The 1-second gap caused the server to start physics before the client's countdown finished, resulting in a position jump when the client entered RACING state. Fixed by setting server `_countdown_secs=4` and sending `display_countdown = _countdown_secs - 1 = 3` to clients.
+
+12. **Dedicated server wrong tile classification (tileset.png missing)** — Root cause of cars spawning inside checkpoints/walls on the dedicated server. The VPS had no `tileset.png`, so `tile_defs._do_load()` failed silently → `_road_ids` empty → ALL road tiles treated as non-driveable → wrong DFS path → wrong start positions → `ensure_valid_spawn` pushed car into wrong location (40px x 96px mismatch vs client). Fixed by embedding `driveable_tiles` list in track JSON at save time. `TileTrack`, `CollisionSystem`, and `build_boundary_mask` now use this embedded set instead of `tile_defs.is_driveable()` when available.
+
+13. **Collision system rewrite (mask-based → circle-vs-tile-AABB)** — Original collision used pygame mask overlap which was angle-dependent, resolution-sensitive, and non-deterministic between client/server. Rewrote to geometric circle-vs-AABB intersection with sub-stepped CCD movement (`COLLISION_MAX_STEP=8px`). Cars have `collision_radius=12`. Push-out by exact penetration depth, with rollback fallback for corner cases. Consistent across all platforms.
