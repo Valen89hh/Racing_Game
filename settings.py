@@ -363,9 +363,12 @@ NET_SNAPSHOT_RATE = 30          # snapshots/segundo (broadcast cada 2do tick)
 NET_INPUT_RATE = 60             # inputs/segundo del cliente al host
 NET_TIMEOUT = 5.0               # segundos sin heartbeat → disconnect
 NET_HEARTBEAT_INTERVAL = 1.0    # segundos entre pings
-NET_INTERPOLATION_DELAY = 0.1   # 100ms delay buffer para autos remotos
+NET_INTERPOLATION_DELAY = 0.1   # 100ms delay buffer para autos remotos (fallback)
+NET_INTERP_MIN_DELAY = 0.033   # mínimo 33ms (1 snapshot interval @ 30Hz)
+NET_INTERP_MAX_DELAY = 0.200   # máximo 200ms (para relay con alto jitter)
 NET_MAX_SNAPSHOT_BUFFER = 60    # 2 segundos de snapshots a 30Hz
 NET_TELEPORT_THRESHOLD = 500.0  # distancia para snap teleport (error extremo)
+NET_EXTRAPOLATION_MAX = 0.100   # máximo 100ms de extrapolación dead-reckoning
 FIXED_DT = 1.0 / 60.0           # dt fijo para TODA la simulación (host, predicción, replay)
 VISUAL_SMOOTH_RATE = 25.0       # velocidad de suavizado visual residual (mayor = más rápido)
 SERVER_INPUT_QUEUE_SIZE = 32    # max inputs buffered por jugador en el servidor

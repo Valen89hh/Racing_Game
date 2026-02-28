@@ -91,11 +91,17 @@ def unpack_join_reject(data):
 
 
 # ── PLAYER_INPUT: C→H ──
-# [header][player_id:1B][accel:b][turn:b][brake:B][use_powerup:B][seq:H]
+# Single input: [player_id:1B][accel:b][turn:b][brake:B][use_powerup:B][seq:H]
 INPUT_FMT = "!BbbBBH"
 INPUT_SIZE = struct.calcsize(INPUT_FMT)
 
+# Redundant input packet: [header][count:1B][input1][input2][input3]
+# count = number of inputs (1-3), newest first
+INPUT_REDUNDANCY = 3
+
+
 def pack_input(player_id, accel, turn, brake, use_powerup, seq=0):
+    """Pack a single input (legacy, still used by server for compatibility)."""
     accel_i = max(-127, min(127, int(accel * 127)))
     turn_i = max(-127, min(127, int(turn * 127)))
     return _pack_header(PKT_PLAYER_INPUT, seq) + struct.pack(
@@ -104,17 +110,56 @@ def pack_input(player_id, accel, turn, brake, use_powerup, seq=0):
     )
 
 
+def pack_input_redundant(player_id, inputs):
+    """Pack multiple inputs for redundancy. inputs = [(accel, turn, brake, use_pw, seq), ...] newest first."""
+    count = min(len(inputs), INPUT_REDUNDANCY)
+    newest_seq = inputs[0][4] if inputs else 0
+    body = struct.pack("!B", count)
+    for i in range(count):
+        accel, turn, brake, use_pw, seq = inputs[i]
+        accel_i = max(-127, min(127, int(accel * 127)))
+        turn_i = max(-127, min(127, int(turn * 127)))
+        body += struct.pack(INPUT_FMT, player_id, accel_i, turn_i,
+                            1 if brake else 0, 1 if use_pw else 0, seq)
+    return _pack_header(PKT_PLAYER_INPUT, newest_seq) + body
+
+
 def unpack_input(data):
+    """Unpack input packet. Returns list of input dicts (newest first).
+    Backward compatible: old single-input packets return a 1-element list."""
     _, seq_h, payload = _unpack_header(data)
+    # Detect redundant format: if payload starts with count byte and
+    # total size matches count * INPUT_SIZE + 1
+    if len(payload) >= 1 + INPUT_SIZE:
+        count = payload[0]
+        expected = 1 + count * INPUT_SIZE
+        if 1 <= count <= INPUT_REDUNDANCY and len(payload) >= expected:
+            results = []
+            offset = 1
+            for _ in range(count):
+                pid, accel_i, turn_i, brake, use_pw, seq = struct.unpack_from(
+                    INPUT_FMT, payload, offset)
+                results.append({
+                    "player_id": pid,
+                    "accel": accel_i / 127.0,
+                    "turn": turn_i / 127.0,
+                    "brake": bool(brake),
+                    "use_powerup": bool(use_pw),
+                    "seq": seq,
+                })
+                offset += INPUT_SIZE
+            return results
+
+    # Legacy single-input format
     pid, accel_i, turn_i, brake, use_pw, seq = struct.unpack_from(INPUT_FMT, payload, 0)
-    return {
+    return [{
         "player_id": pid,
         "accel": accel_i / 127.0,
         "turn": turn_i / 127.0,
         "brake": bool(brake),
         "use_powerup": bool(use_pw),
         "seq": seq,
-    }
+    }]
 
 
 # ── STATE_SNAPSHOT: H→C ──

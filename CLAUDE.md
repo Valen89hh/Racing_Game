@@ -12,7 +12,7 @@
 ```
 racing_game/
 ├── main.py              (~40 lines)  - Entry point + --train/--dedicated routing
-├── game.py              (~2200 lines) - Game loop, state machine, orchestration
+├── game.py              (~2250 lines) - Game loop, state machine, orchestration
 ├── settings.py          (~270 lines) - All configuration constants
 ├── track_manager.py     (~200 lines) - Track file I/O (JSON save/load)
 ├── tile_track.py        (~500 lines) - Tile-based track (TileTrack class)
@@ -24,10 +24,10 @@ racing_game/
 │
 ├── networking/
 │   ├── __init__.py                  - Package marker
-│   ├── protocol.py      (~475 lines) - Binary UDP protocol (pack/unpack all packet types)
+│   ├── protocol.py      (~530 lines) - Binary UDP protocol (pack/unpack, redundant inputs)
 │   ├── net_state.py     (~100 lines) - Data classes (NetCarState, StateSnapshot, InputState)
-│   ├── server.py        (~400 lines) - GameServer (host-side UDP, supports LAN + relay)
-│   ├── client.py        (~330 lines) - GameClient (client-side UDP, supports LAN + relay)
+│   ├── server.py        (~470 lines) - GameServer (host-side UDP, supports LAN + relay)
+│   ├── client.py        (~410 lines) - GameClient (client-side UDP, adaptive interp, redundant input)
 │   ├── relay_protocol.py (~120 lines) - Relay binary protocol (room commands + forwarding)
 │   └── relay_socket.py  (~210 lines) - RelaySocket drop-in adapter for transparent relay
 │
@@ -161,7 +161,8 @@ METHODS:    draw(surface, camera), check_car_collision(mask, rect),
 - **Laps:** 3 per race
 - **Power-ups:** Boost (3s), Shield (12s), Missile (700px/s), Oil (8s on ground)
 - **Dust particles:** pool=120, threshold=80px/s, lifetime=0.3-0.8s, alpha fade+shrink
-- **Networking:** port=5555 (LAN), tick_rate=30Hz, input_rate=60Hz, timeout=5s
+- **Networking:** port=5555 (LAN), tick_rate=60Hz, snapshot_rate=30Hz, input_rate=60Hz, timeout=5s
+- **Networking advanced:** input_redundancy=3, interp_min=33ms, interp_max=200ms, extrapolation_max=100ms
 - **Relay:** port=7777, heartbeat=3s, peer_timeout=10s, room_code=4 chars
 
 ## Tile System (tile_defs.py)
@@ -479,6 +480,56 @@ Online clients do NOT call `_activate_powerup()` locally on click. Instead:
 3. Flag is cleared after send (one-shot)
 4. Server activates the powerup authoritatively
 
+### Client Predictive Car-vs-Car Collision
+Local prediction (`_simulate_car_step_headless`) only simulates wall collisions. Without car-vs-car prediction, the local car visually passes through remote cars for a few frames until the server correction arrives (causing a "teleport snap-back").
+
+**Solution:** `_predict_car_vs_car_local(local_car, remote_car)` — one-sided push that only moves the local car away from the remote car. Uses the same `half = (overlap+1)*0.5` push distance as the server so the prediction matches. Applied in two places:
+1. After `_simulate_car_step_headless()` in the main prediction loop (each tick)
+2. After `_simulate_car_step_headless()` in the reconciliation replay loop
+
+Does NOT move remote cars (server-authoritative). Does NOT modify the server, protocol, or collision system.
+
+### Input Redundancy (Packet Loss Recovery)
+Each input packet carries the last 3 inputs (newest first) instead of just 1. If packet N is lost but N+1 arrives, the server recovers input N from the redundant data in N+1.
+
+**Protocol format:** `[header][count:1B][input1:7B][input2:7B][input3:7B]`
+- `count`: 1–3 (number of inputs in packet)
+- Each input: same `INPUT_FMT` as before (player_id, accel, turn, brake, use_pw, seq)
+- `pack_input_redundant(pid, inputs)` / `unpack_input(data)` → returns list of dicts
+- **Backward compatible:** `unpack_input` auto-detects legacy single-input packets
+
+**Client:** `_recent_inputs` ring buffer (max 3 entries, newest first). `send_input()` calls `pack_input_redundant()`.
+**Server:** `_handle_input()` iterates over the input list. Existing dedup by seq rejects already-processed inputs.
+**Overhead:** +15 bytes/packet (25 vs 10). At 60Hz = ~900 bytes/s extra.
+
+### Remote Car Extrapolation (Dead Reckoning)
+When `render_time` is beyond the latest snapshot (late arrival / jitter), instead of freezing the remote car at the last known position, extrapolate using velocity:
+```python
+target_car.x += car_state.vx * dt_extra
+target_car.y += car_state.vy * dt_extra
+```
+- `dt_extra` capped at `NET_EXTRAPOLATION_MAX` (100ms) to prevent runaway divergence
+- Only activates when no snapshot pair is available for interpolation
+- Falls back to regular `apply_net_state()` when snapshots arrive on time
+
+### Adaptive Interpolation Delay
+The interpolation delay for remote cars adjusts dynamically based on measured network jitter, instead of using a fixed 100ms constant.
+
+**Algorithm:** In `_handle_snapshot()`, measure inter-arrival times of consecutive snapshots. Compute:
+```
+adaptive_delay = avg_interval + 2 * stddev(intervals)
+```
+Clamped between `NET_INTERP_MIN_DELAY` (33ms) and `NET_INTERP_MAX_DELAY` (200ms).
+
+**Measured results:**
+- **LAN** (~2ms jitter): delay = ~36ms (vs 100ms fixed — 64ms more responsive)
+- **Relay** (~20ms jitter): delay = ~78ms (auto-adapts)
+- **Bad connection** (~40ms jitter): delay = ~119ms (auto-buffers more)
+
+**API:** `GameClient.get_adaptive_delay()` → float (seconds). Used in `game.py` for `render_time` calculation. Shown in F3 debug overlay as "Interp dl".
+
+**Reset:** `clear_snapshots()` resets jitter samples and falls back to `NET_INTERPOLATION_DELAY` (100ms) until enough samples (5+) are collected.
+
 ## Dedicated Server (server/)
 
 ### Architecture
@@ -528,6 +579,9 @@ The dedicated server typically runs on a VPS **without `tileset.png`**. Without 
 6. **Particle pool:** `DustParticleSystem` pre-allocates 120 `Particle` objects (with `__slots__`) to avoid per-frame allocations. Circular index reuses dead particles.
 7. **Path resolution:** Always use `utils/base_path.py` (`TRACKS_DIR`, `ASSETS_DIR`, `get_writable_dir()`) for file paths. Never use `os.path.dirname(__file__)` for data files — it breaks in PyInstaller frozen builds.
 8. **Server-safe tile checks:** Never call `tile_defs.is_driveable()` directly in code that runs on the dedicated server. Use `track._driveable_set` (from embedded `driveable_tiles` in the track JSON) or `track._is_tid_driveable()` instead. The server has no `tileset.png` and `is_driveable()` returns `False` for all tileset tiles.
+9. **Input redundancy:** Client sends last 3 inputs per packet via `pack_input_redundant()`. Server deduplicates naturally via seq check. If modifying input protocol, update both `pack_input_redundant()` and `unpack_input()` in `protocol.py`.
+10. **Adaptive interpolation:** Remote car interpolation delay is dynamic (`get_adaptive_delay()`), not the fixed `NET_INTERPOLATION_DELAY` constant. The constant is only used as the initial fallback before enough jitter samples are collected.
+11. **Client-side car-vs-car prediction:** `_predict_car_vs_car_local()` only pushes the local car (one-sided). Never move remote cars in client prediction — they are server-authoritative.
 
 ## Render Order (_render_race)
 
@@ -649,3 +703,13 @@ Documented here for context if similar issues arise:
 12. **Dedicated server wrong tile classification (tileset.png missing)** — Root cause of cars spawning inside checkpoints/walls on the dedicated server. The VPS had no `tileset.png`, so `tile_defs._do_load()` failed silently → `_road_ids` empty → ALL road tiles treated as non-driveable → wrong DFS path → wrong start positions → `ensure_valid_spawn` pushed car into wrong location (40px x 96px mismatch vs client). Fixed by embedding `driveable_tiles` list in track JSON at save time. `TileTrack`, `CollisionSystem`, and `build_boundary_mask` now use this embedded set instead of `tile_defs.is_driveable()` when available.
 
 13. **Collision system rewrite (mask-based → circle-vs-tile-AABB)** — Original collision used pygame mask overlap which was angle-dependent, resolution-sensitive, and non-deterministic between client/server. Rewrote to geometric circle-vs-AABB intersection with sub-stepped CCD movement (`COLLISION_MAX_STEP=8px`). Cars have `collision_radius=12`. Push-out by exact penetration depth, with rollback fallback for corner cases. Consistent across all platforms.
+
+### Networking Improvements (v1.2.x — Multiplayer Quality)
+
+14. **Car-vs-car visual pass-through in multiplayer** — Client prediction (`_simulate_car_step_headless`) only simulated wall collisions but not car-vs-car. When Player A drove into Player B, A's local prediction showed pass-through for a few frames, then snapped back when the server correction arrived. Fixed with `_predict_car_vs_car_local()` — one-sided push matching the server's `half = (overlap+1)*0.5` formula. Applied in both the prediction loop and the reconciliation replay loop.
+
+15. **Input packet loss causing server-side prediction errors** — Each input was sent once per frame. A single lost UDP packet meant the server had no input for that tick and repeated the previous one, causing divergence and large reconciliation corrections. Fixed by sending the last 3 inputs in every packet (`pack_input_redundant`). Server deduplicates via existing seq check. Overhead: +15 bytes/packet (~900 bytes/s at 60Hz).
+
+16. **Remote cars freezing on late snapshots** — When a snapshot arrived late (jitter), remote cars froze at their last known position until the next snapshot. Fixed with dead-reckoning extrapolation: `pos += velocity * dt_extra` capped at 100ms (`NET_EXTRAPOLATION_MAX`). Cars now continue moving in their last known direction instead of stopping.
+
+17. **Fixed 100ms interpolation delay too high for LAN, too low for relay** — The constant `NET_INTERPOLATION_DELAY = 0.1` was a compromise that was too sluggish for LAN (~2ms RTT) and sometimes insufficient for relay (~150ms RTT). Fixed with adaptive delay based on measured snapshot inter-arrival jitter: `delay = avg_interval + 2 * stddev`. LAN auto-tunes to ~36ms, relay to ~78-120ms depending on conditions. Clamped between 33ms and 200ms.

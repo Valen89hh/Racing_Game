@@ -18,14 +18,17 @@ from networking.protocol import (
     unpack_join_accept, unpack_join_reject, unpack_state_snapshot,
     unpack_lobby_state, unpack_race_start, unpack_track_chunk,
     unpack_powerup_event, unpack_ping,
-    pack_join_request, pack_input, pack_track_ack,
+    pack_join_request, pack_input, pack_input_redundant,
+    pack_track_ack,
     pack_ping, pack_disconnect,
+    INPUT_REDUNDANCY,
 )
 from networking.net_state import StateSnapshot, InputState
 
 from settings import (
     NET_DEFAULT_PORT, NET_TIMEOUT, NET_HEARTBEAT_INTERVAL,
-    NET_MAX_SNAPSHOT_BUFFER,
+    NET_MAX_SNAPSHOT_BUFFER, NET_INTERPOLATION_DELAY,
+    NET_INTERP_MIN_DELAY, NET_INTERP_MAX_DELAY,
 )
 
 
@@ -78,10 +81,18 @@ class GameClient:
         # Input sequence
         self._input_seq = 0
 
+        # Input redundancy: ring buffer of last N sent inputs (newest first)
+        self._recent_inputs = []  # [(accel, turn, brake, use_pw, seq), ...]
+
         # Clock offset estimation (server_race_time ↔ client wall-clock)
         self._clock_offsets = []       # list of (recv_time - race_time) samples
         self._clock_offset = 0.0       # current estimated offset
         self._clock_synced = False
+
+        # Adaptive interpolation delay (jitter measurement)
+        self._last_snap_recv_time = 0.0          # recv_time del último snapshot
+        self._snap_intervals = []                 # últimos N inter-arrival times
+        self._adaptive_delay = NET_INTERPOLATION_DELAY  # valor actual adaptativo
 
     def connect_async(self, player_name):
         """Inicia conexión en un hilo separado (no bloquea game loop)."""
@@ -227,6 +238,30 @@ class GameClient:
             self._clock_offset = sorted_offsets[len(sorted_offsets) // 2]
             self._clock_synced = True
 
+        # Adaptive interpolation delay (jitter measurement)
+        now = snapshot.recv_time
+        if self._last_snap_recv_time > 0:
+            interval = now - self._last_snap_recv_time
+            if 0.001 < interval < 0.500:  # ignore outliers (>500ms = reconnect/pause)
+                self._snap_intervals.append(interval)
+                if len(self._snap_intervals) > 30:
+                    self._snap_intervals.pop(0)
+                self._update_adaptive_delay()
+        self._last_snap_recv_time = now
+
+    def _update_adaptive_delay(self):
+        """Recalcula el delay de interpolación basado en jitter de snapshots."""
+        n = len(self._snap_intervals)
+        if n < 5:
+            return  # No hay suficientes muestras
+        avg = sum(self._snap_intervals) / n
+        variance = sum((x - avg) ** 2 for x in self._snap_intervals) / n
+        stddev = variance ** 0.5
+        # delay = intervalo promedio + 2 * desviación estándar
+        delay = avg + 2.0 * stddev
+        self._adaptive_delay = max(NET_INTERP_MIN_DELAY,
+                                   min(delay, NET_INTERP_MAX_DELAY))
+
     def _handle_lobby_state(self, data):
         lobby = unpack_lobby_state(data)
         with self._lobby_lock:
@@ -280,12 +315,17 @@ class GameClient:
     # ── API pública ──
 
     def send_input(self, accel, turn, brake, use_powerup):
-        """Envía input del frame al servidor."""
+        """Envía input del frame al servidor con redundancia (últimos 3 inputs)."""
         if not self.connected or not self.socket:
             return
         self._input_seq = (self._input_seq + 1) % 65536
-        data = pack_input(self.player_id, accel, turn, brake,
-                          use_powerup, self._input_seq)
+
+        # Add to recent inputs buffer (newest first)
+        self._recent_inputs.insert(0, (accel, turn, brake, use_powerup, self._input_seq))
+        if len(self._recent_inputs) > INPUT_REDUNDANCY:
+            self._recent_inputs.pop()
+
+        data = pack_input_redundant(self.player_id, self._recent_inputs)
         try:
             self.socket.sendto(data, self.host_addr)
         except OSError:
@@ -305,6 +345,9 @@ class GameClient:
             self._snapshots.clear()
         self._clock_offsets.clear()
         self._clock_synced = False
+        self._last_snap_recv_time = 0.0
+        self._snap_intervals.clear()
+        self._adaptive_delay = NET_INTERPOLATION_DELAY
 
     def get_interpolation_states(self):
         """Retorna (prev, curr) snapshots para interpolación."""
@@ -320,6 +363,10 @@ class GameClient:
         if not self._clock_synced:
             return 0.0
         return time.time() - self._clock_offset
+
+    def get_adaptive_delay(self):
+        """Retorna el delay de interpolación adaptativo actual (en segundos)."""
+        return self._adaptive_delay
 
     def get_snapshots_for_time(self, render_time):
         """Busca (prev, next, t) snapshots que encuadran render_time por race_time.

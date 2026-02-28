@@ -47,7 +47,7 @@ from settings import (
     AUTOPILOT_DURATION, TELEPORT_DISTANCE,
     SMART_MISSILE_LIFETIME,
     NET_DEFAULT_PORT, NET_TICK_RATE, NET_INTERPOLATION_DELAY,
-    NET_TELEPORT_THRESHOLD,
+    NET_TELEPORT_THRESHOLD, NET_EXTRAPOLATION_MAX,
     FIXED_DT, VISUAL_SMOOTH_RATE,
     SLOWMO_FACTOR,
     CAR_VS_CAR_SPEED_PENALTY,
@@ -1055,6 +1055,7 @@ class Game:
             f"Srv tick:  {s['server_tick']}",
             f"Input seq: {s['input_seq']}",
             f"Srv ack:   {s['last_server_seq']}",
+            f"Interp dl: {s.get('interp_delay', 0):.0f} ms",
         ]
 
         line_h = 18
@@ -2066,8 +2067,9 @@ class Game:
             self._sync_powerup_items(latest)
             self.race_timer.total_time = latest.race_time
 
-        # 3B. REMOTE CARS: Interpolar con delay buffer (server time)
-        render_time = self.net_client.get_server_time_now() - NET_INTERPOLATION_DELAY
+        # 3B. REMOTE CARS: Interpolar con delay buffer adaptativo (server time)
+        interp_delay = self.net_client.get_adaptive_delay()
+        render_time = self.net_client.get_server_time_now() - interp_delay
         prev_snap, next_snap, t = self.net_client.get_snapshots_for_time(render_time)
 
         if prev_snap and next_snap:
@@ -2084,12 +2086,17 @@ class Game:
                     else:
                         target_car.apply_net_state(car_state)
         elif next_snap:
-            # No hay par disponible (render_time fuera del buffer) → snap al último
+            # No hay par → extrapolación dead-reckoning con velocidad del último snapshot
+            dt_extra = render_time - next_snap.race_time
+            dt_extra = max(0.0, min(dt_extra, NET_EXTRAPOLATION_MAX))
             for car_state in next_snap.cars:
                 if car_state.player_id != self.my_player_id:
                     target_car = self._find_car_by_pid(car_state.player_id)
                     if target_car:
                         target_car.apply_net_state(car_state)
+                        if dt_extra > 0.001:
+                            target_car.x += car_state.vx * dt_extra
+                            target_car.y += car_state.vy * dt_extra
 
         # Procesar eventos de power-up
         for event in self.net_client.pop_powerup_events():
@@ -2108,6 +2115,7 @@ class Game:
             self._net_stats['ping'] = self.net_client.get_ping()
             self._net_stats['snap_rate'] = self._snap_rate_value
             self._net_stats['input_seq'] = self.net_client._input_seq
+            self._net_stats['interp_delay'] = self.net_client.get_adaptive_delay() * 1000
 
         # Partículas
         if self.dust_particles:

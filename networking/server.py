@@ -192,48 +192,50 @@ class GameServer:
             self.on_player_join(pid, name)
 
     def _handle_input(self, data, addr):
-        """Procesa input de un cliente. Appends a queue con orden por seq."""
+        """Procesa input de un cliente. Soporta paquetes con redundancia (1-3 inputs)."""
         with self._clients_lock:
             client = self._clients.get(addr)
             if not client:
                 return
             client.last_heartbeat = time.time()
 
-        inp = unpack_input(data)
-        input_state = InputState(
-            accel=inp["accel"],
-            turn=inp["turn"],
-            brake=inp["brake"],
-            use_powerup=inp["use_powerup"],
-            seq=inp["seq"],
-        )
-        pid = inp["player_id"]
+        input_list = unpack_input(data)
 
-        with self._inputs_lock:
-            if pid not in self._input_queues:
-                self._input_queues[pid] = deque(maxlen=SERVER_INPUT_QUEUE_SIZE)
+        for inp in input_list:
+            input_state = InputState(
+                accel=inp["accel"],
+                turn=inp["turn"],
+                brake=inp["brake"],
+                use_powerup=inp["use_powerup"],
+                seq=inp["seq"],
+            )
+            pid = inp["player_id"]
 
-            last_proc = self._last_processed_seq.get(pid, 0)
-            diff = (input_state.seq - last_proc) & 0xFFFF
-            if diff == 0 or diff >= 32768:
-                return  # Duplicado o antiguo
+            with self._inputs_lock:
+                if pid not in self._input_queues:
+                    self._input_queues[pid] = deque(maxlen=SERVER_INPUT_QUEUE_SIZE)
 
-            queue = self._input_queues[pid]
-            if not queue or self._seq_after(input_state.seq, queue[-1].seq):
-                queue.append(input_state)  # Caso común: llega en orden
-            else:
-                # Out-of-order: insertar en posición correcta (raro)
-                inserted = False
-                for i in range(len(queue)):
-                    if input_state.seq == queue[i].seq:
-                        inserted = True
-                        break  # duplicado
-                    if not self._seq_after(input_state.seq, queue[i].seq):
-                        queue.insert(i, input_state)
-                        inserted = True
-                        break
-                if not inserted:
-                    queue.append(input_state)
+                last_proc = self._last_processed_seq.get(pid, 0)
+                diff = (input_state.seq - last_proc) & 0xFFFF
+                if diff == 0 or diff >= 32768:
+                    continue  # Duplicado o antiguo
+
+                queue = self._input_queues[pid]
+                if not queue or self._seq_after(input_state.seq, queue[-1].seq):
+                    queue.append(input_state)  # Caso común: llega en orden
+                else:
+                    # Out-of-order: insertar en posición correcta (raro)
+                    inserted = False
+                    for i in range(len(queue)):
+                        if input_state.seq == queue[i].seq:
+                            inserted = True
+                            break  # duplicado
+                        if not self._seq_after(input_state.seq, queue[i].seq):
+                            queue.insert(i, input_state)
+                            inserted = True
+                            break
+                    if not inserted:
+                        queue.append(input_state)
 
     @staticmethod
     def _seq_after(a, b):
