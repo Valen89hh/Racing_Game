@@ -193,13 +193,13 @@ class RoomManager:
         self._cleanup_empty_rooms()
 
     def _cleanup_empty_rooms(self):
-        """Destruye salas sin jugadores (solo en estado lobby o done)."""
+        """Destruye salas sin jugadores humanos conectados."""
         to_remove = []
         for room_id, room in self.rooms.items():
             adapter = self.adapters.get(room_id)
             if not adapter:
                 continue
-            if adapter.get_connected_count() == 0 and room.state in ("lobby", "done"):
+            if adapter.get_connected_count() == 0:
                 to_remove.append(room_id)
 
         for room_id in to_remove:

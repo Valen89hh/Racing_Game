@@ -58,6 +58,7 @@ class WorldSimulation:
         self.ai_system = AISystem(self.track)
         self.race_timer = RaceTimer()
         self.race_timer.reset()
+        self.race_timer.start()
 
         # Crear autos
         self.cars = []
