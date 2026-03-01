@@ -625,6 +625,102 @@ On failure: automatic rollback from `game_backup/`.
 - `version.txt` — Current version
 - `config.json` — Update URL, timeouts
 
+## Server Deployment (DigitalOcean Droplet)
+
+The dedicated server is deployed to a DigitalOcean droplet using **git sparse checkout**. Only the ~28 Python files the server needs are materialized on the droplet (no `game.py`, `editor.py`, `assets/cars/`, `launcher/`). Updating the server = `git pull`.
+
+### Architecture
+
+```
+Windows (Git Bash)                    Droplet (Ubuntu)
+┌──────────────────┐   git push      ┌──────────────────────────────┐
+│ racing_game/     │ ──────────────► │ /home/racing/racing_server/  │
+│ (full repo)      │                 │ (sparse checkout, ~28 files) │
+│                  │   SSH           │                              │
+│ deploy_server.sh │ ──────────────► │ systemctl restart            │
+└──────────────────┘                 │ racing-server.service        │
+                                     └──────────────────────────────┘
+```
+
+### deploy_server.sh
+
+Script bash (compatible con Git Bash en Windows) que automatiza el deploy. Se configura con variables de entorno o editando los valores por defecto al inicio del script.
+
+**Variables de configuración:**
+
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `RACING_SERVER_IP` | (requerido) | IP del droplet |
+| `RACING_SERVER_USER` | `racing` | Usuario SSH |
+| `RACING_SSH_KEY` | (system default) | Path a SSH key |
+| `RACING_REPO_URL` | (from `origin` remote) | URL del repo Git |
+| `RACING_TRACK_FILE` | `leve_4.json` | Nombre del track (sin `tracks/`) |
+| `RACING_BOT_COUNT` | `1` | Número de bots |
+| `RACING_GAME_PORT` | `5555` | Puerto UDP del juego |
+| `RACING_BRANCH` | `main` | Branch de git |
+
+**Modos de uso:**
+
+```bash
+# Configurar IP (o editar directamente en deploy_server.sh línea 18)
+export RACING_SERVER_IP=143.198.138.38
+
+# Setup inicial (una vez): instala python, git, pygame, clona repo con sparse checkout
+bash deploy_server.sh --setup
+
+# Instalar servicio systemd (una vez): crea el servicio, lo habilita e inicia
+bash deploy_server.sh --install-service
+
+# Deploy normal (diario): git push + git pull en droplet + restart servicio
+bash deploy_server.sh
+```
+
+### Server Management Commands
+
+```bash
+# Ver estado del servicio
+ssh racing@IP "systemctl status racing-server"
+
+# Ver logs en tiempo real
+ssh racing@IP "journalctl -u racing-server -f"
+
+# Ver últimas N líneas de logs
+ssh racing@IP "journalctl -u racing-server -n 20"
+
+# Reiniciar el servidor manualmente
+ssh racing@IP "sudo systemctl restart racing-server"
+
+# Parar el servidor
+ssh racing@IP "sudo systemctl stop racing-server"
+
+# Iniciar el servidor
+ssh racing@IP "sudo systemctl start racing-server"
+
+# Ver qué archivos tiene el servidor (verificar sparse checkout)
+ssh racing@IP "find /home/racing/racing_server -name '*.py' -not -path '*/venv/*'"
+
+# Ver el archivo del servicio systemd
+ssh racing@IP "cat /etc/systemd/system/racing-server.service"
+```
+
+### Files
+
+| File | Description |
+|------|-------------|
+| `deploy_server.sh` | Script de deploy con 3 modos (--setup, --install-service, deploy) |
+| `server/requirements-server.txt` | Dependencias del servidor (solo pygame) |
+| `.github/workflows/deploy-server.yml` | GitHub Actions auto-deploy (deshabilitado, requiere secrets) |
+
+### IMPORTANT: Track filename
+
+The `--track` argument takes only the filename (e.g. `leve_4.json`), NOT the full path. The code internally prepends `TRACKS_DIR` (`tracks/`). Passing `tracks/leve_4.json` causes a double path: `tracks/tracks/leve_4.json`.
+
+### CI/CD (optional, future)
+
+`.github/workflows/deploy-server.yml` auto-deploys when server-relevant files change on `main`. Currently disabled (`if: false`). To enable:
+1. Add GitHub secrets: `SERVER_SSH_KEY`, `SERVER_IP`, `SERVER_USER`
+2. Remove the `if: false` line from the workflow
+
 ## Running the Game
 
 ```bash
@@ -634,7 +730,7 @@ pip install gymnasium stable-baselines3  # for RL training feature
 python main.py
 
 # To run the dedicated server (headless, for multiplayer):
-python main.py --dedicated-server tracks/leve_4.json --bots 1 --port 5555
+python main.py --dedicated-server --track leve_4.json --bots 1 --port 5555
 
 # To run the relay server (for internet multiplayer):
 python relay_server/relay_server.py --port 7777

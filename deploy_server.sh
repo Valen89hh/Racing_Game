@@ -20,7 +20,7 @@ SERVER_USER="${RACING_SERVER_USER:-racing}"
 SSH_KEY="${RACING_SSH_KEY:-}"  # e.g. ~/.ssh/id_rsa (empty = default key)
 REMOTE_DIR="/home/${SERVER_USER}/racing_server"
 REPO_URL="${RACING_REPO_URL:-$(git remote get-url origin 2>/dev/null || echo 'https://github.com/Valen89hh/Racing_Game.git')}"
-TRACK_FILE="${RACING_TRACK_FILE:-tracks/leve_4.json}"
+TRACK_FILE="${RACING_TRACK_FILE:-leve_4.json}"
 BOT_COUNT="${RACING_BOT_COUNT:-1}"
 GAME_PORT="${RACING_GAME_PORT:-5555}"
 BRANCH="${RACING_BRANCH:-main}"
@@ -150,7 +150,7 @@ User=${SERVER_USER}
 WorkingDirectory=${REMOTE_DIR}
 Environment=SDL_VIDEODRIVER=dummy
 Environment=PYTHONUNBUFFERED=1
-ExecStart=${REMOTE_DIR}/venv/bin/python main.py --dedicated-server ${TRACK_FILE} --bots ${BOT_COUNT} --port ${GAME_PORT}
+ExecStart=${REMOTE_DIR}/venv/bin/python main.py --dedicated-server --track ${TRACK_FILE} --bots ${BOT_COUNT} --port ${GAME_PORT}
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
