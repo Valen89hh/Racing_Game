@@ -8,10 +8,14 @@ import time
 import json
 
 import track_manager
-from networking.protocol import pack_state_snapshot
+from networking.protocol import (
+    pack_state_snapshot, pack_track_list,
+    CONFIG_CHANGE_TRACK, CONFIG_CHANGE_BOTS, CONFIG_START_RACE,
+)
 from settings import (
-    FIXED_DT,
+    FIXED_DT, MAX_PLAYERS,
     DEDICATED_AUTO_START_DELAY, DEDICATED_MIN_PLAYERS,
+    DEDICATED_DONE_RESET_DELAY,
 )
 from server.world_simulation import WorldSimulation
 
@@ -25,11 +29,15 @@ ROOM_DONE = "done"
 class Room:
     """Sala de juego con state machine para el servidor dedicado."""
 
-    def __init__(self, net_server, track_file, bot_count, max_players):
+    def __init__(self, net_server, track_file, bot_count, max_players,
+                 room_code="", room_name="", is_private=False):
         self.net_server = net_server
         self.track_file = track_file
         self.bot_count = bot_count
         self.max_players = max_players
+        self.room_code = room_code
+        self.room_name = room_name
+        self.is_private = is_private
 
         self.state = ROOM_LOBBY
         self.world = None
@@ -38,6 +46,10 @@ class Room:
         self._lobby_broadcast_timer = 0.0
         self._auto_start_timer = 0.0
         self._auto_start_triggered = False
+
+        # Admin control
+        self._admin_start_requested = False
+        self._available_tracks = track_manager.list_tracks()
 
         # Countdown (4 segundos: "3" 1s + "2" 1s + "1" 1s + "GO!" 1s)
         # Debe coincidir con el countdown del cliente para evitar gap
@@ -48,8 +60,16 @@ class Room:
         self._snapshot_seq = 0
         self._snapshot_tick_counter = 0
 
+        # Done → lobby reset
+        self._done_timer = 0.0
+
         # Track data cargada
         self._track_data = None
+
+        # Conectar callbacks
+        self.net_server.on_player_join = self._on_player_join
+        self.net_server.on_player_leave = self._on_player_leave
+        self.net_server.on_config_change = self._on_config_change
 
     def tick(self, dt):
         """Ejecuta un tick segun el estado actual."""
@@ -63,31 +83,43 @@ class Room:
             self._tick_done(dt)
 
     def _tick_lobby(self, dt):
-        """Lobby: broadcast estado y auto-start cuando hay suficientes jugadores."""
+        """Lobby: broadcast estado y esperar admin start (o auto-start sin admin)."""
         # Broadcast lobby state periodicamente
         self._lobby_broadcast_timer += dt
         if self._lobby_broadcast_timer >= 0.25:
             self._lobby_broadcast_timer = 0.0
             self.net_server.bot_count = self.bot_count
+            self.net_server.track_name = self.track_file
             self.net_server.broadcast_lobby_state()
 
-        # Auto-start
         connected = self.net_server.get_connected_count()
-        if connected >= DEDICATED_MIN_PLAYERS:
-            if not self._auto_start_triggered:
-                self._auto_start_triggered = True
-                self._auto_start_timer = 0.0
-                print(f"[ROOM] {connected} player(s) connected, "
-                      f"auto-starting in {DEDICATED_AUTO_START_DELAY}s...")
+        has_admin = self.net_server.get_admin_player_id() is not None
 
-            self._auto_start_timer += dt
-            if self._auto_start_timer >= DEDICATED_AUTO_START_DELAY:
-                self._begin_race()
+        # Admin requested start
+        if self._admin_start_requested and connected >= DEDICATED_MIN_PLAYERS:
+            self._admin_start_requested = False
+            self._begin_race()
+            return
+
+        # Auto-start SOLO cuando no hay admin (fallback para servidores sin admin)
+        if not has_admin:
+            if connected >= DEDICATED_MIN_PLAYERS:
+                if not self._auto_start_triggered:
+                    self._auto_start_triggered = True
+                    self._auto_start_timer = 0.0
+                    print(f"[ROOM] {connected} player(s) connected (no admin), "
+                          f"auto-starting in {DEDICATED_AUTO_START_DELAY}s...")
+
+                self._auto_start_timer += dt
+                if self._auto_start_timer >= DEDICATED_AUTO_START_DELAY:
+                    self._begin_race()
+            else:
+                if self._auto_start_triggered:
+                    self._auto_start_triggered = False
+                    print("[ROOM] Not enough players, auto-start cancelled")
         else:
-            # Reset auto-start si se desconectan
-            if self._auto_start_triggered:
-                self._auto_start_triggered = False
-                print("[ROOM] Not enough players, auto-start cancelled")
+            # Con admin, reset auto-start
+            self._auto_start_triggered = False
 
     def _begin_race(self):
         """Carga track, lo envia a clientes, crea WorldSimulation."""
@@ -189,5 +221,82 @@ class Room:
         self.net_server.broadcast(data)
 
     def _tick_done(self, dt):
-        """Carrera terminada. Por ahora no hace nada (futuro: restart)."""
-        pass
+        """Carrera terminada. Espera DEDICATED_DONE_RESET_DELAY y vuelve al lobby."""
+        self._done_timer += dt
+        if self._done_timer >= DEDICATED_DONE_RESET_DELAY:
+            self._reset_to_lobby()
+
+    def _reset_to_lobby(self):
+        """Reset completo al lobby para nueva partida."""
+        print("[ROOM] Resetting to lobby...")
+
+        # Broadcast return-to-lobby a clientes
+        self.net_server.reset_for_new_lobby()
+
+        # Reset state
+        self.state = ROOM_LOBBY
+        self.world = None
+        self._track_data = None
+        self._done_timer = 0.0
+        self._lobby_broadcast_timer = 0.0
+        self._auto_start_timer = 0.0
+        self._auto_start_triggered = False
+        self._admin_start_requested = False
+        self._snapshot_seq = 0
+        self._snapshot_tick_counter = 0
+        self._countdown_timer = 0.0
+
+        # Refrescar tracks disponibles
+        self._available_tracks = track_manager.list_tracks()
+
+        # Enviar track list al admin si existe
+        admin_pid = self.net_server.get_admin_player_id()
+        if admin_pid is not None:
+            self._send_track_list_to_admin(admin_pid)
+
+        print("[ROOM] Lobby ready for new race")
+
+    def _on_player_join(self, pid, name):
+        """Callback cuando un jugador se conecta."""
+        # Si es admin, enviar track list
+        if pid == self.net_server.get_admin_player_id():
+            self._send_track_list_to_admin(pid)
+
+    def _on_player_leave(self, pid):
+        """Callback cuando un jugador se desconecta."""
+        # Si se reasignó admin, enviar track list al nuevo admin
+        new_admin = self.net_server.get_admin_player_id()
+        if new_admin is not None and new_admin != pid:
+            self._send_track_list_to_admin(new_admin)
+
+    def _on_config_change(self, config):
+        """Callback cuando el admin cambia la config."""
+        if self.state != ROOM_LOBBY:
+            return  # Solo en lobby
+
+        subtype = config.get("subtype")
+        if subtype == CONFIG_CHANGE_TRACK:
+            filename = config.get("filename", "")
+            # Validar que el track existe
+            valid = any(t["filename"] == filename for t in self._available_tracks)
+            if valid:
+                self.track_file = filename
+                self.net_server.track_name = filename
+                print(f"[ROOM] Admin changed track to: {filename}")
+            else:
+                print(f"[ROOM] Admin requested invalid track: {filename}")
+        elif subtype == CONFIG_CHANGE_BOTS:
+            count = config.get("count", 0)
+            connected = self.net_server.get_connected_count()
+            max_bots = MAX_PLAYERS - connected
+            self.bot_count = max(0, min(count, max_bots))
+            self.net_server.bot_count = self.bot_count
+            print(f"[ROOM] Admin changed bots to: {self.bot_count}")
+        elif subtype == CONFIG_START_RACE:
+            self._admin_start_requested = True
+            print("[ROOM] Admin requested race start")
+
+    def _send_track_list_to_admin(self, pid):
+        """Envía la lista de tracks disponibles al admin."""
+        data = pack_track_list(self._available_tracks)
+        self.net_server.send_to_player(pid, data)

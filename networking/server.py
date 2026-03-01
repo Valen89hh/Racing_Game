@@ -16,12 +16,19 @@ from networking.protocol import (
     get_packet_type,
     PKT_JOIN_REQUEST, PKT_PLAYER_INPUT, PKT_TRACK_ACK,
     PKT_PING, PKT_PONG, PKT_DISCONNECT,
+    PKT_SERVER_CONFIG, PKT_RETURN_LOBBY,
+    PKT_ROOM_LIST_REQ, PKT_ROOM_CREATE, PKT_ROOM_JOIN, PKT_ROOM_LEAVE,
     unpack_join_request, unpack_input, unpack_track_ack, unpack_ping,
+    unpack_server_config,
+    unpack_room_create, unpack_room_join,
     pack_join_accept, pack_join_reject, pack_pong,
     pack_lobby_state, pack_race_start, pack_track_chunks,
     pack_state_snapshot, pack_powerup_event,
-    pack_disconnect,
+    pack_disconnect, pack_return_lobby,
+    pack_room_list, pack_room_create_ok, pack_room_accept, pack_room_reject,
     REJECT_FULL, REJECT_RACING,
+    ROOM_JOIN_BY_ID, ROOM_JOIN_BY_CODE,
+    ROOM_FULL, ROOM_RACING, ROOM_NOT_FOUND, MAX_ROOMS_REACHED,
 )
 from networking.net_state import InputState
 
@@ -80,9 +87,18 @@ class GameServer:
         self._track_send_done = False
         self._track_send_ok = False
 
+        # Admin (dedicated server only)
+        self._admin_player_id = None  # player_id del admin, None = no admin
+
+        # Multi-room support
+        self._room_manager = None       # set by DedicatedServer if multi-room
+        self._client_room = {}          # addr -> room_id (None = en room select)
+        self._client_slot = {}          # addr -> slot dentro de la sala
+
         # Callbacks
         self.on_player_join = None    # (player_id, name) → None
         self.on_player_leave = None   # (player_id) → None
+        self.on_config_change = None  # (config_dict) → None
 
     def start(self):
         """Inicia el servidor en un hilo daemon."""
@@ -141,10 +157,20 @@ class GameServer:
                     self._handle_input(data, addr)
                 elif pkt_type == PKT_TRACK_ACK:
                     self._handle_track_ack(data, addr)
+                elif pkt_type == PKT_SERVER_CONFIG:
+                    self._handle_server_config(data, addr)
                 elif pkt_type == PKT_PING:
                     self._handle_ping(data, addr)
                 elif pkt_type == PKT_DISCONNECT:
                     self._handle_disconnect(addr)
+                elif pkt_type == PKT_ROOM_LIST_REQ:
+                    self._handle_room_list_req(addr)
+                elif pkt_type == PKT_ROOM_CREATE:
+                    self._handle_room_create(data, addr)
+                elif pkt_type == PKT_ROOM_JOIN:
+                    self._handle_room_join(data, addr)
+                elif pkt_type == PKT_ROOM_LEAVE:
+                    self._handle_room_leave(addr)
             except Exception as e:
                 print(f"[SERVER] Error handling pkt 0x{pkt_type:02x}: {e}")
 
@@ -152,43 +178,66 @@ class GameServer:
         """Procesa solicitud de unión."""
         name = unpack_join_request(data)
 
+        is_new = False
+        is_admin = False
+        multi_room = self._room_manager is not None
+
         with self._clients_lock:
             # Ya conectado? Re-enviar accept
             if addr in self._clients:
                 client = self._clients[addr]
                 pid = client.player_id
-                # sendto fuera del lock abajo
+                if not multi_room:
+                    is_admin = (self._admin_player_id == pid)
             else:
-                # Lobby lleno?
-                if self._next_player_id >= MAX_PLAYERS:
-                    try:
-                        self.socket.sendto(pack_join_reject(REJECT_FULL), addr)
-                    except OSError:
-                        pass
-                    return
+                if multi_room:
+                    # Multi-room: asignar un ID global (solo para tracking)
+                    pid = self._next_player_id
+                    self._next_player_id += 1
+                    client = ClientInfo(addr, pid, name)
+                    self._clients[addr] = client
+                    is_new = True
+                    # No asignar a ninguna sala todavía
+                    self._client_room[addr] = None
+                    print(f"[SERVER] Player '{name}' connected (multi-room, "
+                          f"global_id={pid}) from {addr}")
+                else:
+                    # Legacy single-room mode
+                    if self._next_player_id >= MAX_PLAYERS:
+                        try:
+                            self.socket.sendto(pack_join_reject(REJECT_FULL), addr)
+                        except OSError:
+                            pass
+                        return
 
-                # Ya en carrera?
-                if self.racing:
-                    try:
-                        self.socket.sendto(pack_join_reject(REJECT_RACING), addr)
-                    except OSError:
-                        pass
-                    return
+                    if self.racing:
+                        try:
+                            self.socket.sendto(pack_join_reject(REJECT_RACING), addr)
+                        except OSError:
+                            pass
+                        return
 
-                # Asignar player ID
-                pid = self._next_player_id
-                self._next_player_id += 1
-                client = ClientInfo(addr, pid, name)
-                self._clients[addr] = client
-                print(f"[SERVER] Player '{name}' joined as P{pid + 1} from {addr}")
+                    pid = self._next_player_id
+                    self._next_player_id += 1
+                    client = ClientInfo(addr, pid, name)
+                    self._clients[addr] = client
+                    is_new = True
+                    print(f"[SERVER] Player '{name}' joined as P{pid + 1} from {addr}")
+
+                    if self._dedicated and self._admin_player_id is None:
+                        self._admin_player_id = pid
+                        is_admin = True
+                        print(f"[SERVER] Player P{pid + 1} is now admin")
 
         # Enviar accept FUERA del lock
         try:
-            self.socket.sendto(pack_join_accept(pid), addr)
+            self.socket.sendto(
+                pack_join_accept(pid, is_admin=is_admin, multi_room=multi_room),
+                addr)
         except OSError:
             pass
 
-        if self.on_player_join:
+        if is_new and not multi_room and self.on_player_join:
             self.on_player_join(pid, name)
 
     def _handle_input(self, data, addr):
@@ -201,6 +250,27 @@ class GameServer:
 
         input_list = unpack_input(data)
 
+        # Multi-room: route to the room's adapter
+        if self._room_manager:
+            room_id = self._client_room.get(addr)
+            if room_id is None:
+                return  # Not in a room, ignore inputs
+            adapter = self._room_manager.adapters.get(room_id)
+            if not adapter:
+                return
+            slot = self._client_slot.get(addr, 0)
+            for inp in input_list:
+                input_state = InputState(
+                    accel=inp["accel"],
+                    turn=inp["turn"],
+                    brake=inp["brake"],
+                    use_powerup=inp["use_powerup"],
+                    seq=inp["seq"],
+                )
+                adapter.enqueue_input(slot, input_state)
+            return
+
+        # Legacy single-room mode
         for inp in input_list:
             input_state = InputState(
                 accel=inp["accel"],
@@ -262,14 +332,56 @@ class GameServer:
             if client:
                 client.last_heartbeat = time.time()
 
+    def _handle_server_config(self, data, addr):
+        """Procesa paquete de configuración del admin."""
+        with self._clients_lock:
+            client = self._clients.get(addr)
+            if not client:
+                return
+            client.last_heartbeat = time.time()
+
+        if self._room_manager:
+            # Multi-room: route to the room's adapter
+            room_id = self._client_room.get(addr)
+            if room_id is None:
+                return
+            adapter = self._room_manager.adapters.get(room_id)
+            if not adapter:
+                return
+            slot = self._client_slot.get(addr, 0)
+            if slot != adapter.get_admin_player_id():
+                return  # Solo el admin puede cambiar config
+            config = unpack_server_config(data)
+            if adapter.on_config_change:
+                adapter.on_config_change(config)
+        else:
+            # Legacy single-room
+            with self._clients_lock:
+                if client.player_id != self._admin_player_id:
+                    return
+            config = unpack_server_config(data)
+            if self.on_config_change:
+                self.on_config_change(config)
+
     def _handle_disconnect(self, addr):
         """Procesa desconexión de un cliente."""
+        # Multi-room: leave room first
+        if self._room_manager:
+            self._room_manager.leave_room(addr)
+
         with self._clients_lock:
             client = self._clients.pop(addr, None)
         if client:
             print(f"[SERVER] Player P{client.player_id + 1} disconnected")
-            if self.on_player_leave:
-                self.on_player_leave(client.player_id)
+            # Clean up room tracking
+            self._client_room.pop(addr, None)
+            self._client_slot.pop(addr, None)
+
+            if not self._room_manager:
+                if client.player_id == self._admin_player_id:
+                    self._reassign_admin()
+                if self.on_player_leave:
+                    self.on_player_leave(client.player_id)
 
     def _check_timeouts(self):
         """Desconecta clientes sin heartbeat."""
@@ -283,8 +395,135 @@ class GameServer:
 
         for addr, client in timed_out:
             print(f"[SERVER] Player P{client.player_id + 1} timed out")
-            if self.on_player_leave:
-                self.on_player_leave(client.player_id)
+            if self._room_manager:
+                self._room_manager.leave_room(addr)
+                self._client_room.pop(addr, None)
+                self._client_slot.pop(addr, None)
+            else:
+                if client.player_id == self._admin_player_id:
+                    self._reassign_admin()
+                if self.on_player_leave:
+                    self.on_player_leave(client.player_id)
+
+    def _reassign_admin(self):
+        """Reasigna admin al jugador con menor player_id."""
+        with self._clients_lock:
+            if not self._clients:
+                self._admin_player_id = None
+                print("[SERVER] No players left, no admin")
+                return
+            # Encontrar el cliente con menor player_id
+            min_client = min(self._clients.values(), key=lambda c: c.player_id)
+            self._admin_player_id = min_client.player_id
+            new_admin_addr = min_client.addr
+            print(f"[SERVER] Admin reassigned to P{self._admin_player_id + 1}")
+
+        # Notificar al nuevo admin con un re-accept
+        try:
+            self.socket.sendto(
+                pack_join_accept(self._admin_player_id, is_admin=True),
+                new_admin_addr)
+        except OSError:
+            pass
+
+    # ── Room management handlers (multi-room mode) ──
+
+    def _handle_room_list_req(self, addr):
+        """Envía la lista de salas públicas al cliente."""
+        if not self._room_manager:
+            return
+        with self._clients_lock:
+            client = self._clients.get(addr)
+            if not client:
+                return
+            client.last_heartbeat = time.time()
+        rooms = self._room_manager.get_room_list()
+        try:
+            self.socket.sendto(pack_room_list(rooms), addr)
+        except OSError:
+            pass
+
+    def _handle_room_create(self, data, addr):
+        """Crea una nueva sala."""
+        if not self._room_manager:
+            return
+        with self._clients_lock:
+            client = self._clients.get(addr)
+            if not client:
+                return
+            client.last_heartbeat = time.time()
+
+        info = unpack_room_create(data)
+        result = self._room_manager.create_room(
+            info["name"], info["is_private"], addr)
+        if result is None:
+            try:
+                self.socket.sendto(pack_room_reject(MAX_ROOMS_REACHED), addr)
+            except OSError:
+                pass
+            return
+
+        room_id, code, slot = result
+        try:
+            self.socket.sendto(pack_room_create_ok(room_id, code, slot), addr)
+        except OSError:
+            pass
+
+    def _handle_room_join(self, data, addr):
+        """Une un cliente a una sala existente."""
+        if not self._room_manager:
+            return
+        with self._clients_lock:
+            client = self._clients.get(addr)
+            if not client:
+                return
+            client.last_heartbeat = time.time()
+
+        info = unpack_room_join(data)
+
+        if info["mode"] == ROOM_JOIN_BY_ID:
+            room_id = info["room_id"]
+            slot = self._room_manager.join_room(room_id, addr)
+            if slot is None:
+                reason = self._room_manager.get_room_state_for_reject(room_id)
+                try:
+                    self.socket.sendto(pack_room_reject(reason), addr)
+                except OSError:
+                    pass
+                return
+            is_admin = (self._room_manager.adapters[room_id].get_admin_player_id() == slot)
+            try:
+                self.socket.sendto(pack_room_accept(room_id, slot, is_admin), addr)
+            except OSError:
+                pass
+        else:
+            code = info["code"]
+            result = self._room_manager.join_room_by_code(code, addr)
+            if result is None:
+                try:
+                    self.socket.sendto(pack_room_reject(ROOM_NOT_FOUND), addr)
+                except OSError:
+                    pass
+                return
+            room_id, slot = result
+            is_admin = (self._room_manager.adapters[room_id].get_admin_player_id() == slot)
+            try:
+                self.socket.sendto(pack_room_accept(room_id, slot, is_admin), addr)
+            except OSError:
+                pass
+
+    def _handle_room_leave(self, addr):
+        """Saca un cliente de su sala actual."""
+        if not self._room_manager:
+            return
+        with self._clients_lock:
+            client = self._clients.get(addr)
+            if not client:
+                return
+            client.last_heartbeat = time.time()
+
+        self._room_manager.leave_room(addr)
+        # Client stays connected to the server, just not in any room
 
     # ── API pública ──
 
@@ -328,7 +567,9 @@ class GameServer:
     def broadcast_lobby_state(self):
         """Broadcast estado actual del lobby."""
         players = self.get_player_list()
-        data = pack_lobby_state(players, self.bot_count, self.track_name)
+        admin_pid = self._admin_player_id if self._admin_player_id is not None else 255
+        data = pack_lobby_state(players, self.bot_count, self.track_name,
+                                admin_player_id=admin_pid)
         self.broadcast(data)
 
     def broadcast_race_start(self, countdown=3):
@@ -447,6 +688,37 @@ class GameServer:
                 self.socket.sendto(pack_disconnect(), to_remove)
             except OSError:
                 pass
+
+    def send_to_player(self, player_id, data):
+        """Envía datos a un jugador específico por player_id."""
+        with self._clients_lock:
+            for client in self._clients.values():
+                if client.player_id == player_id:
+                    try:
+                        self.socket.sendto(data, client.addr)
+                    except OSError:
+                        pass
+                    return
+
+    def get_admin_player_id(self):
+        """Retorna el player_id del admin o None."""
+        return self._admin_player_id
+
+    def reset_for_new_lobby(self):
+        """Reset estado para nueva ronda de lobby. Broadcast PKT_RETURN_LOBBY."""
+        self.racing = False
+        # Limpiar input queues
+        with self._inputs_lock:
+            self._input_queues.clear()
+            self._last_processed_seq.clear()
+        # Broadcast return to lobby (3x para reliability)
+        data = pack_return_lobby()
+        for _ in range(3):
+            self.broadcast(data)
+            time.sleep(0.01)
+        # Reset track transfer state
+        self._track_send_done = False
+        self._track_send_ok = False
 
     def get_local_ip(self):
         """Intenta obtener la IP local de la máquina."""

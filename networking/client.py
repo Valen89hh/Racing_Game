@@ -15,12 +15,18 @@ from networking.protocol import (
     PKT_JOIN_ACCEPT, PKT_JOIN_REJECT, PKT_STATE_SNAPSHOT,
     PKT_LOBBY_STATE, PKT_RACE_START, PKT_TRACK_DATA,
     PKT_POWERUP_EVENT, PKT_PONG, PKT_DISCONNECT,
+    PKT_TRACK_LIST, PKT_RETURN_LOBBY,
+    PKT_ROOM_LIST, PKT_ROOM_CREATE_OK, PKT_ROOM_ACCEPT, PKT_ROOM_REJECT,
     unpack_join_accept, unpack_join_reject, unpack_state_snapshot,
     unpack_lobby_state, unpack_race_start, unpack_track_chunk,
-    unpack_powerup_event, unpack_ping,
+    unpack_powerup_event, unpack_ping, unpack_track_list,
+    unpack_room_list, unpack_room_create_ok, unpack_room_accept, unpack_room_reject,
     pack_join_request, pack_input, pack_input_redundant,
     pack_track_ack,
     pack_ping, pack_disconnect,
+    pack_server_config_track, pack_server_config_bots, pack_server_config_start,
+    pack_room_list_req, pack_room_create, pack_room_join_by_id,
+    pack_room_join_by_code, pack_room_leave,
     INPUT_REDUNDANCY,
 )
 from networking.net_state import StateSnapshot, InputState
@@ -55,6 +61,12 @@ class GameClient:
         self.lobby_state = None
         self._lobby_lock = threading.Lock()
 
+        # Admin (dedicated server)
+        self.is_admin = False
+        self._track_list = []
+        self._track_list_lock = threading.Lock()
+        self._return_to_lobby = False
+
         # Race
         self.race_started = False
         self.countdown = 3
@@ -88,6 +100,17 @@ class GameClient:
         self._clock_offsets = []       # list of (recv_time - race_time) samples
         self._clock_offset = 0.0       # current estimated offset
         self._clock_synced = False
+
+        # Multi-room support
+        self.multi_room = False      # servidor soporta multi-room
+        self.room_id = -1            # sala actual (-1 = ninguna)
+        self.room_code = ""          # código de la sala
+        self._room_list = []
+        self._room_list_lock = threading.Lock()
+        self._room_joined = False    # flag: unido a sala
+        self._room_slot = -1         # slot en la sala
+        self._room_is_admin = False  # admin en la sala
+        self._room_reject_reason = 0
 
         # Adaptive interpolation delay (jitter measurement)
         self._last_snap_recv_time = 0.0          # recv_time del último snapshot
@@ -138,11 +161,13 @@ class GameClient:
 
             pkt_type = get_packet_type(resp)
             if pkt_type == PKT_JOIN_ACCEPT:
-                self.player_id, self.max_players = unpack_join_accept(resp)
+                self.player_id, self.max_players, self.is_admin, self.multi_room = unpack_join_accept(resp)
                 self.connected = True
                 self._connect_ok = True
                 self._connect_done = True
-                print(f"[CLIENT] Connected as Player {self.player_id + 1}")
+                admin_tag = " (Admin)" if self.is_admin else ""
+                mr_tag = " [multi-room]" if self.multi_room else ""
+                print(f"[CLIENT] Connected as Player {self.player_id + 1}{admin_tag}{mr_tag}")
                 # Iniciar recv loop
                 self._running = True
                 self._thread = threading.Thread(target=self._recv_loop, daemon=True)
@@ -212,11 +237,25 @@ class GameClient:
                     self._handle_powerup_event(data)
                 elif pkt_type == PKT_PONG:
                     self._handle_pong(data)
+                elif pkt_type == PKT_TRACK_LIST:
+                    self._handle_track_list(data)
+                elif pkt_type == PKT_RETURN_LOBBY:
+                    self._handle_return_lobby()
                 elif pkt_type == PKT_DISCONNECT:
                     self._handle_disconnect()
+                elif pkt_type == PKT_ROOM_LIST:
+                    self._handle_room_list_response(data)
+                elif pkt_type == PKT_ROOM_CREATE_OK:
+                    self._handle_room_create_ok(data)
+                elif pkt_type == PKT_ROOM_ACCEPT:
+                    self._handle_room_accept(data)
+                elif pkt_type == PKT_ROOM_REJECT:
+                    self._handle_room_reject(data)
                 elif pkt_type == PKT_JOIN_ACCEPT:
-                    # Re-accept (idempotent)
-                    self.player_id, self.max_players = unpack_join_accept(data)
+                    # Re-accept (admin reassignment)
+                    self.player_id, self.max_players, self.is_admin, _ = unpack_join_accept(data)
+                    if self.is_admin:
+                        print(f"[CLIENT] You are now admin")
             except Exception as e:
                 print(f"[CLIENT] Error handling pkt 0x{pkt_type:02x}: {e}")
 
@@ -306,6 +345,22 @@ class GameClient:
         rtt = time.time() - ts
         with self._ping_lock:
             self._ping_ms = rtt * 1000.0
+
+    def _handle_track_list(self, data):
+        tracks = unpack_track_list(data)
+        with self._track_list_lock:
+            self._track_list = tracks
+        print(f"[CLIENT] Received track list: {len(tracks)} tracks")
+
+    def _handle_return_lobby(self):
+        print(f"[CLIENT] Server requested return to lobby")
+        self._return_to_lobby = True
+        self.race_started = False
+        # Reset track data for next race
+        with self._track_lock:
+            self._track_chunks.clear()
+            self._track_total_chunks = 0
+            self._track_json = None
 
     def _handle_disconnect(self):
         print(f"[CLIENT] Host disconnected")
@@ -430,3 +485,148 @@ class GameClient:
                 return self.connected
             last = self._snapshots[-1]
             return (time.time() - last.recv_time) < NET_TIMEOUT
+
+    # ── Admin API ──
+
+    def get_track_list(self):
+        """Retorna lista de tracks disponibles del servidor."""
+        with self._track_list_lock:
+            return list(self._track_list)
+
+    def should_return_to_lobby(self):
+        """Retorna True si el servidor pidió volver al lobby (consume flag)."""
+        if self._return_to_lobby:
+            self._return_to_lobby = False
+            return True
+        return False
+
+    def send_config_change_track(self, filename):
+        """Admin: solicita cambio de track al servidor."""
+        if not self.connected or not self.socket:
+            return
+        data = pack_server_config_track(filename)
+        try:
+            self.socket.sendto(data, self.host_addr)
+        except OSError:
+            pass
+
+    def send_config_change_bots(self, count):
+        """Admin: solicita cambio de bots al servidor."""
+        if not self.connected or not self.socket:
+            return
+        data = pack_server_config_bots(count)
+        try:
+            self.socket.sendto(data, self.host_addr)
+        except OSError:
+            pass
+
+    def send_config_start_race(self):
+        """Admin: solicita inicio de carrera al servidor."""
+        if not self.connected or not self.socket:
+            return
+        data = pack_server_config_start()
+        try:
+            self.socket.sendto(data, self.host_addr)
+        except OSError:
+            pass
+
+    # ── Room management (multi-room) ──
+
+    def _handle_room_list_response(self, data):
+        rooms = unpack_room_list(data)
+        with self._room_list_lock:
+            self._room_list = rooms
+
+    def _handle_room_create_ok(self, data):
+        info = unpack_room_create_ok(data)
+        self.room_id = info["room_id"]
+        self.room_code = info["code"]
+        self._room_slot = info["slot"]
+        self._room_is_admin = True
+        self._room_joined = True
+        self.player_id = info["slot"]  # Use slot as player_id in room
+        self.is_admin = True
+        print(f"[CLIENT] Room created: {self.room_code} (slot={self._room_slot})")
+
+    def _handle_room_accept(self, data):
+        info = unpack_room_accept(data)
+        self.room_id = info["room_id"]
+        self._room_slot = info["slot"]
+        self._room_is_admin = info["is_admin"]
+        self._room_joined = True
+        self.player_id = info["slot"]  # Use slot as player_id in room
+        self.is_admin = info["is_admin"]
+        print(f"[CLIENT] Joined room {self.room_id} (slot={self._room_slot}, "
+              f"admin={self._room_is_admin})")
+
+    def _handle_room_reject(self, data):
+        self._room_reject_reason = unpack_room_reject(data)
+        print(f"[CLIENT] Room join rejected (reason={self._room_reject_reason})")
+
+    def request_room_list(self):
+        """Enviar PKT_ROOM_LIST_REQ al servidor."""
+        if not self.connected or not self.socket:
+            return
+        try:
+            self.socket.sendto(pack_room_list_req(), self.host_addr)
+        except OSError:
+            pass
+
+    def send_create_room(self, name, is_private=False):
+        """PKT_ROOM_CREATE: crear sala."""
+        if not self.connected or not self.socket:
+            return
+        try:
+            self.socket.sendto(pack_room_create(name, is_private), self.host_addr)
+        except OSError:
+            pass
+
+    def send_join_room(self, room_id):
+        """PKT_ROOM_JOIN by id."""
+        if not self.connected or not self.socket:
+            return
+        try:
+            self.socket.sendto(pack_room_join_by_id(room_id), self.host_addr)
+        except OSError:
+            pass
+
+    def send_join_room_by_code(self, code):
+        """PKT_ROOM_JOIN by code."""
+        if not self.connected or not self.socket:
+            return
+        try:
+            self.socket.sendto(pack_room_join_by_code(code), self.host_addr)
+        except OSError:
+            pass
+
+    def send_leave_room(self):
+        """PKT_ROOM_LEAVE: salir de sala."""
+        if not self.connected or not self.socket:
+            return
+        try:
+            self.socket.sendto(pack_room_leave(), self.host_addr)
+        except OSError:
+            pass
+        self.room_id = -1
+        self.room_code = ""
+        self._room_slot = -1
+        self._room_is_admin = False
+        self._room_joined = False
+
+    def get_room_list(self):
+        """Retorna lista de salas del servidor."""
+        with self._room_list_lock:
+            return list(self._room_list)
+
+    def has_joined_room(self):
+        """Retorna True si se unió a una sala (consume flag)."""
+        if self._room_joined:
+            self._room_joined = False
+            return True
+        return False
+
+    def get_room_reject_reason(self):
+        """Retorna y consume el motivo de rechazo (0 = sin rechazo)."""
+        r = self._room_reject_reason
+        self._room_reject_reason = 0
+        return r

@@ -28,8 +28,9 @@ from settings import (
     COLOR_RED, COLOR_GRAY, COLOR_DARK_GRAY, COLOR_ORANGE, COLOR_BLUE,
     STATE_MENU, STATE_COUNTDOWN, STATE_RACING, STATE_VICTORY,
     STATE_EDITOR, STATE_TRACK_SELECT, STATE_TRAINING,
-    STATE_JOIN_LOBBY, STATE_CONNECTING,
+    STATE_JOIN_LOBBY, STATE_CONNECTING, STATE_ROOM_SELECT,
     STATE_ONLINE_RACING, STATE_ONLINE_COUNTDOWN,
+    ROOM_LIST_REFRESH_INTERVAL,
     COLOR_PROGRESS_BAR, COLOR_PROGRESS_BG,
     PLAYER_COLORS, MAX_PLAYERS, TOTAL_LAPS, DEBUG_CHECKPOINTS,
     HUD_FONT_SIZE, HUD_TITLE_FONT_SIZE,
@@ -46,7 +47,7 @@ from settings import (
     MAGNET_DURATION, SLOWMO_DURATION, BOUNCE_DURATION,
     AUTOPILOT_DURATION, TELEPORT_DISTANCE,
     SMART_MISSILE_LIFETIME,
-    NET_DEFAULT_PORT, NET_TICK_RATE, NET_INTERPOLATION_DELAY,
+    NET_DEFAULT_PORT, NET_TICK_RATE, NET_INTERPOLATION_DELAY, DEDICATED_SERVER_IP,
     NET_TELEPORT_THRESHOLD, NET_EXTRAPOLATION_MAX,
     FIXED_DT, VISUAL_SMOOTH_RATE,
     SLOWMO_FACTOR,
@@ -165,6 +166,30 @@ class Game:
         self._online_countdown_value = 3
         self._net_error_msg = ""
         self._ip_cursor_blink = 0.0
+        self._join_mode = "choose"  # "choose" | "connecting"
+
+        # Local server (started in-process when user selects "Local")
+        self._local_server = None        # GameServer instance
+        self._local_room_manager = None  # RoomManager instance
+        self._local_server_thread = None # tick loop thread
+
+        # Admin lobby (dedicated server)
+        self._is_lobby_admin = False
+        self._admin_track_list = []
+        self._admin_track_selected = 0
+        self._admin_bot_count = 1
+
+        # Room select (multi-room dedicated server)
+        self._room_list = []
+        self._room_selected = 0
+        self._room_create_mode = False
+        self._room_code_mode = False
+        self._room_name_input = ""
+        self._room_code_input = ""
+        self._room_private = False
+        self._room_refresh_timer = 0.0
+        self._room_error_msg = ""
+        self._room_cursor_blink = 0.0
 
         # Fixed timestep accumulator
         self._physics_accumulator = 0.0
@@ -253,8 +278,34 @@ class Game:
                     elif self.state == STATE_TRAINING:
                         self._cancel_training()
                         self.state = STATE_TRACK_SELECT
-                    elif self.state in (STATE_JOIN_LOBBY, STATE_CONNECTING):
-                        self._stop_online()
+                    elif self.state == STATE_ROOM_SELECT:
+                        if self._room_create_mode:
+                            self._room_create_mode = False
+                        elif self._room_code_mode:
+                            self._room_code_mode = False
+                        else:
+                            self._stop_online()
+                            self.state = STATE_MENU
+                    elif self.state == STATE_JOIN_LOBBY:
+                        if self.net_client and self.net_client.multi_room:
+                            self.net_client.send_leave_room()
+                            self.state = STATE_ROOM_SELECT
+                            self._room_error_msg = ""
+                            self._room_refresh_timer = 0.0
+                            self.net_client.request_room_list()
+                        else:
+                            self._stop_online()
+                            self.state = STATE_MENU
+                    elif self.state == STATE_CONNECTING:
+                        if self._join_mode == "connecting":
+                            self._stop_online()
+                            self._join_mode = "choose"
+                            self.state = STATE_CONNECTING
+                        else:
+                            self.state = STATE_MENU
+                    elif self.state == STATE_VICTORY:
+                        if self.is_online:
+                            self._stop_online()
                         self.state = STATE_MENU
                     else:
                         self.running = False
@@ -277,8 +328,7 @@ class Game:
                         self._start_selected_track()
                     elif self.state == STATE_VICTORY:
                         if self.is_online:
-                            self._stop_online()
-                            self.state = STATE_MENU
+                            pass  # Online: wait for server return-to-lobby
                         elif self.return_to_editor:
                             self._open_editor_with_points()
                         else:
@@ -289,7 +339,90 @@ class Game:
                         elif self._train_status in ("done", "error"):
                             self.state = STATE_TRACK_SELECT
                     elif self.state == STATE_CONNECTING:
-                        self._attempt_connect()
+                        if self._join_mode == "choose":
+                            if self._join_choice == 0:
+                                # Online
+                                self._lobby_ip_input = DEDICATED_SERVER_IP
+                                self._join_mode = "connecting"
+                                self._net_error_msg = "Connecting..."
+                                self._attempt_connect()
+                            else:
+                                # Local — start a local server and auto-connect
+                                self._start_local_server()
+                    elif self.state == STATE_JOIN_LOBBY:
+                        if self._is_lobby_admin:
+                            self.net_client.send_config_start_race()
+                    elif self.state == STATE_ROOM_SELECT:
+                        if self._room_create_mode:
+                            if self._room_name_input.strip():
+                                self.net_client.send_create_room(
+                                    self._room_name_input.strip(),
+                                    self._room_private)
+                                self._room_create_mode = False
+                        elif self._room_code_mode:
+                            if len(self._room_code_input) == 4:
+                                self.net_client.send_join_room_by_code(
+                                    self._room_code_input.upper())
+                                self._room_code_mode = False
+                        else:
+                            # Join selected room
+                            if self._room_list and self._room_selected < len(self._room_list):
+                                room = self._room_list[self._room_selected]
+                                if room["state"] == 0:  # lobby
+                                    self.net_client.send_join_room(room["room_id"])
+
+                elif self.state == STATE_ROOM_SELECT:
+                    if self._room_create_mode:
+                        if event.key == pygame.K_BACKSPACE:
+                            self._room_name_input = self._room_name_input[:-1]
+                        elif event.key == pygame.K_TAB:
+                            self._room_private = not self._room_private
+                    elif self._room_code_mode:
+                        if event.key == pygame.K_BACKSPACE:
+                            self._room_code_input = self._room_code_input[:-1]
+                    else:
+                        if event.key == pygame.K_UP:
+                            self._room_selected = max(0, self._room_selected - 1)
+                        elif event.key == pygame.K_DOWN:
+                            if self._room_list:
+                                self._room_selected = min(
+                                    len(self._room_list) - 1,
+                                    self._room_selected + 1)
+                        elif event.key == pygame.K_c:
+                            self._room_create_mode = True
+                            self._room_name_input = ""
+                            self._room_private = False
+                            self._room_cursor_blink = 0.0
+                        elif event.key == pygame.K_p:
+                            self._room_code_mode = True
+                            self._room_code_input = ""
+                            self._room_cursor_blink = 0.0
+
+                elif self.state == STATE_CONNECTING:
+                    if self._join_mode == "choose":
+                        if event.key in (pygame.K_UP, pygame.K_DOWN):
+                            self._join_choice = 1 - self._join_choice
+
+                elif self.state == STATE_JOIN_LOBBY:
+                    if self._is_lobby_admin and self._admin_track_list:
+                        if event.key == pygame.K_UP:
+                            self._admin_track_selected = max(
+                                0, self._admin_track_selected - 1)
+                            t = self._admin_track_list[self._admin_track_selected]
+                            self.net_client.send_config_change_track(t["filename"])
+                        elif event.key == pygame.K_DOWN:
+                            self._admin_track_selected = min(
+                                len(self._admin_track_list) - 1,
+                                self._admin_track_selected + 1)
+                            t = self._admin_track_list[self._admin_track_selected]
+                            self.net_client.send_config_change_track(t["filename"])
+                        elif event.key == pygame.K_LEFT:
+                            self._admin_bot_count = max(0, self._admin_bot_count - 1)
+                            self.net_client.send_config_change_bots(self._admin_bot_count)
+                        elif event.key == pygame.K_RIGHT:
+                            self._admin_bot_count = min(
+                                MAX_PLAYERS - 1, self._admin_bot_count + 1)
+                            self.net_client.send_config_change_bots(self._admin_bot_count)
 
                 elif self.state == STATE_TRACK_SELECT:
                     if event.key == pygame.K_UP:
@@ -303,10 +436,6 @@ class Game:
                             if entry.get("type") == "tiles":
                                 self._start_training_screen()
 
-                elif self.state == STATE_CONNECTING:
-                    if event.key == pygame.K_BACKSPACE:
-                        self._lobby_ip_input = self._lobby_ip_input[:-1]
-
                 elif self.state == STATE_TRAINING:
                     if event.key == pygame.K_UP and self._train_status == "idle":
                         self._train_timesteps = min(self._train_timesteps + 50000, 1000000)
@@ -317,11 +446,15 @@ class Game:
                 if event.key == pygame.K_F3:
                     self._show_net_stats = not self._show_net_stats
 
-            # Text input for IP address in connecting screen
-            if event.type == pygame.TEXTINPUT and self.state == STATE_CONNECTING:
-                char = event.text
-                if char in "0123456789.":
-                    self._lobby_ip_input += char
+            # Text input for room select (create name / join code)
+            if event.type == pygame.TEXTINPUT and self.state == STATE_ROOM_SELECT:
+                if self._room_create_mode:
+                    if len(self._room_name_input) < 20:
+                        self._room_name_input += event.text
+                elif self._room_code_mode:
+                    char = event.text.upper()
+                    if len(self._room_code_input) < 4 and char.isalnum():
+                        self._room_code_input += char
 
             # Click izquierdo del mouse para activar power-up
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -442,6 +575,11 @@ class Game:
         elif self.state == STATE_CONNECTING:
             self._ip_cursor_blink += dt
             self._update_connecting(dt)
+        elif self.state == STATE_ROOM_SELECT:
+            self._room_cursor_blink += dt
+            self._update_room_select(dt)
+        elif self.state == STATE_VICTORY:
+            self._update_victory(dt)
 
     def _update_countdown(self, dt: float):
         """Actualiza la cuenta regresiva."""
@@ -798,6 +936,8 @@ class Game:
             self._render_training()
         elif self.state == STATE_CONNECTING:
             self._render_connecting()
+        elif self.state == STATE_ROOM_SELECT:
+            self._render_room_select()
         elif self.state == STATE_JOIN_LOBBY:
             self._render_join_lobby()
         elif self.state == STATE_ONLINE_COUNTDOWN:
@@ -1184,6 +1324,22 @@ class Game:
         y = SCREEN_HEIGHT - mm.get_height() - MINIMAP_MARGIN
         self.screen.blit(mm, (x, y))
 
+    def _update_victory(self, dt):
+        """Actualiza estado de victoria. Online: espera return-to-lobby del servidor."""
+        if not self.is_online or not self.net_client:
+            return
+
+        if not self.net_client.connected:
+            self._net_error_msg = "Server disconnected"
+            self._stop_online()
+            self.state = STATE_MENU
+            return
+
+        if self.net_client.should_return_to_lobby():
+            # Volver al lobby sin desconectar
+            self._is_lobby_admin = self.net_client.is_admin
+            self.state = STATE_JOIN_LOBBY
+
     def _render_victory(self):
         """Renderiza la pantalla de victoria."""
         overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
@@ -1234,8 +1390,14 @@ class Game:
             draw_text_centered(self.screen, f"Your Best Lap: {best}",
                                self.font, COLOR_GREEN, y_pos)
 
-        draw_text_centered(self.screen, "Press ENTER to return to menu",
-                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 80)
+        if self.is_online:
+            draw_text_centered(self.screen, "Returning to lobby...",
+                               self.font, COLOR_YELLOW, SCREEN_HEIGHT - 110)
+            draw_text_centered(self.screen, "ESC: Leave server",
+                               self.font, COLOR_GRAY, SCREEN_HEIGHT - 80)
+        else:
+            draw_text_centered(self.screen, "Press ENTER to return to menu",
+                               self.font, COLOR_GRAY, SCREEN_HEIGHT - 80)
 
     # ──────────────────────────────────────────────
     # EDITOR & TRACK SELECT
@@ -1606,9 +1768,20 @@ class Game:
         if self.net_client:
             self.net_client.disconnect()
             self.net_client = None
+        self._stop_local_server()
         self.is_online = False
         self.my_player_id = 0
         self._net_error_msg = ""
+        self._is_lobby_admin = False
+        self._admin_track_list = []
+        self._admin_track_selected = 0
+        self._admin_bot_count = 1
+        # Room select cleanup
+        self._room_list = []
+        self._room_selected = 0
+        self._room_create_mode = False
+        self._room_code_mode = False
+        self._room_error_msg = ""
 
     def _update_online_countdown(self, dt):
         """Cuenta regresiva para carrera online."""
@@ -1704,11 +1877,13 @@ class Game:
         car.render_angle += angle_diff * factor
 
     def _start_join_screen(self):
-        """Muestra la pantalla de input de IP."""
+        """Muestra pantalla de selección: servidor online o local."""
         self._lobby_ip_input = ""
         self._lobby_name_input = "Player"
         self._net_error_msg = ""
         self._ip_cursor_blink = 0.0
+        self._join_mode = "choose"  # "choose" | "connecting"
+        self._join_choice = 0       # 0 = Online, 1 = Local
         self.state = STATE_CONNECTING
 
     def _update_connecting(self, dt):
@@ -1720,10 +1895,21 @@ class Game:
 
         if self.net_client._connect_ok:
             self.my_player_id = self.net_client.player_id
+            self._is_lobby_admin = self.net_client.is_admin
             self.is_online = True
-            self.state = STATE_JOIN_LOBBY
             self._net_error_msg = ""
-            print(f"[GAME] Connected to host as Player {self.my_player_id + 1}")
+            if self.net_client.multi_room:
+                self.state = STATE_ROOM_SELECT
+                self._room_list = []
+                self._room_selected = 0
+                self._room_error_msg = ""
+                self._room_refresh_timer = 0.0
+                self.net_client.request_room_list()
+                print(f"[GAME] Connected to multi-room server")
+            else:
+                self.state = STATE_JOIN_LOBBY
+                admin_tag = " (Admin)" if self._is_lobby_admin else ""
+                print(f"[GAME] Connected to host as Player {self.my_player_id + 1}{admin_tag}")
         else:
             reason = self.net_client.reject_reason
             if reason == 1:
@@ -1734,9 +1920,11 @@ class Game:
                 self._net_error_msg = "Could not connect to host"
             self.net_client.disconnect()
             self.net_client = None
+            self._stop_local_server()
+            self._join_mode = "choose"
 
     def _attempt_connect(self):
-        """Inicia conexión async al host con la IP introducida."""
+        """Inicia conexión async al host con la IP configurada."""
         ip = self._lobby_ip_input.strip()
         if not ip:
             self._net_error_msg = "Enter host IP address"
@@ -1746,6 +1934,8 @@ class Game:
         if self.net_client:
             return
 
+        self._join_mode = "connecting"
+
         from networking.client import GameClient
         self.net_client = GameClient(ip)
         self._net_error_msg = "Connecting..."
@@ -1753,42 +1943,363 @@ class Game:
         name = self._lobby_name_input or "Player"
         self.net_client.connect_async(name)
 
+    def _start_local_server(self):
+        """Inicia un servidor local multi-room en un hilo y auto-conecta."""
+        import threading
+        from networking.server import GameServer
+        from server.room_manager import RoomManager
+        from track_manager import list_tracks
+
+        # Elegir track por defecto (el primero disponible)
+        tracks = list_tracks()
+        default_track = tracks[0]["filename"] if tracks else "default_circuit.json"
+
+        # Crear GameServer local
+        try:
+            srv = GameServer(port=NET_DEFAULT_PORT, dedicated=True)
+            srv.track_name = default_track
+            srv.host_name = "Local Server"
+            srv.start()
+        except OSError as e:
+            self._net_error_msg = f"Cannot start local server: {e}"
+            return
+
+        # Crear RoomManager (multi-room)
+        rm = RoomManager(srv, default_track, 1, 4)
+        srv._room_manager = rm
+
+        self._local_server = srv
+        self._local_room_manager = rm
+
+        # Tick loop en hilo daemon
+        from settings import FIXED_DT
+        import time
+
+        def _tick_loop():
+            next_tick = time.perf_counter()
+            while srv._running:
+                now = time.perf_counter()
+                ticks = 0
+                while now >= next_tick and ticks < 2:
+                    try:
+                        rm.tick_all(FIXED_DT)
+                    except Exception as e:
+                        print(f"[LOCAL-SERVER] Error in tick: {e}")
+                    next_tick += FIXED_DT
+                    ticks += 1
+                if now >= next_tick:
+                    next_tick = now
+                remaining = next_tick - time.perf_counter()
+                if remaining > 0.002:
+                    time.sleep(0.001)
+
+        t = threading.Thread(target=_tick_loop, daemon=True)
+        t.start()
+        self._local_server_thread = t
+
+        print(f"[GAME] Local multi-room server started on port {NET_DEFAULT_PORT}")
+
+        # Auto-conectar al servidor local
+        self._lobby_ip_input = "127.0.0.1"
+        self._join_mode = "connecting"
+        self._net_error_msg = "Connecting..."
+        self._attempt_connect()
+
+    def _stop_local_server(self):
+        """Detiene el servidor local si existe."""
+        if self._local_server:
+            print("[GAME] Stopping local server...")
+            self._local_server.stop()
+            self._local_server = None
+            self._local_room_manager = None
+            self._local_server_thread = None
+
     def _render_connecting(self):
-        """Renderiza pantalla de input de IP para unirse."""
+        """Renderiza pantalla de conexión según el sub-modo."""
         self._render_gradient_bg()
 
+        if self._join_mode == "choose":
+            self._render_join_choose()
+        else:
+            self._render_connecting_status()
+
+    def _render_join_choose(self):
+        """Pantalla de selección: Online o LAN."""
         draw_text_centered(self.screen, "JOIN GAME",
-                           self.font_title, COLOR_YELLOW, 100)
+                           self.font_title, COLOR_YELLOW, 120)
 
-        # IP input
-        draw_text_centered(self.screen, "Enter Server IP:",
-                           self.font_subtitle, COLOR_WHITE, 240)
-
-        # Input box
-        box_w = 350
-        box_h = 40
+        box_w = 400
+        box_h = 80
         box_x = SCREEN_WIDTH // 2 - box_w // 2
-        box_y = 290
-        pygame.draw.rect(self.screen, (40, 40, 60),
-                         (box_x, box_y, box_w, box_h), border_radius=4)
-        pygame.draw.rect(self.screen, COLOR_WHITE,
-                         (box_x, box_y, box_w, box_h), 2, border_radius=4)
 
-        # IP text with cursor
-        cursor = "|" if int(self._ip_cursor_blink * 2) % 2 == 0 else ""
-        ip_text = self._lobby_ip_input + cursor
-        ip_surf = self.font_subtitle.render(ip_text, True, COLOR_WHITE)
-        self.screen.blit(ip_surf, (box_x + 10, box_y + 6))
+        # Online box
+        y1 = 260
+        sel0 = self._join_choice == 0
+        bg0 = (40, 60, 40) if sel0 else (25, 25, 35)
+        border0 = COLOR_GREEN if sel0 else (60, 60, 80)
+        pygame.draw.rect(self.screen, bg0,
+                         (box_x, y1, box_w, box_h), border_radius=8)
+        pygame.draw.rect(self.screen, border0,
+                         (box_x, y1, box_w, box_h), 2, border_radius=8)
+        prefix0 = "> " if sel0 else "  "
+        draw_text_centered(self.screen, f"{prefix0}Online Server",
+                           self.font_subtitle,
+                           COLOR_GREEN if sel0 else COLOR_GRAY, y1 + 15)
+        draw_text_centered(self.screen, f"({DEDICATED_SERVER_IP})",
+                           self.font_small, COLOR_GRAY, y1 + 48)
+
+        # Local box
+        y2 = 370
+        sel1 = self._join_choice == 1
+        bg1 = (30, 40, 60) if sel1 else (25, 25, 35)
+        border1 = COLOR_BLUE if sel1 else (60, 60, 80)
+        pygame.draw.rect(self.screen, bg1,
+                         (box_x, y2, box_w, box_h), border_radius=8)
+        pygame.draw.rect(self.screen, border1,
+                         (box_x, y2, box_w, box_h), 2, border_radius=8)
+        prefix1 = "> " if sel1 else "  "
+        draw_text_centered(self.screen, f"{prefix1}Local",
+                           self.font_subtitle,
+                           COLOR_BLUE if sel1 else COLOR_GRAY, y2 + 15)
+        draw_text_centered(self.screen, "Play on this computer (LAN)",
+                           self.font_small, COLOR_GRAY, y2 + 48)
+
+        # Error (si volvió de un intento fallido)
+        if self._net_error_msg:
+            draw_text_centered(self.screen, self._net_error_msg,
+                               self.font, COLOR_RED, 490)
+
+        draw_text_centered(self.screen,
+                           "UP/DOWN: Select  |  ENTER: Confirm  |  ESC: Back",
+                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
+
+    def _render_connecting_status(self):
+        """Pantalla de 'conectando...'"""
+        if self._local_server:
+            target = "Local Server"
+        else:
+            target = self._lobby_ip_input or DEDICATED_SERVER_IP
+        draw_text_centered(self.screen, "CONNECTING",
+                           self.font_title, COLOR_YELLOW, 200)
+
+        draw_text_centered(self.screen, f"Server: {target}",
+                           self.font, COLOR_GRAY, 280)
+
+        dots = "." * (int(self._ip_cursor_blink * 2) % 4)
+        draw_text_centered(self.screen, f"Please wait{dots}",
+                           self.font_subtitle, COLOR_WHITE, 330)
+
+        if self._net_error_msg and "Connecting" not in self._net_error_msg:
+            draw_text_centered(self.screen, self._net_error_msg,
+                               self.font, COLOR_RED, 400)
+
+        draw_text_centered(self.screen, "ESC: Cancel",
+                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
+
+    # ── ROOM SELECT (multi-room) ──
+
+    def _update_room_select(self, dt):
+        """Actualiza pantalla de selección de salas."""
+        if not self.net_client or not self.net_client.connected:
+            self._stop_online()
+            self.state = STATE_MENU
+            return
+
+        # Refresh room list periódicamente
+        self._room_refresh_timer += dt
+        if self._room_refresh_timer >= ROOM_LIST_REFRESH_INTERVAL:
+            self._room_refresh_timer = 0.0
+            self.net_client.request_room_list()
+
+        # Actualizar lista desde el cliente
+        new_list = self.net_client.get_room_list()
+        if new_list is not None:
+            self._room_list = new_list
+            if self._room_selected >= len(self._room_list):
+                self._room_selected = max(0, len(self._room_list) - 1)
+
+        # Verificar si se unió a una sala
+        if self.net_client.has_joined_room():
+            self.my_player_id = self.net_client.player_id
+            self._is_lobby_admin = self.net_client.is_admin
+            self.state = STATE_JOIN_LOBBY
+            self._room_error_msg = ""
+            admin_tag = " (Admin)" if self._is_lobby_admin else ""
+            print(f"[GAME] Joined room as Player {self.my_player_id + 1}{admin_tag}")
+            return
+
+        # Verificar rechazo
+        reason = self.net_client.get_room_reject_reason()
+        if reason > 0:
+            from networking.protocol import ROOM_FULL, ROOM_RACING, ROOM_NOT_FOUND, MAX_ROOMS_REACHED
+            msg_map = {
+                ROOM_FULL: "Room is full",
+                ROOM_RACING: "Race in progress",
+                ROOM_NOT_FOUND: "Room not found",
+                MAX_ROOMS_REACHED: "Max rooms reached",
+            }
+            self._room_error_msg = msg_map.get(reason, f"Rejected (code {reason})")
+
+    def _render_room_select(self):
+        """Renderiza pantalla de selección de salas."""
+        self._render_gradient_bg()
+
+        draw_text_centered(self.screen, "ROOM SELECT",
+                           self.font_title, COLOR_YELLOW, 50)
+
+        if self._room_create_mode:
+            self._render_room_create_dialog()
+            return
+        if self._room_code_mode:
+            self._render_room_code_dialog()
+            return
+
+        # Room list
+        list_y = 120
+        list_h = 380
+        list_x = 80
+        list_w = SCREEN_WIDTH - 160
+
+        # Header
+        pygame.draw.rect(self.screen, (30, 30, 50),
+                         (list_x, list_y, list_w, 30), border_radius=4)
+        hdr_font = self.font_small
+        hdr_surf = hdr_font.render(
+            f"{'Room':<22} {'Players':<10} {'Track':<20} {'Status':<10}",
+            True, COLOR_GRAY)
+        self.screen.blit(hdr_surf, (list_x + 10, list_y + 6))
+
+        # Rooms
+        row_y = list_y + 35
+        if not self._room_list:
+            draw_text_centered(self.screen, "No rooms available",
+                               self.font, COLOR_GRAY, row_y + 40)
+            draw_text_centered(self.screen, "Press C to create one",
+                               self.font_small, COLOR_GRAY, row_y + 70)
+        else:
+            for i, room in enumerate(self._room_list):
+                is_sel = (i == self._room_selected)
+                bg_color = (50, 50, 80) if is_sel else (25, 25, 40)
+                pygame.draw.rect(self.screen, bg_color,
+                                 (list_x, row_y, list_w, 32), border_radius=3)
+                if is_sel:
+                    pygame.draw.rect(self.screen, COLOR_YELLOW,
+                                     (list_x, row_y, list_w, 32), 2,
+                                     border_radius=3)
+
+                state_names = {0: "Lobby", 1: "Starting", 2: "Racing", 3: "Done"}
+                state_colors = {0: COLOR_GREEN, 1: COLOR_YELLOW,
+                                2: COLOR_ORANGE, 3: COLOR_GRAY}
+                state = room.get("state", 0)
+                name = room.get("name", "?")[:20]
+                players = f"{room.get('players', 0)}/{room.get('max_players', 4)}"
+                track = room.get("track", "?")[:18]
+                status = state_names.get(state, "?")
+
+                txt = f"  {name:<20} {players:<10} {track:<20}"
+                txt_surf = self.font_small.render(txt, True, COLOR_WHITE)
+                self.screen.blit(txt_surf, (list_x + 5, row_y + 7))
+
+                status_surf = self.font_small.render(
+                    status, True, state_colors.get(state, COLOR_WHITE))
+                self.screen.blit(status_surf, (list_x + list_w - 80, row_y + 7))
+
+                row_y += 36
+                if row_y > list_y + list_h:
+                    break
 
         # Error message
-        if self._net_error_msg:
-            color = COLOR_YELLOW if "Connecting" in self._net_error_msg else COLOR_RED
-            draw_text_centered(self.screen, self._net_error_msg,
-                               self.font, color, 360)
+        if self._room_error_msg:
+            draw_text_centered(self.screen, self._room_error_msg,
+                               self.font, COLOR_RED, SCREEN_HEIGHT - 130)
+
+        # Footer controls
+        draw_text_centered(self.screen,
+                           "ENTER: Join  |  C: Create Room  |  P: Join by Code",
+                           self.font, COLOR_GREEN, SCREEN_HEIGHT - 80)
+        draw_text_centered(self.screen,
+                           "UP/DOWN: Navigate  |  ESC: Disconnect",
+                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
+
+    def _render_room_create_dialog(self):
+        """Renderiza diálogo de creación de sala."""
+        # Overlay box
+        box_w = 450
+        box_h = 220
+        box_x = SCREEN_WIDTH // 2 - box_w // 2
+        box_y = SCREEN_HEIGHT // 2 - box_h // 2
+        pygame.draw.rect(self.screen, (20, 20, 35),
+                         (box_x, box_y, box_w, box_h), border_radius=8)
+        pygame.draw.rect(self.screen, COLOR_YELLOW,
+                         (box_x, box_y, box_w, box_h), 2, border_radius=8)
+
+        draw_text_centered(self.screen, "CREATE ROOM",
+                           self.font_subtitle, COLOR_YELLOW, box_y + 20)
+
+        # Name input
+        draw_text_centered(self.screen, "Room Name:",
+                           self.font, COLOR_WHITE, box_y + 60)
+
+        inp_w = 300
+        inp_h = 35
+        inp_x = SCREEN_WIDTH // 2 - inp_w // 2
+        inp_y = box_y + 85
+        pygame.draw.rect(self.screen, (40, 40, 60),
+                         (inp_x, inp_y, inp_w, inp_h), border_radius=4)
+        pygame.draw.rect(self.screen, COLOR_WHITE,
+                         (inp_x, inp_y, inp_w, inp_h), 2, border_radius=4)
+
+        cursor = "|" if int(self._room_cursor_blink * 2) % 2 == 0 else ""
+        name_text = self._room_name_input + cursor
+        name_surf = self.font.render(name_text, True, COLOR_WHITE)
+        self.screen.blit(name_surf, (inp_x + 8, inp_y + 7))
+
+        # Private toggle
+        priv_text = f"Private: {'YES' if self._room_private else 'NO'} (TAB to toggle)"
+        priv_color = COLOR_YELLOW if self._room_private else COLOR_GRAY
+        draw_text_centered(self.screen, priv_text,
+                           self.font, priv_color, box_y + 140)
 
         # Footer
-        draw_text_centered(self.screen, "ENTER: Connect  |  ESC: Back",
-                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
+        draw_text_centered(self.screen, "ENTER: Create  |  ESC: Cancel",
+                           self.font_small, COLOR_GRAY, box_y + 180)
+
+    def _render_room_code_dialog(self):
+        """Renderiza diálogo de ingreso de código de sala."""
+        box_w = 400
+        box_h = 180
+        box_x = SCREEN_WIDTH // 2 - box_w // 2
+        box_y = SCREEN_HEIGHT // 2 - box_h // 2
+        pygame.draw.rect(self.screen, (20, 20, 35),
+                         (box_x, box_y, box_w, box_h), border_radius=8)
+        pygame.draw.rect(self.screen, COLOR_YELLOW,
+                         (box_x, box_y, box_w, box_h), 2, border_radius=8)
+
+        draw_text_centered(self.screen, "JOIN BY CODE",
+                           self.font_subtitle, COLOR_YELLOW, box_y + 20)
+
+        draw_text_centered(self.screen, "Enter 4-character room code:",
+                           self.font, COLOR_WHITE, box_y + 60)
+
+        # Code input (big, centered)
+        inp_w = 160
+        inp_h = 45
+        inp_x = SCREEN_WIDTH // 2 - inp_w // 2
+        inp_y = box_y + 90
+        pygame.draw.rect(self.screen, (40, 40, 60),
+                         (inp_x, inp_y, inp_w, inp_h), border_radius=4)
+        pygame.draw.rect(self.screen, COLOR_WHITE,
+                         (inp_x, inp_y, inp_w, inp_h), 2, border_radius=4)
+
+        cursor = "|" if int(self._room_cursor_blink * 2) % 2 == 0 else ""
+        code_text = self._room_code_input.upper() + cursor
+        code_surf = self.font_subtitle.render(code_text, True, COLOR_YELLOW)
+        code_rect = code_surf.get_rect(center=(SCREEN_WIDTH // 2, inp_y + inp_h // 2))
+        self.screen.blit(code_surf, code_rect)
+
+        # Footer
+        draw_text_centered(self.screen, "ENTER: Join  |  ESC: Cancel",
+                           self.font_small, COLOR_GRAY, box_y + 150)
 
     # ── CLIENT LOBBY ──
 
@@ -1803,6 +2314,21 @@ class Game:
             self.state = STATE_MENU
             return
 
+        # Actualizar admin state
+        self._is_lobby_admin = self.net_client.is_admin
+        track_list = self.net_client.get_track_list()
+        if track_list:
+            self._admin_track_list = track_list
+            # Sincronizar selección con track actual del lobby
+            lobby = self.net_client.get_lobby_state()
+            if lobby:
+                current_track = lobby.get("track_name", "")
+                for i, t in enumerate(self._admin_track_list):
+                    if t["filename"] == current_track:
+                        self._admin_track_selected = i
+                        break
+                self._admin_bot_count = lobby.get("bot_count", 1)
+
         # Verificar si la carrera ha comenzado
         if self.net_client.race_started:
             self._start_online_race_as_client()
@@ -1814,40 +2340,73 @@ class Game:
         draw_text_centered(self.screen, "LOBBY",
                            self.font_title, COLOR_YELLOW, 80)
 
-        draw_text_centered(self.screen, f"Connected as Player {self.my_player_id + 1}",
-                           self.font_subtitle, COLOR_WHITE, 160)
+        admin_tag = " (Admin)" if self._is_lobby_admin else ""
+        draw_text_centered(self.screen,
+                           f"Connected as Player {self.my_player_id + 1}{admin_tag}",
+                           self.font_subtitle, COLOR_WHITE, 150)
 
         # Mostrar estado del lobby
         lobby = self.net_client.get_lobby_state() if self.net_client else None
-        if lobby:
-            draw_text_centered(self.screen, f"Track: {lobby['track_name']}",
-                               self.font, COLOR_GRAY, 210)
+        admin_pid = lobby.get("admin_player_id", 255) if lobby else 255
 
-            y = 260
+        if lobby:
+            # Track display
+            track_name = lobby['track_name']
+            if self._is_lobby_admin and self._admin_track_list:
+                sel = self._admin_track_selected
+                display_name = self._admin_track_list[sel]["name"] if sel < len(self._admin_track_list) else track_name
+                draw_text_centered(self.screen,
+                                   f"< {display_name} >",
+                                   self.font_subtitle, COLOR_YELLOW, 205)
+                draw_text_centered(self.screen,
+                                   f"({self._admin_track_list[sel]['filename']})",
+                                   self.font_small, COLOR_GRAY, 235)
+            else:
+                draw_text_centered(self.screen, f"Track: {track_name}",
+                                   self.font, COLOR_GRAY, 210)
+
+            # Bots display
+            bot_count = lobby["bot_count"]
+            if self._is_lobby_admin:
+                draw_text_centered(self.screen,
+                                   f"Bots: < {bot_count} >",
+                                   self.font, COLOR_YELLOW, 260)
+            else:
+                if bot_count > 0:
+                    draw_text_centered(self.screen, f"Bots: {bot_count}",
+                                       self.font, COLOR_GRAY, 260)
+
+            # Player list
+            y = 300
             draw_text_centered(self.screen, "Players:", self.font_subtitle,
                                COLOR_WHITE, y)
             y += 35
             for pid, name in lobby["players"]:
-                tag = " (You)" if pid == self.my_player_id else ""
+                tag = ""
+                if pid == self.my_player_id:
+                    tag += " (You)"
+                if pid == admin_pid:
+                    tag += " [Admin]"
                 color = PLAYER_COLORS[pid] if pid < len(PLAYER_COLORS) else COLOR_WHITE
                 draw_text_centered(self.screen, f"P{pid + 1}: {name}{tag}",
                                    self.font, color, y)
                 y += 28
-
-            if lobby["bot_count"] > 0:
-                y += 10
-                draw_text_centered(self.screen, f"Bots: {lobby['bot_count']}",
-                                   self.font, COLOR_GRAY, y)
 
         # Track transfer progress
         progress = self.net_client.get_track_progress() if self.net_client else 0.0
         if progress > 0 and progress < 1.0:
             draw_text_centered(self.screen,
                                f"Receiving track... {int(progress * 100)}%",
-                               self.font, COLOR_YELLOW, 500)
+                               self.font, COLOR_YELLOW, 520)
 
-        draw_text_centered(self.screen, "Waiting for host to start...",
-                           self.font, COLOR_GRAY, SCREEN_HEIGHT - 90)
+        # Footer controls
+        if self._is_lobby_admin:
+            draw_text_centered(self.screen,
+                               "UP/DOWN: Track  |  LEFT/RIGHT: Bots  |  ENTER: Start",
+                               self.font, COLOR_GREEN, SCREEN_HEIGHT - 90)
+        else:
+            draw_text_centered(self.screen, "Waiting for admin to start...",
+                               self.font, COLOR_GRAY, SCREEN_HEIGHT - 90)
         draw_text_centered(self.screen, "ESC: Leave",
                            self.font, COLOR_GRAY, SCREEN_HEIGHT - 50)
 

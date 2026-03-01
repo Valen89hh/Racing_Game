@@ -8,6 +8,7 @@ Usa struct para serialización eficiente con tamaño fijo.
 import struct
 import json
 import time
+import random
 
 # ── Tipos de paquete ──
 PKT_JOIN_REQUEST   = 0x01
@@ -17,9 +18,21 @@ PKT_PLAYER_INPUT   = 0x10
 PKT_STATE_SNAPSHOT = 0x20
 PKT_LOBBY_STATE    = 0x30
 PKT_RACE_START     = 0x31
+PKT_SERVER_CONFIG  = 0x32   # Admin→Server: cambiar config
+PKT_TRACK_LIST     = 0x33   # Server→Admin: tracks disponibles
+PKT_RETURN_LOBBY   = 0x34   # Server→All: volver al lobby
 PKT_TRACK_DATA     = 0x35
 PKT_TRACK_ACK      = 0x36
 PKT_POWERUP_EVENT  = 0x40
+PKT_ROOM_LIST_REQ  = 0x50  # C→S: pedir lista de salas
+PKT_ROOM_LIST      = 0x51  # S→C: lista de salas
+PKT_ROOM_CREATE    = 0x52  # C→S: crear sala
+PKT_ROOM_CREATE_OK = 0x53  # S→C: sala creada + código + slot
+PKT_ROOM_JOIN      = 0x54  # C→S: unirse a sala
+PKT_ROOM_ACCEPT    = 0x55  # S→C: aceptado en sala
+PKT_ROOM_REJECT    = 0x56  # S→C: rechazado
+PKT_ROOM_LEAVE     = 0x57  # C→S: salir de sala
+
 PKT_PING           = 0xF0
 PKT_PONG           = 0xF1
 PKT_DISCONNECT     = 0xFF
@@ -63,23 +76,39 @@ def unpack_join_request(data):
 
 
 # ── JOIN_ACCEPT: H→C ──
-# [header][player_id:1B][max_players:1B]
-JOIN_ACCEPT_FMT = "!BB"
+# [header][player_id:1B][max_players:1B][is_admin:1B][multi_room:1B]
+JOIN_ACCEPT_FMT = "!BBBB"
 
-def pack_join_accept(player_id, max_players=4):
-    return _pack_header(PKT_JOIN_ACCEPT) + struct.pack(JOIN_ACCEPT_FMT, player_id, max_players)
+def pack_join_accept(player_id, max_players=4, is_admin=False, multi_room=False):
+    return _pack_header(PKT_JOIN_ACCEPT) + struct.pack(
+        JOIN_ACCEPT_FMT, player_id, max_players,
+        1 if is_admin else 0, 1 if multi_room else 0)
 
 
 def unpack_join_accept(data):
     _, _, payload = _unpack_header(data)
-    player_id, max_players = struct.unpack_from(JOIN_ACCEPT_FMT, payload, 0)
-    return player_id, max_players
+    if len(payload) >= 4:
+        player_id, max_players, is_admin_byte, multi_room_byte = struct.unpack_from(
+            JOIN_ACCEPT_FMT, payload, 0)
+        return player_id, max_players, bool(is_admin_byte), bool(multi_room_byte)
+    if len(payload) >= 3:
+        player_id, max_players, is_admin_byte = struct.unpack_from("!BBB", payload, 0)
+        return player_id, max_players, bool(is_admin_byte), False
+    # Backward compat: old format without is_admin
+    player_id, max_players = struct.unpack_from("!BB", payload, 0)
+    return player_id, max_players, False, False
 
 
 # ── JOIN_REJECT: H→C ──
 # [header][reason:1B]
 REJECT_FULL = 1
 REJECT_RACING = 2
+
+# Room reject reasons
+ROOM_FULL = 1
+ROOM_RACING = 2
+ROOM_NOT_FOUND = 3
+MAX_ROOMS_REACHED = 4
 
 def pack_join_reject(reason=REJECT_FULL):
     return _pack_header(PKT_JOIN_REJECT) + struct.pack("!B", reason)
@@ -442,13 +471,14 @@ def unpack_state_snapshot(data):
 
 
 # ── LOBBY_STATE: H→C ──
-# [header][n_players:B][bot_count:B][track_name_len:B][track_name:varB]
+# [header][n_players:B][bot_count:B][track_name_len:B][admin_pid:B][track_name:varB]
 # followed by: for each player [pid:B][name_len:B][name:varB]
-def pack_lobby_state(players, bot_count, track_name):
+# admin_pid: 255 = no admin
+def pack_lobby_state(players, bot_count, track_name, admin_player_id=255):
     """players: list of (player_id, name)"""
     header = _pack_header(PKT_LOBBY_STATE)
     track_bytes = track_name.encode("utf-8")[:40]
-    meta = struct.pack("!BBB", len(players), bot_count, len(track_bytes))
+    meta = struct.pack("!BBBB", len(players), bot_count, len(track_bytes), admin_player_id)
     payload = meta + track_bytes
     for pid, name in players:
         name_bytes = name.encode("utf-8")[:20]
@@ -458,18 +488,27 @@ def pack_lobby_state(players, bot_count, track_name):
 
 def unpack_lobby_state(data):
     _, _, payload = _unpack_header(data)
-    n_players, bot_count, track_name_len = struct.unpack_from("!BBB", payload, 0)
-    offset = 3
+    # New format: 4-byte meta with admin_pid
+    if len(payload) >= 4:
+        n_players, bot_count, track_name_len, admin_pid = struct.unpack_from("!BBBB", payload, 0)
+        offset = 4
+    else:
+        n_players, bot_count, track_name_len = struct.unpack_from("!BBB", payload, 0)
+        admin_pid = 255
+        offset = 3
     track_name = payload[offset:offset + track_name_len].decode("utf-8", errors="replace")
     offset += track_name_len
     players = []
     for _ in range(n_players):
+        if offset + 2 > len(payload):
+            break
         pid, name_len = struct.unpack_from("!BB", payload, offset)
         offset += 2
         name = payload[offset:offset + name_len].decode("utf-8", errors="replace")
         offset += name_len
         players.append((pid, name))
-    return {"players": players, "bot_count": bot_count, "track_name": track_name}
+    return {"players": players, "bot_count": bot_count, "track_name": track_name,
+            "admin_player_id": admin_pid}
 
 
 # ── RACE_START: H→C ──
@@ -556,6 +595,238 @@ def unpack_ping(data):
     return struct.unpack_from(PING_FMT, payload, 0)[0]
 
 
+# ── SERVER_CONFIG: Admin→Server ──
+# [header][subtype:1B][payload...]
+CONFIG_CHANGE_TRACK = 0x01
+CONFIG_CHANGE_BOTS  = 0x02
+CONFIG_START_RACE   = 0x03
+
+def pack_server_config_track(filename):
+    """Admin requests track change."""
+    name_bytes = filename.encode("utf-8")[:60]
+    return _pack_header(PKT_SERVER_CONFIG) + struct.pack("!BB", CONFIG_CHANGE_TRACK,
+                                                          len(name_bytes)) + name_bytes
+
+def pack_server_config_bots(count):
+    """Admin requests bot count change."""
+    return _pack_header(PKT_SERVER_CONFIG) + struct.pack("!BB", CONFIG_CHANGE_BOTS, count)
+
+def pack_server_config_start():
+    """Admin requests race start."""
+    return _pack_header(PKT_SERVER_CONFIG) + struct.pack("!B", CONFIG_START_RACE)
+
+def unpack_server_config(data):
+    """Unpack server config packet. Returns dict with 'subtype' and payload fields."""
+    _, _, payload = _unpack_header(data)
+    subtype = payload[0]
+    if subtype == CONFIG_CHANGE_TRACK:
+        name_len = payload[1]
+        filename = payload[2:2 + name_len].decode("utf-8", errors="replace")
+        return {"subtype": subtype, "filename": filename}
+    elif subtype == CONFIG_CHANGE_BOTS:
+        return {"subtype": subtype, "count": payload[1]}
+    elif subtype == CONFIG_START_RACE:
+        return {"subtype": subtype}
+    return {"subtype": subtype}
+
+
+# ── TRACK_LIST: Server→Admin ──
+# [header][count:1B][ [name_len:1B][name][fname_len:1B][fname][type:1B] ...]
+def pack_track_list(tracks):
+    """Pack list of available tracks. tracks: list of dicts with name, filename, type."""
+    header = _pack_header(PKT_TRACK_LIST)
+    count = min(len(tracks), 255)
+    body = struct.pack("!B", count)
+    for i in range(count):
+        t = tracks[i]
+        name_bytes = t["name"].encode("utf-8")[:40]
+        fname_bytes = t["filename"].encode("utf-8")[:60]
+        ttype = 1 if t.get("type") == "tiles" else 0
+        body += struct.pack("!B", len(name_bytes)) + name_bytes
+        body += struct.pack("!B", len(fname_bytes)) + fname_bytes
+        body += struct.pack("!B", ttype)
+    return header + body
+
+def unpack_track_list(data):
+    """Unpack track list. Returns list of dicts with name, filename, type."""
+    _, _, payload = _unpack_header(data)
+    count = payload[0]
+    offset = 1
+    tracks = []
+    for _ in range(count):
+        name_len = payload[offset]; offset += 1
+        name = payload[offset:offset + name_len].decode("utf-8", errors="replace"); offset += name_len
+        fname_len = payload[offset]; offset += 1
+        fname = payload[offset:offset + fname_len].decode("utf-8", errors="replace"); offset += fname_len
+        ttype = payload[offset]; offset += 1
+        tracks.append({"name": name, "filename": fname, "type": "tiles" if ttype == 1 else "classic"})
+    return tracks
+
+
+# ── RETURN_LOBBY: Server→All ──
+def pack_return_lobby():
+    """Signal all clients to return to lobby."""
+    return _pack_header(PKT_RETURN_LOBBY)
+
+
 # ── DISCONNECT ──
 def pack_disconnect():
     return _pack_header(PKT_DISCONNECT)
+
+
+# ══════════════════════════════════════════════
+# ROOM MANAGEMENT (multi-room dedicated server)
+# ══════════════════════════════════════════════
+
+_ROOM_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # sin 0/O/1/I/L
+
+
+def generate_room_code():
+    """Genera un código de sala de 4 caracteres."""
+    return "".join(random.choices(_ROOM_CHARS, k=4))
+
+
+# ── ROOM_LIST_REQ: C→S ──
+def pack_room_list_req():
+    return _pack_header(PKT_ROOM_LIST_REQ)
+
+
+# ── ROOM_LIST: S→C ──
+# [header][count:1B] per room: [room_id:1B][code_len:1B][code:varB]
+#   [name_len:1B][name:varB][track_len:1B][track:varB]
+#   [players:1B][max_players:1B][state:1B][is_private:1B]
+ROOM_STATE_LOBBY = 0
+ROOM_STATE_COUNTDOWN = 1
+ROOM_STATE_RACING = 2
+ROOM_STATE_DONE = 3
+
+
+def pack_room_list(rooms):
+    """Pack list of room info dicts.
+    rooms: [{room_id, code, name, track, players, max_players, state, is_private}, ...]
+    """
+    header = _pack_header(PKT_ROOM_LIST)
+    count = min(len(rooms), 255)
+    body = struct.pack("!B", count)
+    for r in rooms[:count]:
+        code_bytes = r["code"].encode("utf-8")[:8]
+        name_bytes = r["name"].encode("utf-8")[:30]
+        track_bytes = r["track"].encode("utf-8")[:40]
+        body += struct.pack("!BB", r["room_id"], len(code_bytes)) + code_bytes
+        body += struct.pack("!B", len(name_bytes)) + name_bytes
+        body += struct.pack("!B", len(track_bytes)) + track_bytes
+        body += struct.pack("!BBBB", r["players"], r["max_players"],
+                            r["state"], 1 if r["is_private"] else 0)
+    return header + body
+
+
+def unpack_room_list(data):
+    _, _, payload = _unpack_header(data)
+    count = payload[0]
+    offset = 1
+    rooms = []
+    for _ in range(count):
+        room_id = payload[offset]; offset += 1
+        code_len = payload[offset]; offset += 1
+        code = payload[offset:offset + code_len].decode("utf-8", errors="replace"); offset += code_len
+        name_len = payload[offset]; offset += 1
+        name = payload[offset:offset + name_len].decode("utf-8", errors="replace"); offset += name_len
+        track_len = payload[offset]; offset += 1
+        track = payload[offset:offset + track_len].decode("utf-8", errors="replace"); offset += track_len
+        players, max_p, state, is_priv = struct.unpack_from("!BBBB", payload, offset); offset += 4
+        rooms.append({
+            "room_id": room_id, "code": code, "name": name,
+            "track": track, "players": players, "max_players": max_p,
+            "state": state, "is_private": bool(is_priv),
+        })
+    return rooms
+
+
+# ── ROOM_CREATE: C→S ──
+# [header][is_private:1B][name_len:1B][name:varB]
+def pack_room_create(name, is_private=False):
+    name_bytes = name.encode("utf-8")[:30]
+    return _pack_header(PKT_ROOM_CREATE) + struct.pack(
+        "!BB", 1 if is_private else 0, len(name_bytes)) + name_bytes
+
+
+def unpack_room_create(data):
+    _, _, payload = _unpack_header(data)
+    is_private = bool(payload[0])
+    name_len = payload[1]
+    name = payload[2:2 + name_len].decode("utf-8", errors="replace")
+    return {"is_private": is_private, "name": name}
+
+
+# ── ROOM_CREATE_OK: S→C ──
+# [header][room_id:1B][code_len:1B][code:varB][slot:1B]
+def pack_room_create_ok(room_id, code, slot):
+    code_bytes = code.encode("utf-8")[:8]
+    return _pack_header(PKT_ROOM_CREATE_OK) + struct.pack(
+        "!BB", room_id, len(code_bytes)) + code_bytes + struct.pack("!B", slot)
+
+
+def unpack_room_create_ok(data):
+    _, _, payload = _unpack_header(data)
+    room_id = payload[0]
+    code_len = payload[1]
+    code = payload[2:2 + code_len].decode("utf-8", errors="replace")
+    slot = payload[2 + code_len]
+    return {"room_id": room_id, "code": code, "slot": slot}
+
+
+# ── ROOM_JOIN: C→S ──
+# [header][join_mode:1B][id_or_code_len:1B][id_or_code:varB]
+# join_mode: 0=by room_id (1 byte), 1=by code (4 bytes)
+ROOM_JOIN_BY_ID = 0
+ROOM_JOIN_BY_CODE = 1
+
+
+def pack_room_join_by_id(room_id):
+    return _pack_header(PKT_ROOM_JOIN) + struct.pack("!BBB", ROOM_JOIN_BY_ID, 1, room_id)
+
+
+def pack_room_join_by_code(code):
+    code_bytes = code.encode("utf-8")[:8]
+    return _pack_header(PKT_ROOM_JOIN) + struct.pack(
+        "!BB", ROOM_JOIN_BY_CODE, len(code_bytes)) + code_bytes
+
+
+def unpack_room_join(data):
+    _, _, payload = _unpack_header(data)
+    join_mode = payload[0]
+    val_len = payload[1]
+    if join_mode == ROOM_JOIN_BY_ID:
+        return {"mode": ROOM_JOIN_BY_ID, "room_id": payload[2]}
+    else:
+        code = payload[2:2 + val_len].decode("utf-8", errors="replace")
+        return {"mode": ROOM_JOIN_BY_CODE, "code": code}
+
+
+# ── ROOM_ACCEPT: S→C ──
+# [header][room_id:1B][slot:1B][is_admin:1B]
+def pack_room_accept(room_id, slot, is_admin=False):
+    return _pack_header(PKT_ROOM_ACCEPT) + struct.pack(
+        "!BBB", room_id, slot, 1 if is_admin else 0)
+
+
+def unpack_room_accept(data):
+    _, _, payload = _unpack_header(data)
+    room_id, slot, is_admin = struct.unpack_from("!BBB", payload, 0)
+    return {"room_id": room_id, "slot": slot, "is_admin": bool(is_admin)}
+
+
+# ── ROOM_REJECT: S→C ──
+# [header][reason:1B]
+def pack_room_reject(reason):
+    return _pack_header(PKT_ROOM_REJECT) + struct.pack("!B", reason)
+
+
+def unpack_room_reject(data):
+    _, _, payload = _unpack_header(data)
+    return payload[0]
+
+
+# ── ROOM_LEAVE: C→S ──
+def pack_room_leave():
+    return _pack_header(PKT_ROOM_LEAVE)

@@ -15,24 +15,34 @@ import argparse
 from settings import NET_DEFAULT_PORT, FIXED_DT
 from networking.server import GameServer
 from server.room import Room
+from server.room_manager import RoomManager
 
 
 class DedicatedServer:
     """Servidor dedicado headless."""
 
-    def __init__(self, track_file, port, max_players, bot_count):
+    def __init__(self, track_file, port, max_players, bot_count,
+                 multi_room=False):
         self.track_file = track_file
         self.port = port
         self.max_players = max_players
         self.bot_count = bot_count
+        self.multi_room = multi_room
         self.running = False
 
         self.net_server = GameServer(port=port, dedicated=True)
         self.net_server.track_name = track_file
         self.net_server.host_name = "Server"
 
-        self.room = Room(
-            self.net_server, track_file, bot_count, max_players)
+        if multi_room:
+            self.room_manager = RoomManager(
+                self.net_server, track_file, bot_count, max_players)
+            self.net_server._room_manager = self.room_manager
+            self.room = None
+        else:
+            self.room = Room(
+                self.net_server, track_file, bot_count, max_players)
+            self.room_manager = None
 
     def start(self):
         """Inicia el servidor y entra en el main loop."""
@@ -45,6 +55,9 @@ class DedicatedServer:
         print(f"[DEDICATED] Server started on port {self.port}")
         print(f"[DEDICATED] Track: {self.track_file}")
         print(f"[DEDICATED] Max players: {self.max_players}, Bots: {self.bot_count}")
+        if self.multi_room:
+            from settings import MAX_ROOMS
+            print(f"[DEDICATED] Multi-room mode: up to {MAX_ROOMS} rooms")
         print(f"[DEDICATED] Waiting for players...")
 
         self.running = True
@@ -64,7 +77,10 @@ class DedicatedServer:
 
             while now >= next_tick_time and ticks_this_frame < self.MAX_TICKS_PER_FRAME:
                 try:
-                    self.room.tick(FIXED_DT)
+                    if self.room_manager:
+                        self.room_manager.tick_all(FIXED_DT)
+                    else:
+                        self.room.tick(FIXED_DT)
                 except KeyboardInterrupt:
                     self.running = False
                     break
@@ -107,6 +123,8 @@ def main():
                         help="Max players (default: 4)")
     parser.add_argument("--bots", type=int, default=1,
                         help="Number of bots (default: 1)")
+    parser.add_argument("--multi-room", action="store_true",
+                        help="Enable multi-room mode (up to 4 simultaneous rooms)")
     args = parser.parse_args()
 
     server = DedicatedServer(
@@ -114,6 +132,7 @@ def main():
         port=args.port,
         max_players=args.max_players,
         bot_count=args.bots,
+        multi_room=args.multi_room,
     )
 
     try:

@@ -150,7 +150,7 @@ User=${SERVER_USER}
 WorkingDirectory=${REMOTE_DIR}
 Environment=SDL_VIDEODRIVER=dummy
 Environment=PYTHONUNBUFFERED=1
-ExecStart=${REMOTE_DIR}/venv/bin/python main.py --dedicated-server --track ${TRACK_FILE} --bots ${BOT_COUNT} --port ${GAME_PORT}
+ExecStart=${REMOTE_DIR}/venv/bin/python main.py --dedicated-server --track ${TRACK_FILE} --bots ${BOT_COUNT} --port ${GAME_PORT} --multi-room
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

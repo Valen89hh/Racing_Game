@@ -297,6 +297,7 @@ STATE_JOIN_LOBBY = "join_lobby"
 STATE_CONNECTING = "connecting"
 STATE_ONLINE_RACING = "online_racing"
 STATE_ONLINE_COUNTDOWN = "online_countdown"
+STATE_ROOM_SELECT = "room_select"
 
 # ──────────────────────────────────────────────
 # JUGADORES (preparado para multiplayer futuro)
@@ -376,5 +377,14 @@ SERVER_INPUT_QUEUE_SIZE = 32    # max inputs buffered por jugador en el servidor
 # ──────────────────────────────────────────────
 # DEDICATED SERVER
 # ──────────────────────────────────────────────
+DEDICATED_SERVER_IP = "143.198.138.38"  # IP del servidor dedicado (auto-connect)
 DEDICATED_AUTO_START_DELAY = 10.0   # segundos antes de auto-start
 DEDICATED_MIN_PLAYERS = 1           # jugadores humanos minimos
+DEDICATED_DONE_RESET_DELAY = 10.0   # segundos después de fin de carrera antes de volver al lobby
+
+# ──────────────────────────────────────────────
+# MULTI-ROOM (dedicated server)
+# ──────────────────────────────────────────────
+MAX_ROOMS = 4
+ROOM_CODE_LENGTH = 4
+ROOM_LIST_REFRESH_INTERVAL = 2.0    # segundos entre refreshes de room list
