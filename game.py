@@ -2620,11 +2620,13 @@ class Game:
                     if cs.player_id != self.my_player_id and "slowmo" in (cs.effects or []):
                         self._client_slowmo_on_me = True
                         break
+                # Sincronizar timer con el servidor solo en snapshots nuevos
+                # (evita que total_time se resetee cada frame a un valor stale)
+                self.race_timer.total_time = latest.race_time
             # Sincronizar objetos del mundo cada frame (no causan jitter)
             self._sync_projectiles(latest)
             self._sync_hazards(latest)
             self._sync_powerup_items(latest)
-            self.race_timer.total_time = latest.race_time
 
         # 3B. REMOTE CARS: Interpolar con delay buffer adaptativo (server time)
         interp_delay = self.net_client.get_adaptive_delay()
@@ -2704,6 +2706,29 @@ class Game:
         if all_finished or (self.winner and
                             self.race_timer.total_time > self.winner.finish_time + 15):
             self.state = STATE_VICTORY
+            return
+
+        # Debug: imprimir estado de victoria cada 2 segundos si el jugador terminó
+        if self.player_car and self.player_car.finished:
+            self._victory_debug_timer = getattr(self, '_victory_debug_timer', 0.0) + dt
+            if self._victory_debug_timer >= 2.0:
+                self._victory_debug_timer = 0.0
+                finished_cars = sum(1 for c in self.cars if c.finished)
+                print(f"[DEBUG-VICTORY] player.finished=True "
+                      f"winner={self.winner is not None} "
+                      f"all_finished={all_finished} "
+                      f"finished={finished_cars}/{len(self.cars)} "
+                      f"total_time={self.race_timer.total_time:.1f} "
+                      f"finish_time={self.winner.finish_time if self.winner else 'N/A'}")
+
+        # Return-to-lobby del servidor (fallback si la victoria no se detectó)
+        if self.net_client and self.net_client.should_return_to_lobby():
+            if self.winner:
+                # Hubo ganador pero no se mostró victoria → mostrar ahora
+                self.state = STATE_VICTORY
+            else:
+                self._is_lobby_admin = self.net_client.is_admin
+                self.state = STATE_JOIN_LOBBY
 
     def _save_input_to_buffer(self, seq, accel, turn, brake, use_powerup=False):
         """Guarda un input enviado en el buffer circular para replay."""
@@ -2795,11 +2820,18 @@ class Game:
 
         # Discretos
         old_laps = car.laps
+        old_finished = car.finished
         car.laps = server_state.laps
         car.next_checkpoint_index = server_state.next_checkpoint_index
         car.held_powerup = server_state.held_powerup
         car.finished = server_state.finished
         car.finish_time = server_state.finish_time
+
+        # Debug: detectar cambio de finished
+        if car.finished and not old_finished and car is self.player_car:
+            print(f"[DEBUG-FINISH] Player car FINISHED! "
+                  f"laps={car.laps} finish_time={car.finish_time:.2f} "
+                  f"race_time={self.race_timer.total_time:.2f}")
 
         # Actualizar race_timer cuando el servidor reporta una vuelta nueva
         if car.laps > old_laps and car is self.player_car:

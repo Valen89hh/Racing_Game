@@ -178,12 +178,17 @@ class WorldSimulation:
             old_laps = car.laps
             self.collision_system.update_checkpoints(car)
             if car.laps > old_laps:
+                print(f"[SERVER-LAP] {car.name}(pid={car.player_id}) "
+                      f"lap {old_laps} → {car.laps} "
+                      f"(race_time={self.race_timer.total_time:.2f})")
                 if car.laps >= TOTAL_LAPS:
                     car.finished = True
                     car.finish_time = self.race_timer.total_time
                     self.final_times[car.name] = car.finish_time
                     if self.winner is None:
                         self.winner = car
+                    print(f"[SERVER-FINISH] {car.name}(pid={car.player_id}) "
+                          f"FINISHED! time={car.finish_time:.2f}")
 
             # Progress
             self.race_progress.update(car)
