@@ -2794,11 +2794,17 @@ class Game:
         car.update_effects(0)  # recalc multipliers sin tickear
 
         # Discretos
+        old_laps = car.laps
         car.laps = server_state.laps
         car.next_checkpoint_index = server_state.next_checkpoint_index
         car.held_powerup = server_state.held_powerup
         car.finished = server_state.finished
         car.finish_time = server_state.finish_time
+
+        # Actualizar race_timer cuando el servidor reporta una vuelta nueva
+        if car.laps > old_laps and car is self.player_car:
+            for _ in range(car.laps - old_laps):
+                self.race_timer.complete_lap()
 
         if car.finished and self.winner is None:
             self.winner = car
