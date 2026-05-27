@@ -95,11 +95,35 @@ jobs:
       # quitó de build-tools 31+). Sin esa variable, Buildozer descarga su propio
       # SDK completo en ~/.buildozer/android/platform/android-sdk, donde aidl sí
       # viene incluido.
+      #
+      # `set -o pipefail` es crítico: sin él, `buildozer | tee` esconde el exit
+      # code real de buildozer porque tee siempre devuelve 0.
       - name: Build debug APK
+        id: build
         env:
           BUILDOZER_WARN_ON_ROOT: 0
+        shell: bash
         run: |
+          set -o pipefail
           buildozer android debug 2>&1 | tee build.log
+
+      # Si el build falló, dumpear las últimas 200 líneas del log INLINE en la
+      # página de Actions. Así no hay que descargar artifacts para ver el error.
+      - name: Surface buildozer error
+        if: failure() && steps.build.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::group::Last 200 lines of build.log"
+          tail -200 build.log || true
+          echo "::endgroup::"
+          echo ""
+          echo "::group::Posibles recipe.log con error"
+          find .buildozer/android/platform/build-* -name '*.log' -newer build.log 2>/dev/null \
+            | head -5 | while read f; do
+              echo "── $f ──"
+              tail -50 "$f"
+            done
+          echo "::endgroup::"
 
       - name: Locate APK
         id: locate
