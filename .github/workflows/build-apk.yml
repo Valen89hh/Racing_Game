@@ -61,15 +61,17 @@ jobs:
 
       # Cachea ~/.buildozer (NDK, SDK, builds intermedios) entre runs.
       # Primera build: ~30-50 min. Builds siguientes con cache: ~5-10 min.
+      # NOTA: la key tiene un sufijo de versión para invalidar caches viejos
+      # cuando hay cambios estructurales (p.ej. cambiar la fuente del SDK).
       - name: Cache Buildozer global state
         uses: actions/cache@v4
         with:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v2-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-${{ runner.os }}-
+            buildozer-v2-${{ runner.os }}-
 
       # Opción --no-onnx: parchea el spec antes de buildear para excluir onnxruntime.
       # El código cae automáticamente al backend numpy de los .npz.
@@ -88,11 +90,14 @@ jobs:
           echo "NPZ fallback files:"
           ls -la models/*.npz 2>/dev/null || echo "(none)"
 
+      # Importante: NO seteamos ANDROID_HOME. Si lo hacemos, Buildozer usa el SDK
+      # preinstalado en los runners de GitHub, que no incluye `aidl` (Google lo
+      # quitó de build-tools 31+). Sin esa variable, Buildozer descarga su propio
+      # SDK completo en ~/.buildozer/android/platform/android-sdk, donde aidl sí
+      # viene incluido.
       - name: Build debug APK
         env:
-          # Configuraciones útiles para CI:
           BUILDOZER_WARN_ON_ROOT: 0
-          ANDROID_HOME: /usr/local/lib/android/sdk
         run: |
           buildozer android debug 2>&1 | tee build.log
 

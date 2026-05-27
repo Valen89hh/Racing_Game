@@ -73,6 +73,9 @@ android.minapi = 24
 # android.ndk = 25b
 # android.sdk = 33
 
+# Aceptar licencias del SDK automáticamente (necesario en CI sin interactividad).
+android.accept_sdk_license = True
+
 # (str) Presplash de la app (logo durante el arranque).
 # presplash.filename = %(source.dir)s/assets/presplash.png
 
