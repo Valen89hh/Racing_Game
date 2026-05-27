@@ -9,6 +9,7 @@ import pygame
 
 from entities.car import Car
 from settings import PLAYER_CONTROLS
+from utils.platform import IS_ANDROID
 
 
 class InputHandler:
@@ -46,6 +47,12 @@ class InputHandler:
         """Actualiza los comandos de input de un auto."""
         car.reset_inputs()
 
+        # En Android, el jugador local (player 0) usa el joystick virtual.
+        # Otros player_id (bots locales con flechas en desktop) no aplican en móvil.
+        if IS_ANDROID and car.player_id == 0:
+            self._apply_touch(car)
+            return
+
         controls = self.control_schemes.get(car.player_id)
         if controls is None:
             return
@@ -69,6 +76,24 @@ class InputHandler:
             car.input_brake = True
 
         # Power-up se activa con click izquierdo del mouse (ver game.py)
+
+    def _apply_touch(self, car: Car) -> None:
+        """Lee el TouchInput global y mapea su estado a los inputs del auto."""
+        from mobile.touch_input import get_touch_input
+        touch = get_touch_input()
+
+        dx, dy = touch.stick_vector
+        # eje Y: arriba (negativo en pantalla) = acelerar; abajo = reversa
+        car.input_accelerate = -dy   # ya está en [-1,1] con deadzone aplicada
+        # eje X: derecha positivo
+        car.input_turn = dx
+
+        if touch.brake_pressed:
+            car.input_brake = True
+
+        # El power-up se activa una sola vez por tap.
+        if touch.consume_powerup_press():
+            car.input_use_powerup = True
 
     def add_player(self, player_id: int, controls: dict):
         """Agrega un esquema de control para un nuevo jugador."""

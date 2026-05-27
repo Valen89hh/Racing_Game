@@ -32,6 +32,7 @@ from systems.physics import PhysicsSystem
 from systems.collision import CollisionSystem
 from tile_track import TileTrack
 from utils.helpers import angle_to_vector, angle_between_points, normalize_angle
+from utils.observation import build_observation, apply_action
 import track_manager
 
 
@@ -174,80 +175,17 @@ class RacingEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def _apply_action(self, action):
-        """Map discrete action to car inputs."""
-        if action == 0:  # Forward
-            self.car.input_accelerate = 1.0
-        elif action == 1:  # Left + forward
-            self.car.input_accelerate = 1.0
-            self.car.input_turn = -1.0
-        elif action == 2:  # Right + forward
-            self.car.input_accelerate = 1.0
-            self.car.input_turn = 1.0
-        elif action == 3:  # Brake
-            self.car.input_brake = True
+        """Map discrete action to car inputs (delegates to shared helper)."""
+        apply_action(self.car, action)
 
     def _get_observation(self):
-        """Build 9-float observation vector."""
-        rays = self._cast_rays()
-        speed_norm = min(abs(self.car.speed) / CAR_MAX_SPEED, 1.0)
-        angle_norm = self._angle_to_next_checkpoint()
-
-        obs = np.zeros(9, dtype=np.float32)
-        obs[0:7] = rays
-        obs[7] = speed_norm
-        obs[8] = angle_norm
-        return obs
-
-    def _cast_rays(self):
-        """Cast 7 rays from car position, return normalized distances."""
-        rays = np.zeros(self.NUM_RAYS, dtype=np.float32)
-        mask = self.track.boundary_mask
-
-        for i, angle_offset in enumerate(self.RAY_ANGLES):
-            ray_angle = self.car.angle + angle_offset
-            rad = math.radians(ray_angle)
-            dx = math.sin(rad)
-            dy = -math.cos(rad)
-
-            hit_dist = self.RAY_MAX_DIST
-            step = 0
-            while step < self.RAY_MAX_DIST:
-                step += self.RAY_STEP
-                sx = int(self.car.x + dx * step)
-                sy = int(self.car.y + dy * step)
-
-                if not (0 <= sx < WORLD_WIDTH and 0 <= sy < WORLD_HEIGHT):
-                    hit_dist = step
-                    break
-
-                if mask.get_at((sx, sy)):
-                    hit_dist = step
-                    break
-
-            rays[i] = hit_dist / self.RAY_MAX_DIST
-
-        return rays
+        """Build 9-float observation vector (delegates to shared helper)."""
+        return build_observation(self.car, self.track)
 
     def _angle_to_next_checkpoint(self):
-        """Return normalized angle to next checkpoint (0.5 = straight ahead)."""
-        zones = self.track.checkpoint_zones
-        if not zones:
-            # Fall back to waypoints
-            if not self.track.waypoints:
-                return 0.5
-            wp = self.track.waypoints[0]
-            target = (wp[0], wp[1])
-        else:
-            idx = self.car.next_checkpoint_index % len(zones)
-            zone = zones[idx]
-            target = (zone.centerx, zone.centery)
-
-        target_angle = angle_between_points(
-            (self.car.x, self.car.y), target
-        )
-        diff = normalize_angle(target_angle - self.car.angle)
-        # Map [-180, 180] to [0, 1] with 0.5 = straight ahead
-        return (diff + 180.0) / 360.0
+        """Return normalized angle to next checkpoint (delegates to shared helper)."""
+        from utils.observation import angle_to_next_checkpoint
+        return angle_to_next_checkpoint(self.car, self.track)
 
     def _compute_progress(self):
         """

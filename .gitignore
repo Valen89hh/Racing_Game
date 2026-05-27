@@ -110,3 +110,12 @@ training/logs/
 models/checkpoints/
 models/*.zip
 project*.tar.gz
+
+# ===============================
+# Buildozer / python-for-android (Android APK build)
+# ===============================
+.buildozer/
+bin/
+.p4a
+*.apk
+*.aab

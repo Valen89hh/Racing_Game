@@ -12,8 +12,8 @@
 ```
 racing_game/
 ├── main.py              (~40 lines)  - Entry point + --train/--dedicated routing
-├── game.py              (~2250 lines) - Game loop, state machine, orchestration
-├── settings.py          (~270 lines) - All configuration constants
+├── game.py              (~2750 lines) - Game loop, state machine, orchestration
+├── settings.py          (~290 lines) - All configuration constants
 ├── track_manager.py     (~200 lines) - Track file I/O (JSON save/load)
 ├── tile_track.py        (~500 lines) - Tile-based track (TileTrack class)
 ├── tile_defs.py         (~360 lines) - Tile definitions, classification, sprites
@@ -24,18 +24,20 @@ racing_game/
 │
 ├── networking/
 │   ├── __init__.py                  - Package marker
-│   ├── protocol.py      (~530 lines) - Binary UDP protocol (pack/unpack, redundant inputs)
+│   ├── protocol.py      (~700 lines) - Binary UDP protocol (pack/unpack, room management, redundant inputs)
 │   ├── net_state.py     (~100 lines) - Data classes (NetCarState, StateSnapshot, InputState)
-│   ├── server.py        (~470 lines) - GameServer (host-side UDP, supports LAN + relay)
-│   ├── client.py        (~410 lines) - GameClient (client-side UDP, adaptive interp, redundant input)
+│   ├── server.py        (~750 lines) - GameServer (host-side UDP, supports LAN + relay + multi-room routing)
+│   ├── client.py        (~520 lines) - GameClient (client-side UDP, adaptive interp, room management)
 │   ├── relay_protocol.py (~120 lines) - Relay binary protocol (room commands + forwarding)
 │   └── relay_socket.py  (~210 lines) - RelaySocket drop-in adapter for transparent relay
 │
 ├── server/
 │   ├── __init__.py                  - Package marker
-│   ├── dedicated_server.py (~120 lines) - Headless dedicated server (fixed timestep loop)
-│   ├── room.py          (~190 lines) - Room state machine (LOBBY→COUNTDOWN→RACING→DONE)
-│   └── world_simulation.py (~410 lines) - Authoritative world simulation (physics, AI, powerups)
+│   ├── dedicated_server.py (~140 lines) - Headless dedicated server (fixed timestep loop)
+│   ├── room.py          (~300 lines) - Room state machine (LOBBY→COUNTDOWN→RACING→DONE)
+│   ├── room_manager.py  (~230 lines) - Multi-room manager (create/join/leave rooms)
+│   ├── room_net_adapter.py (~250 lines) - Per-room networking adapter (filters broadcasts)
+│   └── world_simulation.py (~420 lines) - Authoritative world simulation (physics, AI, powerups)
 │
 ├── relay_server/
 │   ├── relay_server.py  (~250 lines) - Standalone relay server (stdlib only, Python 3.8+)
@@ -111,15 +113,27 @@ Multiplayer LAN:
   Track Select → H → STATE_HOST_LOBBY → ENTER → STATE_ONLINE_COUNTDOWN → STATE_ONLINE_RACING
   Menu → J → STATE_CONNECTING → STATE_JOIN_LOBBY → STATE_ONLINE_COUNTDOWN → STATE_ONLINE_RACING
 
+Multiplayer Local (auto-server):
+  Menu → J → "Local" → auto-starts GameServer+RoomManager in-process
+       → STATE_CONNECTING → STATE_ROOM_SELECT → create/join room
+       → STATE_JOIN_LOBBY → STATE_ONLINE_COUNTDOWN → STATE_ONLINE_RACING
+
+Multiplayer Dedicated (multi-room):
+  Menu → J → "Remote" → enter IP → STATE_CONNECTING
+       → STATE_ROOM_SELECT → browse/create/join rooms
+       → STATE_JOIN_LOBBY → STATE_ONLINE_COUNTDOWN → STATE_ONLINE_RACING
+  ESC in lobby → back to STATE_ROOM_SELECT (stays connected)
+
 Multiplayer Relay (internet):
   Track Select → R → STATE_RELAY_HOST → create room → STATE_HOST_LOBBY → (same as LAN)
   Menu → R → STATE_RELAY_JOIN → enter code → STATE_CONNECTING → (same as LAN)
 
 Dedicated Server (headless):
-  main.py --dedicated-server → DedicatedServer → Room(LOBBY→COUNTDOWN→RACING→DONE)
+  main.py --dedicated-server --multi-room → DedicatedServer → RoomManager → N×Room(LOBBY→COUNTDOWN→RACING→DONE)
+  main.py --dedicated-server             → DedicatedServer → single Room (legacy)
 ```
 
-States defined in `settings.py`: `STATE_MENU`, `STATE_COUNTDOWN`, `STATE_RACING`, `STATE_VICTORY`, `STATE_EDITOR`, `STATE_TRACK_SELECT`, `STATE_TRAINING`, `STATE_HOST_LOBBY`, `STATE_JOIN_LOBBY`, `STATE_CONNECTING`, `STATE_ONLINE_RACING`, `STATE_ONLINE_COUNTDOWN`, `STATE_RELAY_HOST`, `STATE_RELAY_JOIN`.
+States defined in `settings.py`: `STATE_MENU`, `STATE_COUNTDOWN`, `STATE_RACING`, `STATE_VICTORY`, `STATE_EDITOR`, `STATE_TRACK_SELECT`, `STATE_TRAINING`, `STATE_HOST_LOBBY`, `STATE_JOIN_LOBBY`, `STATE_CONNECTING`, `STATE_ONLINE_RACING`, `STATE_ONLINE_COUNTDOWN`, `STATE_RELAY_HOST`, `STATE_RELAY_JOIN`, `STATE_ROOM_SELECT`.
 
 ### Entity-System Pattern
 
@@ -164,6 +178,7 @@ METHODS:    draw(surface, camera), check_car_collision(mask, rect),
 - **Networking:** port=5555 (LAN), tick_rate=60Hz, snapshot_rate=30Hz, input_rate=60Hz, timeout=5s
 - **Networking advanced:** input_redundancy=3, interp_min=33ms, interp_max=200ms, extrapolation_max=100ms
 - **Relay:** port=7777, heartbeat=3s, peer_timeout=10s, room_code=4 chars
+- **Multi-room:** MAX_ROOMS=4, ROOM_CODE_LENGTH=4, ROOM_LIST_REFRESH_INTERVAL=2s
 
 ## Tile System (tile_defs.py)
 
@@ -533,12 +548,12 @@ Clamped between `NET_INTERP_MIN_DELAY` (33ms) and `NET_INTERP_MAX_DELAY` (200ms)
 ## Dedicated Server (server/)
 
 ### Architecture
-Headless authoritative server that runs the full game simulation without a display. Clients connect via LAN or relay and receive state snapshots.
+Headless authoritative server that runs the full game simulation without a display. Clients connect via LAN or relay and receive state snapshots. Supports **multi-room mode** where a single server manages up to `MAX_ROOMS` (4) independent rooms.
 
 ```
-main.py --dedicated-server track_file [--bots N] [--port P]
+main.py --dedicated-server --track leve_4.json --multi-room [--bots N] [--port P]
   → SDL_VIDEODRIVER=dummy + pygame.display.set_mode((1,1))
-  → DedicatedServer(track, bots, port).run()
+  → DedicatedServer(track, bots, port, multi_room=True).run()
 ```
 
 ### Components
@@ -546,14 +561,50 @@ main.py --dedicated-server track_file [--bots N] [--port P]
 | File | Role |
 |------|------|
 | `dedicated_server.py` | Fixed-timestep main loop (60Hz physics, MAX_TICKS_PER_FRAME=2 catch-up) |
-| `room.py` | State machine: LOBBY → COUNTDOWN → RACING → DONE |
+| `room.py` | State machine: LOBBY → COUNTDOWN → RACING → DONE (per-room) |
+| `room_manager.py` | Manages multiple Room instances, create/join/leave, cleanup empty rooms |
+| `room_net_adapter.py` | Per-room networking wrapper — filters broadcasts to room's clients only |
 | `world_simulation.py` | Authoritative simulation: physics, collisions, AI, power-ups, checkpoints |
 
+### Multi-Room Architecture (RoomNetAdapter Pattern)
+
+Room calls `self.net_server.broadcast()`, `get_player_list()`, etc. In multi-room mode, `self.net_server` is a `RoomNetAdapter` that filters everything to clients of THAT room. **Room's internal logic is unchanged.**
+
+```
+GameServer (UDP socket, recv thread)
+  └─ RoomManager
+       ├─ Room[0] ←→ RoomNetAdapter[0] (filters to clients of room 0)
+       ├─ Room[1] ←→ RoomNetAdapter[1]
+       └─ Room[N] ←→ RoomNetAdapter[N]
+```
+
+Each room assigns **per-room slots 0-3** independently. The client receives its slot in `PKT_ROOM_ACCEPT`. Server tracks `_client_room[addr]` and `_client_slot[addr]` for routing.
+
+### Room Management Protocol (multi-room)
+
+| Packet | Dir | Description |
+|--------|-----|-------------|
+| `PKT_ROOM_LIST_REQ` (0x50) | C→S | Request room list |
+| `PKT_ROOM_LIST` (0x51) | S→C | Room list (public rooms, state, player count) |
+| `PKT_ROOM_CREATE` (0x52) | C→S | Create room (name, public/private) |
+| `PKT_ROOM_CREATE_OK` (0x53) | S→C | Room created (room_id, code, slot) |
+| `PKT_ROOM_JOIN` (0x54) | C→S | Join room (by id or code) |
+| `PKT_ROOM_ACCEPT` (0x55) | S→C | Joined room (room_id, slot, is_admin) |
+| `PKT_ROOM_REJECT` (0x56) | S→C | Rejected (full, racing, not found) |
+| `PKT_ROOM_LEAVE` (0x57) | C→S | Leave room (back to room select) |
+
+Room codes: 4 alphanumeric chars (A-Z+2-9, no confusables). Generated by `generate_room_code()`.
+
 ### Room State Machine
-- **LOBBY**: Broadcasts lobby state every 250ms. Auto-starts race when `DEDICATED_MIN_PLAYERS` connected for `DEDICATED_AUTO_START_DELAY` seconds.
+- **LOBBY**: Broadcasts lobby state every 250ms. Admin controls track/bots. Admin starts race (or auto-start if no admin after `DEDICATED_AUTO_START_DELAY` seconds).
 - **COUNTDOWN**: 4 seconds total (`_countdown_secs=4`). Sends `display_countdown=3` to clients (shows "3, 2, 1, GO!"). Must match client countdown duration to avoid position jumps.
 - **RACING**: Pops 1 input per player per tick. Runs `WorldSimulation.step()`. Broadcasts snapshots at 30Hz (every 2nd tick). Broadcasts power-up events (3x redundancy).
-- **DONE**: Race finished (all cars done or 15s after winner).
+- **DONE**: Race finished (all cars done or 15s after winner). After `DEDICATED_DONE_RESET_DELAY` (10s), resets to LOBBY.
+
+### Room Lifecycle
+- Empty rooms (0 connected players) are automatically destroyed in `_cleanup_empty_rooms()`, regardless of room state (lobby, racing, done).
+- When the admin disconnects, admin is reassigned to another player in the room.
+- Private rooms are only accessible by code (not shown in room list).
 
 ### Server-Safe Tile Classification (CRITICAL)
 The dedicated server typically runs on a VPS **without `tileset.png`**. Without the tileset image, `tile_defs._do_load()` fails and ALL road tiles are treated as walls. This causes wrong start positions, wrong collision grid, and wrong DFS path.
@@ -582,6 +633,10 @@ The dedicated server typically runs on a VPS **without `tileset.png`**. Without 
 9. **Input redundancy:** Client sends last 3 inputs per packet via `pack_input_redundant()`. Server deduplicates naturally via seq check. If modifying input protocol, update both `pack_input_redundant()` and `unpack_input()` in `protocol.py`.
 10. **Adaptive interpolation:** Remote car interpolation delay is dynamic (`get_adaptive_delay()`), not the fixed `NET_INTERPOLATION_DELAY` constant. The constant is only used as the initial fallback before enough jitter samples are collected.
 11. **Client-side car-vs-car prediction:** `_predict_car_vs_car_local()` only pushes the local car (one-sided). Never move remote cars in client prediction — they are server-authoritative.
+12. **Multi-room networking:** In multi-room mode, Room receives a `RoomNetAdapter` instead of `GameServer` directly. The adapter filters all broadcasts/queries to clients of that specific room. Room's internal logic is unchanged. Input routing: `GameServer._handle_input()` looks up `_client_room[addr]` and enqueues to the correct adapter.
+13. **Local server mode:** When the user selects "Local" in the join screen, `game.py` creates a `GameServer` + `RoomManager` in-process on a daemon thread, then auto-connects `GameClient` to `127.0.0.1`. The local server is stopped in `_stop_local_server()` (called from `_stop_online()`).
+14. **Client timer sync (CRITICAL):** `self.race_timer.total_time = latest.race_time` must only run when a NEW snapshot arrives (inside the `seq != last_seq` check). If run every frame, it resets the timer to a stale value, preventing the 15-second victory timeout from working after the server stops sending snapshots.
+15. **Victory detection (online):** Two conditions: `all_finished` (all cars done) OR `(winner exists AND total_time > finish_time + 15)`. A `should_return_to_lobby()` fallback ensures the client doesn't get stuck in ONLINE_RACING if the victory check fails and the server sends return-to-lobby.
 
 ## Render Order (_render_race)
 
@@ -707,7 +762,7 @@ ssh racing@IP "cat /etc/systemd/system/racing-server.service"
 
 | File | Description |
 |------|-------------|
-| `deploy_server.sh` | Script de deploy con 3 modos (--setup, --install-service, deploy) |
+| `deploy_server.sh` | Script de deploy con 3 modos (--setup, --install-service, deploy). Service uses `--multi-room` by default. |
 | `server/requirements-server.txt` | Dependencias del servidor (solo pygame) |
 | `.github/workflows/deploy-server.yml` | GitHub Actions auto-deploy (deshabilitado, requiere secrets) |
 
@@ -729,7 +784,10 @@ pip install pygame
 pip install gymnasium stable-baselines3  # for RL training feature
 python main.py
 
-# To run the dedicated server (headless, for multiplayer):
+# To run the dedicated server (headless, multi-room):
+python main.py --dedicated-server --track leve_4.json --bots 1 --port 5555 --multi-room
+
+# To run the dedicated server (single-room legacy):
 python main.py --dedicated-server --track leve_4.json --bots 1 --port 5555
 
 # To run the relay server (for internet multiplayer):
@@ -739,9 +797,18 @@ python relay_server/relay_server.py --port 7777
 ### Menu Controls
 - **ENTER** — Open track selection
 - **E** — Open track editor
-- **J** — Join online game (LAN, enter IP)
+- **J** — Join online game (choose Local or Remote)
+  - **Local** — Auto-starts GameServer+RoomManager in-process, connects to 127.0.0.1
+  - **Remote** — Enter server IP, connects to dedicated server
 - **R** — Join online game (Relay, enter server + room code)
 - **ESC** — Quit
+
+### Room Select Controls (STATE_ROOM_SELECT)
+- **UP/DOWN** — Navigate room list
+- **ENTER** — Join selected room
+- **C** — Create new room (enter name, Tab to toggle private)
+- **P** — Join room by code (enter 4-char code)
+- **ESC** — Disconnect and return to menu
 
 ### Race Controls
 - **W/S** — Accelerate/Reverse
@@ -766,7 +833,7 @@ python relay_server/relay_server.py --port 7777
 
 ## Known Bugs / Pending
 
-*No known open bugs at this time.*
+- **Victory screen may not show in server mode (investigating):** After completing 3 laps in dedicated server mode, the victory screen sometimes fails to appear. Root cause identified as stale timer sync (fix applied: moved timer sync inside new-snapshot check). Also added `should_return_to_lobby()` fallback and debug logging. Needs deployment + testing to confirm fix.
 
 ### Resolved Issues (v1.1.0 development)
 
@@ -809,3 +876,17 @@ Documented here for context if similar issues arise:
 16. **Remote cars freezing on late snapshots** — When a snapshot arrived late (jitter), remote cars froze at their last known position until the next snapshot. Fixed with dead-reckoning extrapolation: `pos += velocity * dt_extra` capped at 100ms (`NET_EXTRAPOLATION_MAX`). Cars now continue moving in their last known direction instead of stopping.
 
 17. **Fixed 100ms interpolation delay too high for LAN, too low for relay** — The constant `NET_INTERPOLATION_DELAY = 0.1` was a compromise that was too sluggish for LAN (~2ms RTT) and sometimes insufficient for relay (~150ms RTT). Fixed with adaptive delay based on measured snapshot inter-arrival jitter: `delay = avg_interval + 2 * stddev`. LAN auto-tunes to ~36ms, relay to ~78-120ms depending on conditions. Clamped between 33ms and 200ms.
+
+### Multi-Room System (v1.3.0)
+
+18. **Multi-room dedicated server** — Single server now supports up to 4 simultaneous independent rooms. Each room has its own `RoomNetAdapter` (filters networking to room's clients), `Room` (state machine), and `WorldSimulation` (physics). Players connect to the server, see a room browser (`STATE_ROOM_SELECT`), and can create/join public or private rooms. Private rooms use 4-char codes. Empty rooms auto-cleanup regardless of state (lobby, racing, done). Admin controls (track, bots, start) work per-room.
+
+19. **Local server mode** — The "Join" (J key) screen now offers "Local" and "Remote" options instead of asking for an IP. "Local" auto-starts a `GameServer` + `RoomManager` in-process on a daemon thread and auto-connects the `GameClient` to `127.0.0.1:5555`. No manual IP input needed. The local server is stopped when the player disconnects.
+
+20. **Empty racing rooms not cleaned up** — When all players left a room during RACING state, the room stayed allocated because `_cleanup_empty_rooms()` only cleaned rooms in "lobby" or "done" state. Fixed by removing the state filter — any room with 0 connected players is destroyed.
+
+21. **Server race timer never started** — `world_simulation.py` called `race_timer.reset()` (sets `running=False`) but never called `race_timer.start()`. Timer stayed at 0 forever, breaking the 15-second timeout after the winner finishes. Fixed by adding `self.race_timer.start()` after reset.
+
+22. **Lap count HUD always showing "Lap 1/3" in online mode** — The HUD displays `race_timer.current_lap_number` which depends on `race_timer.complete_lap()` being called. In online mode, laps are counted server-side, but `complete_lap()` was never called on the client. Fixed by detecting `car.laps` changes in `_reconcile_local_car()` and calling `complete_lap()` for each new lap.
+
+23. **Victory screen not showing after 3 laps (timer sync bug)** — `self.race_timer.total_time = latest.race_time` ran EVERY frame (even with stale snapshots), resetting the timer to the last snapshot's race_time + one frame of dt. This prevented the 15-second timeout from ever triggering after the server stopped sending snapshots. Fixed by moving the timer sync inside the new-snapshot check. Also added `should_return_to_lobby()` fallback in `_update_online_racing_client()` so the server's return-to-lobby packet is handled even if the victory check fails.

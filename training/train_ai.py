@@ -164,11 +164,11 @@ def _run_training(args, json_progress):
     track_basename = os.path.splitext(os.path.basename(track_path))[0]
     model_name = args.name or track_basename
 
-    # Output path — use writable dir (next to exe) so models persist
-    from utils.base_path import get_writable_dir
-    models_dir = os.path.join(get_writable_dir(), "models")
-    os.makedirs(models_dir, exist_ok=True)
-    model_path = os.path.join(models_dir, f"{model_name}_model")
+    # Output path — use writable models dir (next to exe). En desktop MODELS_DIR
+    # apunta al mismo dir writable; en Android no aplica (training está excluido).
+    from utils.base_path import MODELS_DIR
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    model_path = os.path.join(MODELS_DIR, f"{model_name}_model")
 
     quiet = json_progress is not None
 

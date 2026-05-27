@@ -8,6 +8,7 @@ y usa power-ups de forma táctica.
 """
 
 import math
+import os
 import random
 
 from entities.car import Car
@@ -313,6 +314,37 @@ class AISystem:
         return False
 
 
+def load_bot_policy(track, track_name: str, models_dir: str):
+    """
+    Carga el bot RL para `track_name`, prefiriendo ONNX sobre PPO.
+
+    Orden de preferencia:
+      1. `{track_name}_model.onnx` con onnxruntime  (compatible con Android)
+      2. `{track_name}_model.zip`  con stable_baselines3 + PyTorch  (sólo desktop)
+      3. None  → el caller debe usar AISystem (waypoints) como fallback
+
+    El móvil sólo empaqueta los `.onnx`, así que el camino 2 se omite naturalmente
+    en Android porque (a) los .zip no van en la APK y (b) torch no se instala.
+    """
+    onnx_path = os.path.join(models_dir, f"{track_name}_model.onnx")
+    if os.path.exists(onnx_path):
+        try:
+            from mobile.onnx_policy import ONNXPolicy
+            policy = ONNXPolicy(track, onnx_path)
+            if policy.is_loaded:
+                return policy
+        except ImportError as e:
+            print(f"[load_bot_policy] ONNXPolicy import failed: {e}")
+
+    zip_path = os.path.join(models_dir, f"{track_name}_model.zip")
+    if os.path.exists(zip_path):
+        policy = RLSystem(track, zip_path)
+        if policy.is_loaded:
+            return policy
+
+    return None
+
+
 class RLSystem:
     """
     Sistema de IA basado en Reinforcement Learning (PPO).
@@ -321,11 +353,6 @@ class RLSystem:
     un bot en tiempo real. Si el modelo no se puede cargar, is_loaded = False
     y el juego debe usar AISystem como fallback.
     """
-
-    NUM_RAYS = 7
-    RAY_MAX_DIST = 300.0
-    RAY_STEP = 4
-    RAY_ANGLES = [-60, -40, -20, 0, 20, 40, 60]
 
     def __init__(self, track, model_path: str):
         self.track = track
@@ -352,91 +379,15 @@ class RLSystem:
         if self.model is None:
             return
 
+        from utils.observation import build_observation, apply_action
+
         car.reset_inputs()
-        obs = self._build_observation(car)
+        obs = build_observation(car, self.track)
 
         try:
-            import numpy as np
             action, _ = self.model.predict(obs, deterministic=True)
             action = int(action)
         except Exception:
             return
 
-        # Map action to car inputs (same mapping as RacingEnv)
-        if action == 0:  # Forward
-            car.input_accelerate = 1.0
-        elif action == 1:  # Left + forward
-            car.input_accelerate = 1.0
-            car.input_turn = -1.0
-        elif action == 2:  # Right + forward
-            car.input_accelerate = 1.0
-            car.input_turn = 1.0
-        elif action == 3:  # Brake
-            car.input_brake = True
-
-    def _build_observation(self, car: Car):
-        """Build 9-float observation vector (identical to RacingEnv)."""
-        import numpy as np
-        from settings import CAR_MAX_SPEED
-
-        rays = self._cast_rays(car)
-        speed_norm = min(abs(car.speed) / CAR_MAX_SPEED, 1.0)
-        angle_norm = self._angle_to_next_checkpoint(car)
-
-        obs = np.zeros(9, dtype=np.float32)
-        obs[0:7] = rays
-        obs[7] = speed_norm
-        obs[8] = angle_norm
-        return obs
-
-    def _cast_rays(self, car: Car):
-        """Cast 7 rays from car position, return normalized distances."""
-        import numpy as np
-        from settings import WORLD_WIDTH, WORLD_HEIGHT
-
-        rays = np.zeros(self.NUM_RAYS, dtype=np.float32)
-        mask = self.track.boundary_mask
-
-        for i, angle_offset in enumerate(self.RAY_ANGLES):
-            ray_angle = car.angle + angle_offset
-            rad = math.radians(ray_angle)
-            dx = math.sin(rad)
-            dy = -math.cos(rad)
-
-            hit_dist = self.RAY_MAX_DIST
-            step = 0
-            while step < self.RAY_MAX_DIST:
-                step += self.RAY_STEP
-                sx = int(car.x + dx * step)
-                sy = int(car.y + dy * step)
-
-                if not (0 <= sx < WORLD_WIDTH and 0 <= sy < WORLD_HEIGHT):
-                    hit_dist = step
-                    break
-
-                if mask.get_at((sx, sy)):
-                    hit_dist = step
-                    break
-
-            rays[i] = hit_dist / self.RAY_MAX_DIST
-
-        return rays
-
-    def _angle_to_next_checkpoint(self, car: Car):
-        """Return normalized angle to next checkpoint (0.5 = straight ahead)."""
-        zones = self.track.checkpoint_zones
-        if not zones:
-            if not self.track.waypoints:
-                return 0.5
-            wp = self.track.waypoints[0]
-            target = (wp[0], wp[1])
-        else:
-            idx = car.next_checkpoint_index % len(zones)
-            zone = zones[idx]
-            target = (zone.centerx, zone.centery)
-
-        target_angle = angle_between_points(
-            (car.x, car.y), target
-        )
-        diff = normalize_angle(target_angle - car.angle)
-        return (diff + 180.0) / 360.0
+        apply_action(car, action)

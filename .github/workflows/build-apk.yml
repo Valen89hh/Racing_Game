@@ -1,0 +1,138 @@
+name: Build Android APK
+
+# Cuándo correr el build:
+on:
+  # 1. Manual: ir a Actions → "Build Android APK" → "Run workflow"
+  workflow_dispatch:
+    inputs:
+      no_onnx:
+        description: 'Quitar onnxruntime (forza backend numpy si falla la build)'
+        required: false
+        type: boolean
+        default: false
+
+  # 2. Automático: cada push al branch mobile que toque código del juego
+  push:
+    branches: [mobile]
+    paths:
+      - '**.py'
+      - 'buildozer.spec'
+      - 'models/*.onnx'
+      - 'models/*.npz'
+      - 'tracks/*.json'
+      - 'assets/**'
+      - '.github/workflows/build-apk.yml'
+
+jobs:
+  build:
+    name: Build APK with Buildozer
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git zip unzip \
+            autoconf libtool pkg-config \
+            zlib1g-dev libncurses-dev libncursesw5-dev libtinfo6 \
+            cmake libffi-dev libssl-dev \
+            ccache
+
+      - name: Install Buildozer + Cython
+        run: |
+          python -m pip install --upgrade pip wheel
+          pip install "cython==0.29.36" buildozer
+
+      # Cachea ~/.buildozer (NDK, SDK, builds intermedios) entre runs.
+      # Primera build: ~30-50 min. Builds siguientes con cache: ~5-10 min.
+      - name: Cache Buildozer global state
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+
+      # Opción --no-onnx: parchea el spec antes de buildear para excluir onnxruntime.
+      # El código cae automáticamente al backend numpy de los .npz.
+      - name: Patch spec (no-onnx mode)
+        if: ${{ inputs.no_onnx == true }}
+        run: |
+          sed -i 's/^requirements = \(.*\),onnxruntime/requirements = \1/' buildozer.spec
+          sed -i 's/^requirements = \(.*\)onnxruntime,/requirements = \1/' buildozer.spec
+          echo "::notice::onnxruntime quitado del spec — usando backend numpy"
+          grep '^requirements' buildozer.spec
+
+      - name: Verify exported models
+        run: |
+          echo "ONNX files:"
+          ls -la models/*.onnx 2>/dev/null || echo "(none)"
+          echo "NPZ fallback files:"
+          ls -la models/*.npz 2>/dev/null || echo "(none)"
+
+      - name: Build debug APK
+        env:
+          # Configuraciones útiles para CI:
+          BUILDOZER_WARN_ON_ROOT: 0
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          buildozer android debug 2>&1 | tee build.log
+
+      - name: Locate APK
+        id: locate
+        run: |
+          APK=$(find bin -maxdepth 1 -name '*.apk' | head -1)
+          if [[ -z "$APK" ]]; then
+            echo "::error::No APK encontrado en bin/"
+            exit 1
+          fi
+          echo "apk_path=$APK" >> $GITHUB_OUTPUT
+          echo "apk_name=$(basename $APK)" >> $GITHUB_OUTPUT
+          ls -lh bin/
+
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.locate.outputs.apk_name }}
+          path: ${{ steps.locate.outputs.apk_path }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            build.log
+            .buildozer/android/platform/build-*/dists/*/build.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Summary
+        if: success()
+        run: |
+          APK="${{ steps.locate.outputs.apk_path }}"
+          SIZE=$(du -h "$APK" | cut -f1)
+          echo "### APK Build Successful" >> $GITHUB_STEP_SUMMARY
+          echo "- **File:** \`$(basename $APK)\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Size:** $SIZE" >> $GITHUB_STEP_SUMMARY
+          echo "- **Download:** desde la sección 'Artifacts' arriba" >> $GITHUB_STEP_SUMMARY

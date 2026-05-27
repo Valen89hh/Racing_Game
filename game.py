@@ -60,11 +60,13 @@ from entities.particles import DustParticleSystem, SkidMarkSystem
 from systems.physics import PhysicsSystem
 from systems.collision import CollisionSystem
 from systems.input_handler import InputHandler
-from systems.ai import AISystem, RLSystem
+from systems.ai import AISystem, RLSystem, load_bot_policy
 from systems.camera import Camera
 from utils.timer import RaceTimer
 from utils.helpers import draw_text_centered
-from editor import TileEditor
+from utils.platform import IS_ANDROID
+# `editor` se importa lazy dentro de _open_editor* y _edit_selected_track porque
+# el módulo está excluido del build de Android (ver buildozer.spec).
 from tile_track import TileTrack
 from race_progress import RaceProgressTracker
 import track_manager
@@ -96,7 +98,18 @@ class Game:
             pass  # Audio no disponible (otra instancia lo usa)
         pygame.display.set_caption(TITLE)
 
-        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        # En Android, render a una surface lógica 1280x720 y blit-escala al display
+        # real con letterbox. Esto deja TODO el código de renderizado intacto
+        # (cámara, HUD, menús, overlay táctil) sin tener que rehacer coordenadas.
+        if IS_ANDROID:
+            self._display_surface = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+            self.screen = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+            self._compute_letterbox()
+        else:
+            self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+            self._display_surface = self.screen
+            self._letterbox_offset = (0, 0)
+            self._letterbox_size = (SCREEN_WIDTH, SCREEN_HEIGHT)
         self.clock = pygame.time.Clock()
 
         # Fuentes
@@ -245,9 +258,22 @@ class Game:
 
     def _handle_events(self):
         """Procesa eventos de Pygame."""
+        if IS_ANDROID:
+            from mobile.touch_input import get_touch_input
+            _touch = get_touch_input()
+        else:
+            _touch = None
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
+                continue
+
+            # Touch global: el TouchInput consume FINGER* y se queda con el evento.
+            if _touch is not None and event.type in (
+                pygame.FINGERDOWN, pygame.FINGERMOTION, pygame.FINGERUP
+            ):
+                _touch.handle_event(event)
                 continue
 
             # Editor captura sus propios eventos
@@ -311,7 +337,10 @@ class Game:
                         self.running = False
 
                 elif event.key == pygame.K_e:
-                    if self.state == STATE_MENU:
+                    # Editor excluido en Android (no hay teclado/mouse preciso ni el módulo).
+                    if IS_ANDROID:
+                        pass
+                    elif self.state == STATE_MENU:
                         self._open_editor()
                     elif self.state == STATE_TRACK_SELECT:
                         self._edit_selected_track()
@@ -430,7 +459,8 @@ class Game:
                     elif event.key == pygame.K_DOWN:
                         self.track_selected = min(
                             len(self.track_list) - 1, self.track_selected + 1)
-                    elif event.key == pygame.K_t:
+                    elif event.key == pygame.K_t and not IS_ANDROID:
+                        # Training RL excluido en Android (sin PyTorch / stable_baselines3).
                         if self.track_list:
                             entry = self.track_list[self.track_selected]
                             if entry.get("type") == "tiles":
@@ -501,16 +531,12 @@ class Game:
         for car in self.cars:
             self.collision_system.ensure_valid_spawn(car)
 
-        # Intentar cargar modelo RL para esta pista
+        # Intentar cargar modelo RL para esta pista (prefiere ONNX, fallback a PPO).
         self.rl_system = None
         if hasattr(self, 'track_list') and self.track_list and self.track_selected < len(self.track_list):
-            from utils.base_path import get_writable_dir
+            from utils.base_path import MODELS_DIR
             track_name = os.path.splitext(self.track_list[self.track_selected]["filename"])[0]
-            model_path = os.path.join(get_writable_dir(), "models", f"{track_name}_model.zip")
-            if os.path.exists(model_path):
-                rl = RLSystem(self.track, model_path)
-                if rl.is_loaded:
-                    self.rl_system = rl
+            self.rl_system = load_bot_policy(self.track, track_name, MODELS_DIR)
 
         self.ai_system = AISystem(self.track)
         self.ai_system.register_bot(bot_car)
@@ -949,7 +975,38 @@ class Game:
             self._render_hud()
             self._render_net_stats()
 
+        # Overlay táctil (Android): se dibuja sobre el HUD durante carreras.
+        if IS_ANDROID and self.state in (
+            STATE_COUNTDOWN, STATE_RACING,
+            STATE_ONLINE_COUNTDOWN, STATE_ONLINE_RACING,
+        ):
+            from mobile.touch_input import get_touch_input
+            from mobile.touch_overlay import draw as draw_touch_overlay
+            draw_touch_overlay(self.screen, get_touch_input())
+
+        # Letterbox: en Android la pantalla física es distinta a la lógica.
+        if IS_ANDROID and self._display_surface is not self.screen:
+            self._display_surface.fill(COLOR_BLACK)
+            scaled = pygame.transform.smoothscale(self.screen, self._letterbox_size)
+            self._display_surface.blit(scaled, self._letterbox_offset)
+
         pygame.display.flip()
+
+    def _compute_letterbox(self) -> None:
+        """Calcula offset y tamaño del letterbox preservando aspect ratio 16:9."""
+        phys_w, phys_h = self._display_surface.get_size()
+        scale = min(phys_w / SCREEN_WIDTH, phys_h / SCREEN_HEIGHT)
+        scaled_w = int(SCREEN_WIDTH * scale)
+        scaled_h = int(SCREEN_HEIGHT * scale)
+        self._letterbox_offset = ((phys_w - scaled_w) // 2, (phys_h - scaled_h) // 2)
+        self._letterbox_size = (scaled_w, scaled_h)
+        # Informa al TouchInput cómo traducir coords físicas → lógicas.
+        from mobile.touch_input import get_touch_input
+        get_touch_input().configure_display(
+            phys_size=(phys_w, phys_h),
+            lb_offset=self._letterbox_offset,
+            lb_size=self._letterbox_size,
+        )
 
     def _render_menu(self):
         """Renderiza la pantalla de inicio."""
@@ -1405,6 +1462,7 @@ class Game:
 
     def _open_editor(self):
         """Abre el editor de pistas."""
+        from editor import TileEditor
         self.editor = TileEditor(self.screen)
         self.state = STATE_EDITOR
         self.return_to_editor = False
@@ -1412,6 +1470,7 @@ class Game:
     def _open_editor_with_points(self):
         """Vuelve al editor conservando los tiles de la carrera de prueba."""
         if self.editor is None:
+            from editor import TileEditor
             self.editor = TileEditor(self.screen)
         self.state = STATE_EDITOR
         self.return_to_editor = False
@@ -1445,6 +1504,7 @@ class Game:
         entry = self.track_list[self.track_selected]
         if entry.get("type") != "tiles":
             return
+        from editor import TileEditor
         self.editor = TileEditor(self.screen)
         if self.editor.load_from_file(entry["filename"]):
             self.state = STATE_EDITOR
