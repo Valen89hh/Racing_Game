@@ -102,13 +102,14 @@ android.logcat_filters = *:S python:D
 # p4a.local_recipes = ./p4a-recipes
 
 # CRÍTICO: Buildozer clona python-for-android desde GitHub e IGNORA cualquier
-# pip install de p4a. Por defecto clona `master`, donde el python3 recipe
-# defaultea a Python 3.14 — y con esa versión el `pygame` upstream NO compila
-# (src_c/_sdl2/sdl2.c:211 incluye `longintrepr.h`, removido en Python 3.12).
+# pip install de p4a. Por defecto clona `master`. Hay que pinear vía spec.
 #
-# Pinneamos al tag `2024.1.21` donde el python3 recipe construye Python 3.9/3.11
-# y el `pygame` recipe compila sin problemas para ARM64.
-p4a.branch = v2024.01.21
+# Por qué v2023.05.21 (y no algo más reciente):
+#   - master / v2026.05.09 → Python 3.14, pygame no compila (longintrepr.h eliminado)
+#   - v2024.01.21          → Python 3.11, pygame no compila (longintrepr.h movido
+#                            a Include/cpython/ pero pygame lo incluye sin prefijo)
+#   - v2023.05.21          → Python 3.9, longintrepr.h en Include/ raíz → pygame OK
+p4a.branch = v2023.05.21
 
 
 [buildozer]
