@@ -73,9 +73,9 @@ jobs:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-v5-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v6-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-v5-${{ runner.os }}-
+            buildozer-v6-${{ runner.os }}-
 
       # Opción --no-onnx: parchea el spec antes de buildear para excluir onnxruntime.
       # El código cae automáticamente al backend numpy de los .npz.

@@ -108,7 +108,7 @@ android.logcat_filters = *:S python:D
 #
 # Pinneamos al tag `2024.1.21` donde el python3 recipe construye Python 3.9/3.11
 # y el `pygame` recipe compila sin problemas para ARM64.
-p4a.branch = 2024.1.21
+p4a.branch = v2024.01.21
 
 
 [buildozer]
