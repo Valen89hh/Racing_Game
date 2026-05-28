@@ -38,20 +38,22 @@ source.exclude_patterns = editor.py, models/*.zip, *.spec, build_*.bat, build_*.
 version = 1.3.0
 
 # Dependencias Python.
-#   - python3:        runtime (p4a lo cross-compila para ARM)
-#   - pygame_ce:      pygame Community Edition — fork activo del pygame, API
-#                     idéntica (`import pygame` sigue funcionando). El upstream
-#                     `pygame` rompe con Python 3.12+ porque su _sdl2/sdl2.c
-#                     incluye `longintrepr.h` (header privado eliminado en
-#                     Python 3.12). p4a defaultea a Python 3.14, por lo que el
-#                     pygame upstream no compila — pygame_ce sí.
-#   - numpy:          observación, math e inferencia del bot
+#   - python3:        runtime (p4a lo cross-compila — la versión la fija p4a;
+#                     con python-for-android==2024.1.21 → Python 3.11)
+#   - pygame:         upstream pygame (NO pygame_ce). Razón: p4a tiene un
+#                     recipe oficial para `pygame` que sí cross-compila para
+#                     ARM64. `pygame_ce` no tiene recipe → p4a hace pip install
+#                     y mete el wheel x86_64 de PyPI, que crashea en el celular
+#                     con "is for EM_X86_64 instead of EM_AARCH64".
+#                     El upstream pygame solo rompe con Python 3.12+ (header
+#                     longintrepr.h removido); por eso pinneamos p4a al 2024.1
+#                     en el workflow, donde el default sigue siendo 3.11.
+#   - numpy:          observación, math e inferencia del bot (recipe oficial)
 #
-# `onnxruntime` se quitó porque no tiene recipe oficial de p4a. El código cae
+# `onnxruntime` se quitó porque tampoco tiene recipe de p4a. El código cae
 # automáticamente al backend numpy puro (loads .npz), validado al 100% contra
-# onnxruntime en desktop. Para reactivar onnxruntime: añadirlo aquí y proveer
-# un wheel ARM64 vía android.add_libs_arm64-v8a.
-requirements = python3,pygame_ce,numpy
+# onnxruntime en desktop.
+requirements = python3,pygame,numpy
 
 # Orientación forzada — el juego está pensado en 1280x720 (16:9) horizontal.
 orientation = landscape
