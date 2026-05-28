@@ -55,15 +55,13 @@ jobs:
             ccache
 
       - name: Install Buildozer + Cython
-        # Pinneamos python-for-android==2024.1.21: esa versión defaultea a
-        # Python 3.11, donde el recipe oficial de `pygame` SÍ compila.
-        # Versiones más nuevas de p4a defaultean a Python 3.14, donde:
-        #   - upstream pygame no compila (longintrepr.h removed)
-        #   - pygame_ce compila pero no tiene recipe → p4a baja el wheel
-        #     x86_64 de PyPI y lo mete al APK (broken por arquitectura).
+        # Pin de sh<2.0 porque p4a 2024.1.21 (que clonamos via buildozer.spec
+        # `p4a.branch = 2024.1.21`) no es compatible con sh>=2.0.
+        # python-for-android NO se pinea aquí porque buildozer lo ignora — lo
+        # clona desde GitHub. La versión real de p4a se fija en buildozer.spec.
         run: |
           python -m pip install --upgrade pip wheel
-          pip install "cython==0.29.36" "python-for-android==2024.1.21" buildozer
+          pip install "cython==0.29.36" "sh<2.0" buildozer
 
       # Cachea ~/.buildozer (NDK, SDK, builds intermedios) entre runs.
       # Primera build: ~30-50 min. Builds siguientes con cache: ~5-10 min.
@@ -75,9 +73,9 @@ jobs:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-v4-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v5-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-v4-${{ runner.os }}-
+            buildozer-v5-${{ runner.os }}-
 
       # Opción --no-onnx: parchea el spec antes de buildear para excluir onnxruntime.
       # El código cae automáticamente al backend numpy de los .npz.

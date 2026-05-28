@@ -101,6 +101,15 @@ android.logcat_filters = *:S python:D
 # Recipe customizada para ONNX Runtime (descomentar si falla la build estándar).
 # p4a.local_recipes = ./p4a-recipes
 
+# CRÍTICO: Buildozer clona python-for-android desde GitHub e IGNORA cualquier
+# pip install de p4a. Por defecto clona `master`, donde el python3 recipe
+# defaultea a Python 3.14 — y con esa versión el `pygame` upstream NO compila
+# (src_c/_sdl2/sdl2.c:211 incluye `longintrepr.h`, removido en Python 3.12).
+#
+# Pinneamos al tag `2024.1.21` donde el python3 recipe construye Python 3.9/3.11
+# y el `pygame` recipe compila sin problemas para ARM64.
+p4a.branch = 2024.1.21
+
 
 [buildozer]
 
